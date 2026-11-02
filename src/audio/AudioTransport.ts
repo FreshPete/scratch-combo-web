@@ -12,12 +12,21 @@ import { createTempoPitchProcessor, type TempoPitchProcessorFactory, type TempoP
 import { decodeLocalAudioFile, validateLocalAudioBuffer } from "./beatAnalysis";
 import { resolveBeatPlaybackFrameRange, type BeatPlaybackFrameRange, type BeatPlaybackRegion } from "./beatPlaybackRegion";
 
-export type TransportStatus = "idle" | "loading" | "playing" | "completed" | "error" | "disposed";
+export type TransportStatus = "idle" | "loading" | "counting-in" | "playing" | "completed" | "error" | "disposed";
+
+export interface CountInProgress {
+  /** One-based beat currently shown during count-in. */
+  readonly beat: number;
+  /** Total count-in beats: four for one bar, eight for two bars. */
+  readonly beats: number;
+}
 
 export interface TransportSnapshot {
   readonly status: TransportStatus;
   /** Scheduler/input-clock progress. AudioWorklet output can trail this clock. */
   readonly progress: number;
+  /** Present only while the audible count-in is in progress. */
+  readonly countIn?: CountInProgress;
   /** Estimated heard position, mapped from the output-device clock and SoundTouch delay. */
   readonly presentation?: TransportPresentation;
   readonly error?: string;
@@ -55,6 +64,12 @@ export interface PlayOptions {
   /** Selected beat track's original BPM. Defaults to the scratch reference BPM. */
   readonly beatReferenceBpm?: number;
   readonly bpm: number;
+  /** Audible 4/4 bars before sequence start. Defaults to no count-in. */
+  readonly countInBars?: 0 | 1 | 2;
+  /** Continue quarter-note clicks after count-in, including silent cycle slots. Defaults to false. */
+  readonly metronomeEnabled?: boolean;
+  /** Independent metronome level, as a percentage from 0 to 100. Defaults to 60. */
+  readonly metronomeVolume?: number;
   /** Independent pitch shift in semitones. Defaults to zero. */
   readonly pitchSemitones?: number;
   /** Fixture units per quarter-note beat. Defaults to 4 sixteenth-note units; legacy raw ticks use 16. */
@@ -137,6 +152,14 @@ interface ActivePlayback {
   readonly sampleGain: GainNode;
   readonly beatGain?: GainNode;
   readonly beatSource?: AudioBufferSourceNode;
+  readonly metronomeGain?: GainNode;
+  readonly countInBeats: number;
+  readonly metronomeEnabled: boolean;
+  /** Initial sequence-start anchor. Count-in never reopens at later plan boundaries. */
+  readonly countInEndAt: number;
+  /** Sequence beat-zero anchor; remains stable across Auto-generate plan boundaries. */
+  clickAnchorAt: number;
+  nextMetronomeBeatIndex: number;
   readonly keepAliveSources: readonly ConstantSourceNode[];
   drainEndAt?: number;
   /** Processor for combo samples; also processes the beat when both tempo ratios match. */
@@ -197,6 +220,11 @@ interface SampleSourceState {
   readonly startedAt: number;
 }
 
+interface MetronomeSourceState {
+  readonly scheduledAt: number;
+  readonly envelope: GainNode;
+}
+
 type AudioDecodeJob =
   | { readonly kind: "sample"; readonly sampleId: string }
   | { readonly kind: "beat"; readonly file: File };
@@ -212,6 +240,9 @@ const DEFAULT_START_DELAY_SECONDS = 0.05;
 const MAX_PARALLEL_AUDIO_DECODES = 4;
 const MAX_DYNAMIC_CYCLE_ADVANCES_PER_TICK = 64;
 const MAX_PRESENTATION_EPOCHS = 64;
+const BEATS_PER_BAR = 4;
+const DEFAULT_METRONOME_VOLUME_PERCENT = 60;
+const METRONOME_CLICK_DURATION_SECONDS = 0.045;
 /**
  * Edge actual-worklet PCM probes at 48 kHz measured first/repeated transient offsets of
  * 102–137 ms for common 0.75–1.176 tempo ratios and 0/+3 semitones. Use 130 ms as an
@@ -236,6 +267,7 @@ export class AudioTransport {
   private syntheticBufferCache = new Map<string, AudioBuffer>();
   private selectedSampleVolume = 1;
   private selectedBeatVolume = 1;
+  private selectedMetronomeVolume = DEFAULT_METRONOME_VOLUME_PERCENT / 100;
   private selectedBpm: number | undefined;
   private selectedReferenceBpm: number | undefined;
   private selectedBeatReferenceBpm: number | undefined;
@@ -243,6 +275,7 @@ export class AudioTransport {
   private readonly sources = new Set<AudioBufferSourceNode>();
   private readonly keepAliveSources = new Set<ConstantSourceNode>();
   private readonly sampleSources = new Map<AudioBufferSourceNode, SampleSourceState>();
+  private readonly metronomeSources = new Map<OscillatorNode, MetronomeSourceState>();
   private readonly outputNodes = new Set<AudioNode>();
   private readonly listeners = new Set<(snapshot: TransportSnapshot) => void>();
   private snapshot: TransportSnapshot = Object.freeze({ status: "idle", progress: 0 });
@@ -329,6 +362,16 @@ export class AudioTransport {
     }
   };
 
+  /** Update the click layer without restarting the count-in or metronome phase. */
+  setMetronomeVolume = (value: number): void => {
+    const normalized = volumeValue(value, "Metronome volume");
+    this.selectedMetronomeVolume = normalized;
+    const playback = this.activePlayback;
+    if (playback?.metronomeGain) {
+      setGainValue(playback.metronomeGain, normalized, playback.context.currentTime);
+    }
+  };
+
   /** Change tempo immediately while preserving the current musical position. */
   setTempo = (value: number): void => {
     const bpm = positiveBpm(value, "BPM");
@@ -345,6 +388,9 @@ export class AudioTransport {
     }
     if (!playback.processor && !playback.beatProcessor) {
       throw new Error("Live tempo changes require playback started with a BPM reference.");
+    }
+    if (playback.countInBeats > 0 && this.presentationTimeAt(playback) < playback.countInEndAt) {
+      throw new Error("Tempo is locked during count-in. It becomes live when the sequence starts.");
     }
 
     const tempoRatio = this.validateTempoRatio(bpm, playback.sampleReferenceBpm);
@@ -419,6 +465,12 @@ export class AudioTransport {
       const initialTempoRatio = this.validateTempoRatio(bpm, sampleReferenceBpm);
       const initialBeatTempoRatio = this.validateTempoRatio(bpm, beatReferenceBpm);
       const initialPitch = pitchValue(options.pitchSemitones ?? this.selectedPitchSemitones);
+      const countInBars = countInBarsValue(options.countInBars);
+      if (options.metronomeEnabled !== undefined && typeof options.metronomeEnabled !== "boolean") {
+        throw new Error("Metronome enabled must be a boolean.");
+      }
+      const metronomeEnabled = options.metronomeEnabled ?? false;
+      const countInBeats = countInBars * BEATS_PER_BAR;
       const hasBeat = Boolean(options.beatFile || options.beatBuffer);
       if (options.beatFile && options.beatBuffer) {
         throw new Error("Pass either a beat file or its decoded beat buffer, not both.");
@@ -437,6 +489,10 @@ export class AudioTransport {
       this.selectedPitchSemitones = initialPitch;
       this.selectedSampleVolume = volumeValue(options.sampleVolume, "Sample volume");
       this.selectedBeatVolume = volumeValue(options.beatVolume, "Beat volume");
+      this.selectedMetronomeVolume = volumeValue(
+        options.metronomeVolume ?? DEFAULT_METRONOME_VOLUME_PERCENT,
+        "Metronome volume",
+      );
       const assets = options.assets ?? new Map<string, File>();
       const sampleIds = new Set(timeline.events.filter((event) => !event.silent).map((event) => event.sampleId));
       for (const sampleId of options.preloadSampleIds ?? []) {
@@ -544,8 +600,17 @@ export class AudioTransport {
       sampleGain.connect(sampleOutput);
       this.outputNodes.add(sampleGain);
 
-      const startAt = context.currentTime + this.startDelaySeconds;
+      const secondsPerBeat = timeline.secondsPerUnit * timeline.unitsPerBeat;
+      const startAt = context.currentTime + this.startDelaySeconds + countInBeats * secondsPerBeat;
       const fixtureEndAt = startAt + timeline.totalSeconds;
+      const metronomeGain = countInBeats > 0 || metronomeEnabled
+        ? context.createGain()
+        : undefined;
+      if (metronomeGain) {
+        metronomeGain.gain.value = this.selectedMetronomeVolume;
+        metronomeGain.connect(context.destination);
+        this.outputNodes.add(metronomeGain);
+      }
       const beatOutput = dedicatedBeatProcessor ?? processor ?? context.destination;
       const beat = beatBuffer
         ? this.scheduleBeat(
@@ -586,6 +651,12 @@ export class AudioTransport {
         buffers,
         sampleGain,
         ...(beat ? { beatGain: beat.gain, beatSource: beat.source } : {}),
+        ...(metronomeGain ? { metronomeGain } : {}),
+        countInBeats,
+        metronomeEnabled,
+        countInEndAt: startAt,
+        clickAnchorAt: startAt,
+        nextMetronomeBeatIndex: countInBeats > 0 ? -countInBeats : 0,
         keepAliveSources,
         ...(processor ? { processor } : {}),
         ...(dedicatedBeatProcessor ? { beatProcessor: dedicatedBeatProcessor } : {}),
@@ -623,21 +694,6 @@ export class AudioTransport {
       };
       this.activePlayback = playback;
 
-      this.publish(cyclePlan
-        ? {
-          status: "playing",
-          progress: 0,
-          presentation: this.presentationAt(playback, this.presentationTimeAt(playback)),
-          cycleSlotIndex: 0,
-          cycleIteration: 1,
-          cycleSlotKind: cyclePlan.slots[0]!.kind,
-          ...(dynamicCycleConfig ? { cyclePlanIndex: 1 } : {}),
-        }
-        : {
-          status: "playing",
-          progress: 0,
-          presentation: this.presentationAt(playback, this.presentationTimeAt(playback)),
-        });
       this.intervalHandle = this.scheduleInterval(() => this.tick(generation), this.schedulerIntervalMs);
       this.tick(generation);
     } catch (error) {
@@ -694,6 +750,8 @@ export class AudioTransport {
       } else {
         this.scheduleFixtureEvents(playback, now, schedulingHorizon);
       }
+      if (!this.isCurrent(generation) || this.activePlayback !== playback) return;
+      this.scheduleMetronomeClicks(playback, now, schedulingHorizon);
     } catch (error) {
       if (!this.isCurrent(generation)) return;
       this.cancelRun();
@@ -721,11 +779,13 @@ export class AudioTransport {
       return;
     }
 
+    const countIn = this.countInAt(playback, presentationTime);
     if (playback.cyclePlan) {
       const phase = cyclePhaseAt(now, playback.startAt, playback.cyclePlan, playback.cycleIterationBase);
       this.publish({
-        status: "playing",
-        progress: repeatingProgressAt(now, playback.startAt, playback.cyclePlan.totalSeconds),
+        status: countIn ? "counting-in" : "playing",
+        progress: countIn ? 0 : repeatingProgressAt(now, playback.startAt, playback.cyclePlan.totalSeconds),
+        ...(countIn ? { countIn } : {}),
         presentation,
         cycleSlotIndex: phase.slotIndex,
         cycleIteration: phase.iteration,
@@ -736,13 +796,18 @@ export class AudioTransport {
     }
 
     this.publish({
-      status: "playing",
-      progress: progressAt(now, playback.startAt, playback.timeline.totalSeconds),
+      status: countIn ? "counting-in" : "playing",
+      progress: countIn ? 0 : progressAt(now, playback.startAt, playback.timeline.totalSeconds),
+      ...(countIn ? { countIn } : {}),
       presentation,
     });
   }
 
   private presentationTimeAt(playback: ActivePlayback): number {
+    return this.outputTimeAt(playback) - playback.presentationDelaySeconds;
+  }
+
+  private outputTimeAt(playback: ActivePlayback): number {
     const context = playback.context;
     let outputTime = context.currentTime;
     const getOutputTimestamp = context.getOutputTimestamp;
@@ -770,7 +835,18 @@ export class AudioTransport {
       }
     }
     playback.lastOutputContextTime = Math.max(playback.lastOutputContextTime, outputTime);
-    return playback.lastOutputContextTime - playback.presentationDelaySeconds;
+    return playback.lastOutputContextTime;
+  }
+
+  private countInAt(playback: ActivePlayback, presentationTime: number): CountInProgress | undefined {
+    if (playback.countInBeats === 0 || presentationTime >= playback.countInEndAt) return undefined;
+    const secondsPerBeat = playback.timeline.secondsPerUnit * playback.timeline.unitsPerBeat;
+    const countInStartAt = playback.countInEndAt - playback.countInBeats * secondsPerBeat;
+    const elapsedBeats = (presentationTime - countInStartAt) / secondsPerBeat;
+    return {
+      beat: Math.max(1, Math.min(playback.countInBeats, Math.floor(elapsedBeats) + 1)),
+      beats: playback.countInBeats,
+    };
   }
 
   private presentationAt(playback: ActivePlayback, presentationTime: number): TransportPresentation {
@@ -875,6 +951,90 @@ export class AudioTransport {
 
       playback.nextEventIndex += 1;
       this.scheduleEvent(playback, event, when, now);
+    }
+  }
+
+  private scheduleMetronomeClicks(playback: ActivePlayback, now: number, schedulingHorizon: number): void {
+    if (!playback.metronomeGain) return;
+    if (!playback.metronomeEnabled && playback.nextMetronomeBeatIndex >= 0) return;
+
+    const secondsPerBeat = playback.timeline.secondsPerUnit * playback.timeline.unitsPerBeat;
+    const clickDelay = playback.presentationDelaySeconds;
+    const firstCurrentBeat = Math.ceil((now - clickDelay - playback.clickAnchorAt) / secondsPerBeat - 1e-9);
+    playback.nextMetronomeBeatIndex = Math.max(playback.nextMetronomeBeatIndex, firstCurrentBeat);
+
+    while (true) {
+      const beatIndex = playback.nextMetronomeBeatIndex;
+      const beatAt = playback.clickAnchorAt + beatIndex * secondsPerBeat;
+      if (beatIndex >= 0 && !playback.cyclePlan && beatAt >= playback.fixtureEndAt) return;
+      const when = beatAt + clickDelay;
+      if (when > schedulingHorizon) return;
+      playback.nextMetronomeBeatIndex += 1;
+      if (beatIndex < 0 && playback.countInBeats === 0) continue;
+      if (beatIndex >= 0 && !playback.metronomeEnabled) continue;
+      this.scheduleMetronomeClick(playback, beatIndex, when);
+    }
+  }
+
+  private scheduleMetronomeClick(playback: ActivePlayback, beatIndex: number, when: number): void {
+    const output = playback.metronomeGain;
+    if (!output) return;
+    const context = playback.context;
+    const accent = beatIndex % BEATS_PER_BAR === 0;
+    const oscillator = context.createOscillator();
+    const envelope = context.createGain();
+    oscillator.type = "sine";
+    oscillator.frequency.value = accent ? 1_760 : 1_320;
+    envelope.gain.setValueAtTime(0, when);
+    envelope.gain.linearRampToValueAtTime(accent ? 0.8 : 0.48, when + 0.002);
+    envelope.gain.exponentialRampToValueAtTime(0.0001, when + METRONOME_CLICK_DURATION_SECONDS);
+    oscillator.connect(envelope);
+    envelope.connect(output);
+    this.outputNodes.add(envelope);
+    this.metronomeSources.set(oscillator, { scheduledAt: when, envelope });
+    oscillator.onended = () => this.releaseMetronomeSource(oscillator);
+
+    try {
+      oscillator.start(when);
+      oscillator.stop(when + METRONOME_CLICK_DURATION_SECONDS);
+    } catch (error) {
+      this.releaseMetronomeSource(oscillator);
+      try {
+        oscillator.stop(0);
+      } catch {
+        // The oscillator may not have started.
+      }
+      throw error;
+    }
+  }
+
+  private releaseMetronomeSource(source: OscillatorNode): void {
+    source.onended = null;
+    const state = this.metronomeSources.get(source);
+    this.metronomeSources.delete(source);
+    try {
+      source.disconnect();
+    } catch {
+      // The oscillator may already have disconnected at its end.
+    }
+    if (state) {
+      this.outputNodes.delete(state.envelope);
+      disconnectNode(state.envelope);
+    }
+  }
+
+  private cancelFutureMetronomeClicks(now: number, presentationDelaySeconds: number): void {
+    for (const [source, state] of this.metronomeSources) {
+      // A click whose musical onset passed is already part of the current phrase,
+      // even if output latency means its oscillator start is still in the future.
+      if (state.scheduledAt <= now + presentationDelaySeconds) continue;
+      source.onended = null;
+      try {
+        source.stop(0);
+      } catch {
+        // The click may already have ended during a tempo change.
+      }
+      this.releaseMetronomeSource(source);
     }
   }
 
@@ -1332,6 +1492,26 @@ export class AudioTransport {
     this.sources.clear();
     this.sampleSources.clear();
 
+    for (const [source, state] of this.metronomeSources) {
+      source.onended = null;
+      try {
+        source.stop(0);
+      } catch {
+        // Stop is best-effort for click nodes that already ended.
+      }
+      try {
+        source.disconnect();
+      } catch {
+        // Ignore duplicate disconnects during cancellation.
+      }
+      try {
+        state.envelope.disconnect();
+      } catch {
+        // The click envelope may already have been disconnected by its end callback.
+      }
+    }
+    this.metronomeSources.clear();
+
     for (const source of this.keepAliveSources) {
       source.onended = null;
       try {
@@ -1372,6 +1552,15 @@ export class AudioTransport {
     }
 
     const now = playback.context.currentTime;
+    // Commit any click whose musical onset has passed under the old phase before
+    // moving the beat cursor. With a 130 ms processor delay and a 100 ms lookahead,
+    // that click can still be just outside the regular scheduler's output horizon.
+    this.scheduleMetronomeClicks(
+      playback,
+      now,
+      now + playback.presentationDelaySeconds,
+    );
+    this.cancelFutureMetronomeClicks(now, playback.presentationDelaySeconds);
     let activatedPlanAtBoundary = false;
     const dynamic = playback.dynamicCycle;
     if (dynamic?.awaitingBoundaryAt !== undefined && now >= dynamic.awaitingBoundaryAt) {
@@ -1395,6 +1584,8 @@ export class AudioTransport {
 
     const oldSecondsPerUnit = playback.timeline.secondsPerUnit;
     const hadStarted = now >= playback.startAt;
+    const oldBeatPosition = (now - playback.clickAnchorAt)
+      / (oldSecondsPerUnit * playback.timeline.unitsPerBeat);
     const oldElapsedSeconds = Math.max(0, now - playback.startAt);
     const oldCycleLength = playback.cyclePlan?.totalSeconds;
     const previousIteration = oldCycleLength
@@ -1409,6 +1600,11 @@ export class AudioTransport {
       ? rescaleCyclePlanTimeline(playback.cyclePlan, bpm)
       : rescaleFixtureTimeline(playback.timeline, bpm);
     if (playback.cyclePlan) playback.cyclePlan = playback.timeline as CyclePlanTimeline;
+    if (hadStarted) {
+      const newSecondsPerBeat = playback.timeline.secondsPerUnit * playback.timeline.unitsPerBeat;
+      playback.clickAnchorAt = now - oldBeatPosition * newSecondsPerBeat;
+      playback.nextMetronomeBeatIndex = Math.max(0, Math.floor(oldBeatPosition) + 1);
+    }
     playback.tempoRatio = tempoRatio;
     playback.beatTempoRatio = this.validateTempoRatio(bpm, playback.beatReferenceBpm);
     playback.startAt = hadStarted
@@ -1599,6 +1795,14 @@ function volumeValue(value: number | undefined, label: string): number {
     throw new Error(`${label} must be a finite percentage between 0 and 100.`);
   }
   return normalized / 100;
+}
+
+function countInBarsValue(value: 0 | 1 | 2 | undefined): 0 | 1 | 2 {
+  const bars = value ?? 0;
+  if (bars !== 0 && bars !== 1 && bars !== 2) {
+    throw new Error("Count-in must be disabled or set to one or two 4/4 bars.");
+  }
+  return bars;
 }
 
 function positiveBpm(value: number, label: string): number {

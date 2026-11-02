@@ -24,6 +24,9 @@ function validSnapshot(): SavedSessionData {
     largePause: false,
     autoGenerate: false,
     autoGenerateRounds: 2,
+    countInBars: 0,
+    metronomeEnabled: false,
+    metronomeVolume: 60,
     omittedZeroDurationCount: 0,
     presetFileName: null,
     sourceIniText: null,
@@ -76,6 +79,28 @@ describe('saved session payload validation', () => {
     const legacyCustom = validateSavedSessionData(legacyWithCustomBeat)
     expect(legacyCustom.beatTrims).toEqual({})
     expect(legacyCustom.customBeatTrimId).toMatch(/^legacy-/)
+  })
+
+  it('defaults older v1 playback-prep fields and strictly validates new settings', () => {
+    const legacy = { ...validSnapshot() } as Partial<SavedSessionData>
+    delete legacy.countInBars
+    delete legacy.metronomeEnabled
+    delete legacy.metronomeVolume
+
+    const restored = validateSavedSessionData(legacy)
+    expect(restored.countInBars).toBe(0)
+    expect(restored.metronomeEnabled).toBe(false)
+    expect(restored.metronomeVolume).toBe(60)
+
+    const configured = { ...validSnapshot(), countInBars: 2 as const, metronomeEnabled: true, metronomeVolume: 37 }
+    expect(validateSavedSessionData(configured)).toEqual(expect.objectContaining({
+      countInBars: 2,
+      metronomeEnabled: true,
+      metronomeVolume: 37,
+    }))
+    expect(() => validateSavedSessionData({ ...configured, countInBars: 3 })).toThrow(/invalid settings or audio metadata/i)
+    expect(() => validateSavedSessionData({ ...configured, metronomeVolume: Number.POSITIVE_INFINITY })).toThrow(/invalid settings or audio metadata/i)
+    expect(() => validateSavedSessionData({ ...configured, metronomeVolume: 101 })).toThrow(/invalid settings or audio metadata/i)
   })
 
   it('accepts source-scoped cue and loop regions and rejects invalid bounds or ownership', () => {

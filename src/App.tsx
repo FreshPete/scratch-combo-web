@@ -6,6 +6,7 @@ import {
   analyzeLocalAudioFile, AudioTransport, LocalWavSnapshotError, snapshotReferencedWavFiles,
   type CyclePlanOptions, type CycleSlot, type PlayOptions, type SnapshotFileValidation,
 } from './audio'
+import { PracticePrepControls, type CountInBars } from './PracticePrepControls'
 import { getTempoRange, SessionControls, type CustomBeatAnalysisStatus } from './SessionControls'
 import { PracticeLibrary } from './PracticeLibrary'
 import {
@@ -1361,10 +1362,11 @@ export default function App() {
   const presentationCycleSlotIndex = presentation?.cycleSlotIndex
   const presentationCycleIteration = presentation?.cycleIteration
   const presentationCyclePlanIndex = presentation?.cyclePlanIndex
-  const isPlaybackLocked = transportSnapshot.status === 'loading' || transportSnapshot.status === 'playing'
+  const isCountInActive = transportSnapshot.status === 'counting-in'
+  const isPlaybackLocked = transportSnapshot.status === 'loading' || isCountInActive || transportSnapshot.status === 'playing'
   const isPlaybackLockedNow = () => {
     const status = transport.getSnapshot().status
-    return status === 'loading' || status === 'playing'
+    return status === 'loading' || status === 'counting-in' || status === 'playing'
   }
   const [preset, setPreset] = useState<Preset>(DEMO_PRESET)
   const [fixture, setFixture] = useState<Fixture | null>(null)
@@ -1378,6 +1380,9 @@ export default function App() {
   const [largePause, setLargePause] = useState(false)
   const [autoGenerate, setAutoGenerate] = useState(false)
   const [autoGenerateRounds, setAutoGenerateRounds] = useState<number>(2)
+  const [countInBars, setCountInBars] = useState<CountInBars>(0)
+  const [metronomeEnabled, setMetronomeEnabled] = useState(false)
+  const [metronomeVolume, setMetronomeVolume] = useState(60)
   const [omittedZeroDurationCount, setOmittedZeroDurationCount] = useState(0)
   const [presetFileName, setPresetFileName] = useState<string | null>(null)
   const [sourceIniText, setSourceIniText] = useState<string | null>(null)
@@ -1585,6 +1590,9 @@ export default function App() {
       largePause,
       autoGenerate,
       autoGenerateRounds,
+      countInBars,
+      metronomeEnabled,
+      metronomeVolume,
       omittedZeroDurationCount,
       presetFileName,
       sourceIniText,
@@ -1826,6 +1834,9 @@ export default function App() {
       setLargePause(data.largePause)
       setAutoGenerate(data.autoGenerate)
       setAutoGenerateRounds(data.autoGenerateRounds)
+      setCountInBars(data.countInBars)
+      setMetronomeEnabled(data.metronomeEnabled)
+      setMetronomeVolume(data.metronomeVolume)
       setOmittedZeroDurationCount(data.omittedZeroDurationCount)
       setPresetFileName(data.presetFileName)
       setSourceIniText(data.sourceIniText)
@@ -1860,6 +1871,7 @@ export default function App() {
       transport.setPitchSemitones(data.pitchSemitones)
       transport.setSampleVolume(data.sampleVolume)
       transport.setBeatVolume(data.beatVolume)
+      transport.setMetronomeVolume(data.metronomeVolume)
       setIsPresetReady(true)
       setIsBootstrapLoading(false)
       setBootstrapError(null)
@@ -2595,6 +2607,7 @@ export default function App() {
   }
 
   const handleBpmChange = (value: string) => {
+    if (transport.getSnapshot().status === 'counting-in') return
     setBpm(value)
     const nextBpm = Number(value)
     if (selectedTempoRange && Number.isFinite(nextBpm) && nextBpm >= selectedTempoRange.min && nextBpm <= selectedTempoRange.max) {
@@ -2640,7 +2653,31 @@ export default function App() {
     transport.setBeatVolume(value)
   }
 
+  const handleCountInBarsChange = (value: CountInBars) => {
+    if (isPlaybackLockedNow() || ![0, 1, 2].includes(value)) return
+    setCountInBars(value)
+    setTransportNote(value === 0
+      ? 'Count-in is off. Play the sequence to start immediately.'
+      : 'Count-in set to ' + value + ' ' + (value === 1 ? 'bar' : 'bars') + ' before the sequence.')
+  }
+
+  const handleMetronomeEnabledChange = (enabled: boolean) => {
+    if (isPlaybackLockedNow() || enabled === metronomeEnabled) return
+    setMetronomeEnabled(enabled)
+    setTransportNote(enabled
+      ? 'Metronome enabled. Clicks will continue through the sequence.'
+      : 'Metronome disabled. Any selected count-in will still click.')
+  }
+
+  const handleMetronomeVolumeChange = (value: number) => {
+    if (!Number.isFinite(value) || value < 0 || value > 100) return
+    const nextVolume = Math.round(value)
+    setMetronomeVolume(nextVolume)
+    transport.setMetronomeVolume(nextVolume)
+  }
+
   const handleResetSessionControls = () => {
+    if (transport.getSnapshot().status === 'counting-in') return
     const defaults = sourceControlDefaultsRef.current
     const customRange = customBeatSelected && customBeatReferenceBpm !== null
       ? getTempoRange(preset.bpm, customBeatReferenceBpm)
@@ -2653,10 +2690,12 @@ export default function App() {
     setPitchSemitones(0)
     setSampleVolume(defaults.sampleVolume)
     setBeatVolume(defaults.beatVolume)
+    setMetronomeVolume(60)
     if (transportSnapshot.status === 'playing' || transportSnapshot.status === 'loading') transport.setTempo(resetBpmValue)
     transport.setPitchSemitones(0)
     transport.setSampleVolume(defaults.sampleVolume)
     transport.setBeatVolume(defaults.beatVolume)
+    transport.setMetronomeVolume(60)
     setActionError(null)
     setTransportNote(customRange
       ? 'Controls reset. Practice tempo is ' + resetBpmValue + ' BPM for the selected custom beat. Playback continues.'
@@ -2970,6 +3009,7 @@ export default function App() {
       assets: sampleAssets,
       sampleVolume,
       beatVolume,
+      ...(target?.kind === 'sequence' ? { countInBars, metronomeEnabled, metronomeVolume } : {}),
       ...(includeBeat && selectedBeatFile ? { beatFile: selectedBeatFile } : {}),
       ...(includeBeat && activeBeatTrim ? { beatPlaybackRegion: activeBeatTrim } : {}),
       ...(includeBeat && customBeatSelected && customBeatBuffer && beatReferenceBpm !== null
@@ -3077,13 +3117,17 @@ export default function App() {
   }
 
   const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating || isCustomBeatAnalysisBusy || isPlaybackLocked || autoGenerateBlocked || !customBeatReferenceInputValid || !sessionTempoValid || savedLibraryBusy
-  const stopDisabled = transportSnapshot.status !== 'playing' && transportSnapshot.status !== 'loading'
+  const stopDisabled = transportSnapshot.status !== 'playing' && transportSnapshot.status !== 'loading' && !isCountInActive
   const isSequencePlaying = playbackTarget?.kind === 'sequence' && transportSnapshot.status === 'playing'
   const displayedProgress = transportSnapshot.status === 'playing' ? presentation?.progress : undefined
-  const progressPercent = transportSnapshot.status === 'completed'
+  const progressPercent = isCountInActive
+    ? 0
+    : transportSnapshot.status === 'completed'
     ? 1
     : Math.max(0, Math.min(1, displayedProgress ?? transportSnapshot.progress))
-  const timelineProgressPercent = presentation?.started && fixture
+  const timelineProgressPercent = isCountInActive
+    ? 0
+    : presentation?.started && fixture
     ? Math.max(0, Math.min(1, presentation.positionUnits / Math.max(fixture.totalUnits, 1)))
     : progressPercent
   const visibleFixturePlanMatches = visibleCyclePlanIndex === null
@@ -3112,7 +3156,12 @@ export default function App() {
   const visibleStagedAudioCount = stagedAudioFiles.length || preparedLocalImport?.selectedAudioFileCount || 0
   const sessionControlsDisabled = !isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy || savedLibraryBusy
   const savedLibraryControlsBusy = savedLibraryBusy || isReadingPreset || isGenerating || isPreparingLocalImport || isPlaybackLocked || isCustomBeatAnalysisBusy || isSavingIni
-  const resetControlsDisabled = sessionControlsDisabled
+  const resetControlsDisabled = sessionControlsDisabled || isCountInActive
+  const transportStatusText = isCountInActive && transportSnapshot.countIn
+    ? 'Count-in · beat ' + transportSnapshot.countIn.beat + ' of ' + transportSnapshot.countIn.beats + '.'
+    : isCountInActive
+      ? 'Count-in in progress.'
+      : transportNote
 
   shortcutActionsRef.current = {
     playDisabled: playDisabled || isReadingPreset,
@@ -3218,7 +3267,7 @@ export default function App() {
           </div>
           <div className="transport-dock__meter">
             <progress value={progressPercent} max="1" aria-label="Preview progress" />
-            <span className="transport-status" role="status" aria-live="polite" aria-atomic="true">{transportNote}</span>
+            <span className="transport-status" role="status" aria-live="polite" aria-atomic="true">{transportStatusText}</span>
           </div>
           {isPlaybackLocked && <p className="playback-lock-note" role="status">Stop playback to change combo options, beat source, or sample settings.</p>}
           {isCustomBeatAnalysisBusy && <p className="playback-lock-note" role="status">Custom beat is loading locally. Playback will stay stopped until analysis finishes.</p>}
@@ -3292,20 +3341,31 @@ export default function App() {
               ? <p>Selection follows the recovered weighted, direction, and repeat rules. This browser uses quantized 24-bit random draws; the original VB6 time-seeded sequence is not reproduced. Playback follows the exact BPM clock in Web Audio, not Windows timer intervals or their jitter.</p>
               : <p>Fixed preview; legacy generator not recovered. This ordered fixture fills a 32-unit window for practice and transport review.</p>}
           </details>
-          {isImportedPreset && (
-            <PracticeCycleControls
-              mode={practiceMode}
-              largePause={largePause}
-              disabled={isReadingPreset || isGenerating || isPlaybackLocked || savedLibraryBusy}
-              autoGenerate={autoGenerate}
-              autoGenerateRounds={autoGenerateRounds}
-              autoGenerateHint={autoGenerateHint}
-              onModeChange={handlePracticeModeChange}
-              onLargePauseChange={handleLargePauseChange}
-              onAutoGenerateChange={handleAutoGenerateChange}
-              onAutoGenerateRoundsChange={handleAutoGenerateRoundsChange}
+          <div className="practice-settings">
+            <PracticePrepControls
+              countInBars={countInBars}
+              metronomeEnabled={metronomeEnabled}
+              metronomeVolume={metronomeVolume}
+              settingsDisabled={!isPresetReady || isReadingPreset || isGenerating || isPlaybackLocked || savedLibraryBusy}
+              onCountInBarsChange={handleCountInBarsChange}
+              onMetronomeEnabledChange={handleMetronomeEnabledChange}
+              onMetronomeVolumeChange={handleMetronomeVolumeChange}
             />
-          )}
+            {isImportedPreset && (
+              <PracticeCycleControls
+                mode={practiceMode}
+                largePause={largePause}
+                disabled={isReadingPreset || isGenerating || isPlaybackLocked || savedLibraryBusy}
+                autoGenerate={autoGenerate}
+                autoGenerateRounds={autoGenerateRounds}
+                autoGenerateHint={autoGenerateHint}
+                onModeChange={handlePracticeModeChange}
+                onLargePauseChange={handleLargePauseChange}
+                onAutoGenerateChange={handleAutoGenerateChange}
+                onAutoGenerateRoundsChange={handleAutoGenerateRoundsChange}
+              />
+            )}
+          </div>
           {fixture
             ? <SequenceTimeline
                 fixture={fixture}
@@ -3391,6 +3451,8 @@ export default function App() {
           beatTrimSourceBuffer={customBeatSelected ? customBeatBuffer : null}
           beatTrim={activeBeatTrim}
           disabled={sessionControlsDisabled}
+          tempoLocked={isCountInActive}
+          resetDisabled={resetControlsDisabled}
           beatSelectionDisabled={isPlaybackLocked || isCustomBeatAnalysisBusy || savedLibraryBusy}
           onBpmChange={handleBpmChange}
           onPitchChange={handlePitchChange}

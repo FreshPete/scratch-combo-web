@@ -15,6 +15,12 @@ interface FakeKeepAliveRecord {
   readonly stopTimes: number[];
 }
 
+interface FakeOscillatorRecord {
+  readonly node: OscillatorNode;
+  readonly startTimes: number[];
+  readonly stopTimes: number[];
+}
+
 function makeBuffer(duration = 0.2, sampleRate = 48_000): AudioBuffer {
   const length = Math.max(1, Math.round(duration * sampleRate));
   const channel = new Float32Array(length);
@@ -33,6 +39,8 @@ function makeFakeParam(initialValue = 1) {
     cancelScheduledValues: vi.fn(),
     setValueAtTime: vi.fn((value: number) => { parameter.value = value; }),
     setTargetAtTime: vi.fn((value: number) => { parameter.value = value; }),
+    linearRampToValueAtTime: vi.fn((value: number) => { parameter.value = value; }),
+    exponentialRampToValueAtTime: vi.fn((value: number) => { parameter.value = value; }),
   };
   return parameter;
 }
@@ -59,6 +67,7 @@ function makeFakeAudioContext(decodeAudioData?: (data: ArrayBuffer) => Promise<A
   let state: AudioContextState = "suspended";
   const sources: FakeSourceRecord[] = [];
   const keepAliveSources: FakeKeepAliveRecord[] = [];
+  const oscillators: FakeOscillatorRecord[] = [];
   const gains: GainNode[] = [];
   const contextLike = {
     get currentTime() { return currentTime; },
@@ -77,7 +86,10 @@ function makeFakeAudioContext(decodeAudioData?: (data: ArrayBuffer) => Promise<A
       const gainParam = {
         value: 1,
         cancelScheduledValues: vi.fn(),
+        setValueAtTime: vi.fn((value: number) => { gainParam.value = value; }),
         setTargetAtTime: vi.fn((value: number) => { gainParam.value = value; }),
+        linearRampToValueAtTime: vi.fn((value: number) => { gainParam.value = value; }),
+        exponentialRampToValueAtTime: vi.fn((value: number) => { gainParam.value = value; }),
       };
       const node = {
         gain: gainParam,
@@ -127,12 +139,30 @@ function makeFakeAudioContext(decodeAudioData?: (data: ArrayBuffer) => Promise<A
       sources.push({ node, startTimes, startOffsets, stopTimes });
       return node;
     }),
+    createOscillator: vi.fn(() => {
+      const startTimes: number[] = [];
+      const stopTimes: number[] = [];
+      let node: OscillatorNode;
+      const oscillatorLike = {
+        type: "sine" as OscillatorType,
+        frequency: makeFakeParam(440),
+        onended: null as OscillatorNode["onended"],
+        start: vi.fn((when = 0) => { startTimes.push(when); }),
+        stop: vi.fn((when = 0) => { stopTimes.push(when); }),
+        connect: vi.fn(() => node),
+        disconnect: vi.fn(),
+      };
+      node = oscillatorLike as unknown as OscillatorNode;
+      oscillators.push({ node, startTimes, stopTimes });
+      return node;
+    }),
   };
 
   return {
     context: contextLike as unknown as AudioContext,
     sources,
     keepAliveSources,
+    oscillators,
     gains,
     setCurrentTime: (value: number) => { currentTime = value; },
     setOutputLatency: (value: number) => { outputLatencySeconds = value; },
@@ -140,10 +170,15 @@ function makeFakeAudioContext(decodeAudioData?: (data: ArrayBuffer) => Promise<A
   };
 }
 
-function makeTransport(context: AudioContext, tempoPitchProcessorFactory?: () => Promise<AudioNode>) {
+function makeTransport(
+  context: AudioContext,
+  tempoPitchProcessorFactory?: () => Promise<AudioNode>,
+  lookAheadSeconds?: number,
+) {
   let tick: (() => void) | undefined;
   const transport = new AudioTransport({
     audioContextFactory: () => context,
+    ...(lookAheadSeconds === undefined ? {} : { lookAheadSeconds }),
     scheduleInterval: (callback) => {
       tick = callback;
       return callback;
@@ -209,6 +244,357 @@ describe("AudioTransport", () => {
     runScheduler();
     expect(fake.sources.map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55, 1.05]);
     expect(transport.getProgress()).toBeCloseTo(0.6);
+    transport.dispose();
+  });
+
+  it("counts in one 4/4 bar before starting the trimmed beat and first sequence source", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const beatBuffer = makeBuffer(2);
+    const oneHit: Fixture = {
+      events: [{ id: "count-in-hit", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+
+    await transport.play({
+      fixture: oneHit,
+      bpm: 120,
+      countInBars: 1,
+      beatBuffer,
+      beatPlaybackRegion: { startOffsetSeconds: 0.25, loopEndSeconds: 1.75 },
+      metronomeEnabled: false,
+      metronomeVolume: 35,
+    });
+
+    expect(transport.getSnapshot()).toMatchObject({
+      status: "counting-in",
+      progress: 0,
+      countIn: { beat: 1, beats: 4 },
+    });
+    const beatSource = fake.sources.find(({ node }) => node.loop);
+    expect(beatSource?.startTimes).toEqual([2.05]);
+    expect(beatSource?.startOffsets).toEqual([0.25]);
+    expect(fake.oscillators).toHaveLength(1);
+    expect(fake.oscillators[0]?.startTimes[0]).toBeCloseTo(0.05);
+    expect(fake.oscillators[0]?.node.frequency.value).toBe(1_760);
+
+    fake.setCurrentTime(0.55);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ status: "counting-in", countIn: { beat: 2, beats: 4 } });
+    expect(fake.oscillators).toHaveLength(2);
+    expect(fake.oscillators[1]?.startTimes[0]).toBeCloseTo(0.55);
+    expect(fake.oscillators[1]?.node.frequency.value).toBe(1_320);
+
+    fake.setCurrentTime(2.05);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", progress: 0 });
+    expect(transport.getSnapshot()).not.toHaveProperty("countIn");
+    const firstSample = fake.sources.find(({ node }) => !node.loop);
+    expect(firstSample?.startTimes).toEqual([2.05]);
+    expect(beatSource?.startTimes).toEqual([2.05]);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("keeps ongoing metronome clicks on quarter beats through silent cycle slots", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const oneBeat: Fixture = {
+      events: [{ id: "silent-beat", sampleId: "synthSilence", startUnits: 0, durationUnits: 4, silent: true }],
+      totalUnits: 4,
+    };
+    await transport.playCyclePlan({
+      slots: [
+        { kind: "fixture", fixture: oneBeat },
+        { kind: "silence", durationUnits: 4 },
+      ],
+      bpm: 120,
+      metronomeEnabled: true,
+    });
+
+    expect(fake.oscillators.map(({ startTimes }) => startTimes[0])).toEqual([0.05]);
+    expect(fake.oscillators[0]?.node.frequency.value).toBe(1_760);
+    fake.setCurrentTime(0.45);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ cycleSlotKind: "fixture" });
+    expect(fake.oscillators.map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55]);
+    expect(fake.oscillators[1]?.node.frequency.value).toBe(1_320);
+
+    fake.setCurrentTime(0.55);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ cycleSlotKind: "silence" });
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("retimes future metronome clicks without replaying the current beat and updates its level live", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport } = makeTransport(fake.context, async () => processor.node, 0.7);
+    await transport.play({
+      fixture,
+      bpm: 120,
+      referenceBpm: 120,
+      metronomeEnabled: true,
+    });
+
+    fake.setCurrentTime(0.4);
+    transport.setTempo(100);
+    transport.setMetronomeVolume(25);
+    expect(fake.gains[1]?.gain.value).toBeCloseTo(0.25);
+
+    expect(fake.oscillators).toHaveLength(3);
+    expect(fake.oscillators[0]?.startTimes[0]).toBeCloseTo(0.18);
+    expect(fake.oscillators[1]?.startTimes[0]).toBeCloseTo(0.68);
+    expect(fake.oscillators[2]?.startTimes[0]).toBeCloseTo(0.71);
+    expect(fake.oscillators[1]?.stopTimes.at(-1)).toBe(0);
+    expect(fake.oscillators[2]?.node.frequency.value).toBe(1_320);
+    const firstSample = fake.sources.find(({ node }) => !node.loop);
+    expect(fake.oscillators[0]?.startTimes[0]! - firstSample?.startTimes[0]!).toBeCloseTo(0.13);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("flushes an already-onset click before tempo rephase when lookahead is shorter than processor delay", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    await transport.play({
+      fixture,
+      bpm: 120,
+      referenceBpm: 120,
+      metronomeEnabled: true,
+    });
+
+    expect(fake.oscillators).toHaveLength(0);
+    fake.setCurrentTime(0.56);
+    transport.setTempo(100);
+
+    const beatOneClick = fake.oscillators.find(({ startTimes }) => Math.abs(startTimes[0]! - 0.68) < 1e-9);
+    expect(beatOneClick).toBeDefined();
+    expect(beatOneClick?.stopTimes).toHaveLength(1);
+    expect(beatOneClick?.stopTimes[0]).toBeCloseTo(0.725);
+
+    fake.setCurrentTime(1.18);
+    runScheduler();
+    expect(fake.oscillators.filter(({ startTimes }) => Math.abs(startTimes[0]! - 0.68) < 1e-9)).toHaveLength(1);
+    const nextClick = fake.oscillators.find(({ startTimes }) => Math.abs(startTimes[0]! - 1.278) < 1e-9);
+    expect(nextClick).toBeDefined();
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("keeps count-in complete across an Auto-generate boundary with processor delay", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const silentBar: Fixture = {
+      events: [{ id: "count-in-silent-bar", sampleId: "synthSilence", startUnits: 0, durationUnits: 16, silent: true }],
+      totalUnits: 16,
+    };
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: silentBar }],
+      cyclesPerPlan: 1,
+      nextPlan: () => ({ slots: [{ kind: "fixture", fixture: silentBar }] }),
+      bpm: 120,
+      referenceBpm: 120,
+      countInBars: 1,
+    });
+    expect(transport.getSnapshot()).toMatchObject({ status: "counting-in", countIn: { beat: 1, beats: 4 } });
+
+    fake.setCurrentTime(4.05);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2 });
+    expect(transport.getSnapshot()).not.toHaveProperty("countIn");
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("locks tempo until the delayed presentation clock has completed count-in", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    await transport.play({ fixture, bpm: 120, referenceBpm: 120, countInBars: 1 });
+
+    fake.setCurrentTime(2.06);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ status: "counting-in" });
+    expect(() => transport.setTempo(100)).toThrow("Tempo is locked during count-in");
+
+    fake.setCurrentTime(2.18);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing" });
+    expect(() => transport.setTempo(100)).not.toThrow();
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("does not schedule clicks after a cycle-plan callback synchronously stops playback", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport } = makeTransport(fake.context);
+    const silentBar: Fixture = {
+      events: [{ id: "stop-before-click", sampleId: "synthSilence", startUnits: 0, durationUnits: 4, silent: true }],
+      totalUnits: 4,
+    };
+    const nextPlan = vi.fn(() => {
+      transport.stop();
+      return { slots: [{ kind: "fixture" as const, fixture: silentBar }] };
+    });
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: silentBar }],
+      cyclesPerPlan: 1,
+      nextPlan,
+      bpm: 120,
+      metronomeEnabled: true,
+    });
+
+    expect(nextPlan).toHaveBeenCalledTimes(1);
+    expect(fake.oscillators).toHaveLength(0);
+    expect(transport.getSnapshot()).toEqual({ status: "idle", progress: 0 });
+    transport.dispose();
+  });
+
+  it("locks tempo during count-in and Stop cancels queued clicks and the future trimmed beat source", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const beatBuffer = makeBuffer(2);
+    await transport.play({
+      fixture,
+      bpm: 120,
+      referenceBpm: 120,
+      countInBars: 2,
+      beatBuffer,
+      beatPlaybackRegion: { startOffsetSeconds: 0.25, loopEndSeconds: 1.75 },
+    });
+
+    expect(transport.getSnapshot()).toMatchObject({ status: "counting-in", countIn: { beat: 1, beats: 8 } });
+    expect(() => transport.setTempo(100)).toThrow("Tempo is locked during count-in");
+    const beatSource = fake.sources.find(({ node }) => node.loop);
+    expect(beatSource?.startTimes).toEqual([4.05]);
+    expect(beatSource?.startOffsets).toEqual([0.25]);
+
+    fake.setCurrentTime(0.6);
+    runScheduler();
+    const futureClick = fake.oscillators.find(({ startTimes }) => Math.abs(startTimes[0]! - 0.68) < 1e-9);
+    expect(futureClick).toBeDefined();
+    transport.stop();
+    expect(futureClick?.stopTimes.at(-1)).toBe(0);
+    expect(beatSource?.stopTimes.at(-1)).toBe(0);
+    fake.setCurrentTime(4.1);
+    runScheduler();
+    expect(fake.sources.filter(({ node }) => !node.loop)).toHaveLength(0);
+    expect(transport.getSnapshot()).toEqual({ status: "idle", progress: 0 });
+    transport.dispose();
+  });
+
+  it("Stop just before sequence start cancels queued sample and trimmed beat sources", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const beatBuffer = makeBuffer(2);
+    const oneHit: Fixture = {
+      events: [{ id: "near-start-hit", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    await transport.play({
+      fixture: oneHit,
+      bpm: 120,
+      referenceBpm: 120,
+      countInBars: 1,
+      beatBuffer,
+      beatPlaybackRegion: { startOffsetSeconds: 0.25, loopEndSeconds: 1.75 },
+    });
+
+    fake.setCurrentTime(1.96);
+    runScheduler();
+    const firstSample = fake.sources.find(({ node }) => !node.loop);
+    const beatSource = fake.sources.find(({ node }) => node.loop);
+    expect(firstSample?.startTimes).toEqual([2.05]);
+    expect(beatSource?.startTimes).toEqual([2.05]);
+    expect(beatSource?.startOffsets).toEqual([0.25]);
+
+    transport.stop();
+    expect(firstSample?.stopTimes.at(-1)).toBe(0);
+    expect(beatSource?.stopTimes.at(-1)).toBe(0);
+    fake.setCurrentTime(2.1);
+    runScheduler();
+    expect(fake.sources.filter(({ node }) => !node.loop)).toHaveLength(1);
+    expect(transport.getSnapshot()).toEqual({ status: "idle", progress: 0 });
+    transport.dispose();
+  });
+
+  it("keeps metronome beat phase through a generated plan boundary and silent round", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const onPlanBoundary = vi.fn();
+    const silentBar = [{ kind: "silence" as const, durationUnits: 4 }];
+    await transport.playCyclePlan({
+      slots: silentBar,
+      cyclesPerPlan: 1,
+      nextPlan: () => ({ slots: silentBar }),
+      onPlanBoundary,
+      bpm: 120,
+      metronomeEnabled: true,
+    });
+
+    fake.setCurrentTime(0.45);
+    runScheduler();
+    expect(fake.oscillators.map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55]);
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+    fake.setCurrentTime(0.55);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledTimes(1);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2 });
+    fake.setCurrentTime(1.0);
+    runScheduler();
+    expect(fake.oscillators.map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55, 1.05]);
+    fake.setCurrentTime(1.05);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledTimes(2);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 3 });
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("keeps future clicks continuous through a Q&A silence and Auto-generate boundary", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const silentFixture: Fixture = {
+      events: [{ id: "silent-cycle", sampleId: "synthSilence", startUnits: 0, durationUnits: 4, silent: true }],
+      totalUnits: 4,
+    };
+    const onPlanBoundary = vi.fn();
+    await transport.playCyclePlan({
+      slots: [
+        { kind: "fixture", fixture: silentFixture },
+        { kind: "silence", durationUnits: 4 },
+      ],
+      cyclesPerPlan: 1,
+      nextPlan: () => ({ slots: [{ kind: "fixture", fixture: silentFixture }, { kind: "silence", durationUnits: 4 }] }),
+      onPlanBoundary,
+      bpm: 120,
+      metronomeEnabled: true,
+    });
+
+    fake.setCurrentTime(0.45);
+    runScheduler();
+    expect(fake.oscillators.map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55]);
+    fake.setCurrentTime(0.55);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ cycleSlotKind: "silence" });
+    fake.setCurrentTime(0.95);
+    runScheduler();
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+    expect(fake.oscillators.map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55, 1.05]);
+    fake.setCurrentTime(1.05);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledTimes(1);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2 });
+    expect(fake.oscillators.map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55, 1.05]);
+    transport.stop();
     transport.dispose();
   });
 

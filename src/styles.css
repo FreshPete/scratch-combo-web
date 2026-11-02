@@ -167,7 +167,19 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
 .sequence-actions { display: flex; align-items: flex-end; gap: 10px; }
 .combo-length-control { display: grid; gap: 5px; color: var(--text-secondary); font-size: 10px; }
 .combo-length-control select { min-width: 112px; min-height: 36px; padding: 0 28px 0 10px; border: 1px solid var(--line-strong); border-radius: 0; background: var(--surface-inset); color: var(--text); font-size: 12px; }
-.practice-cycle-controls { display: flex; min-height: 54px; align-items: center; flex-wrap: wrap; gap: 10px 20px; margin: 0 0 12px; padding: 8px 11px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--surface-inset); }
+.practice-settings { display: block; min-width: 0; margin: 0 0 12px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--surface-inset); }
+.playback-prep { display: flex; width: 100%; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px 20px; margin: 0; padding: 8px 11px; border: 0; }
+.playback-prep legend { float: left; margin-right: 2px; padding: 0; color: var(--text); font-size: 12px; font-weight: 620; }
+.playback-prep__controls { display: flex; flex: 1 1 0; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px 18px; }
+.playback-prep__field { display: grid; min-width: 170px; gap: 4px; color: var(--text-secondary); font-size: 12px; }
+.playback-prep__field select { min-height: 36px; padding: 0 28px 0 9px; border: 1px solid var(--line-strong); border-radius: 0; background: var(--surface); color: var(--text); font-size: 12px; }
+.playback-prep__toggle { display: inline-flex; min-height: 40px; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; cursor: pointer; }
+.playback-prep__toggle input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.playback-prep__level { display: grid; min-width: 170px; grid-template-columns: auto minmax(75px, 1fr) 38px; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; }
+.playback-prep__level input { width: 100%; min-width: 75px; accent-color: var(--accent); }
+.playback-prep__level output { color: var(--text); font-family: var(--mono); font-size: 11px; text-align: right; }
+.playback-prep p { flex-basis: 100%; margin: 0 0 0 2px; color: var(--text-muted); font-size: 11px; line-height: 1.4; }
+.practice-cycle-controls { display: flex; min-width: 0; min-height: 54px; align-items: center; flex-wrap: wrap; gap: 10px 20px; margin: 0; padding: 8px 11px; border-top: 1px solid var(--line); background: transparent; }
 .practice-mode-control { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 14px; margin: 0; padding: 0; border: 0; }
 .practice-mode-control legend { margin-bottom: 4px; color: var(--text-muted); font-size: 10px; }
 .practice-mode-control label { display: inline-flex; min-height: 30px; align-items: center; gap: 7px; color: var(--text-secondary); font-size: 12px; cursor: pointer; }
@@ -394,7 +406,7 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
   .workspace { width: 100%; margin-left: 0; padding: 22px 18px 30px; }
   .quick-preset-row { grid-template-columns: 1fr; gap: 6px; }
   .workspace-header { min-height: 64px; margin-bottom: 20px; }
-  .transport-dock { position: sticky; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-top: 0; }
+  .transport-dock { position: static; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-top: 0; }
   .transport-dock__meter { width: 100%; grid-template-columns: minmax(72px, .35fr) minmax(0, 1fr); }
   .file-picker-grid { grid-template-columns: 1fr; }
   .transport-row { align-items: flex-start; flex-direction: column; }
@@ -427,6 +439,13 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
   .sequence-actions { width: 100%; align-items: stretch; }
   .sequence-actions .button { flex: 1 1 auto; }
   .combo-length-control { flex: 0 0 auto; }
+  .playback-prep { align-items: flex-start; gap: 8px; }
+  .playback-prep__controls { flex: 1 1 100%; width: 100%; flex-direction: column; align-items: stretch; gap: 8px; }
+  .playback-prep__field, .playback-prep__level { width: 100%; min-width: 0; }
+  .playback-prep__field select { width: 100%; min-width: 0; }
+  .playback-prep__level { grid-template-columns: 84px minmax(0, 1fr) 38px; }
+  .playback-prep__level input { min-width: 0; }
+  .playback-prep p { margin-left: 0; }
   .practice-cycle-controls { align-items: flex-start; flex-direction: column; gap: 6px; }
   .practice-mode-control { gap: 4px 16px; }
   .practice-mode-control legend { flex-basis: 100%; }
