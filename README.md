@@ -51,11 +51,13 @@ In Session controls, choose **Preset** or **Custom** as the beat source. The ina
 
 The beat and scratch library retain separate recorded tempos and follow the same practice BPM. Tempo, pitch, and the separate beat/sample levels remain live controls. Beat replacement is locked during playback; Stop before choosing another file or returning to a built-in beat. Custom beats are not included in saved legacy INI files.
 
+Open **Manual beat trim** in Session controls to set the first downbeat / loop start and an optional exclusive loop end in source seconds. The decoded waveform shows both markers when available, and the active beat name and source BPM stay visible for context. Apply saves the values for the next Play; **Reset beat trim** returns that source to the full clip. Each preset beat and the currently cached custom beat keep separate values while switching sources. Trim edits are locked during playback.
+
 ## Saved sessions and favourite combos
 
 Practice keeps the session and favourite selectors beside the sequence timeline. Choose a saved session and **Load session**, or use **Reload last saved** after refreshing the page. Choose a favourite and **Load favourite combo** to restore its exact generated event sequence. These actions stop playback; press Play when ready.
 
-Open **Save and manage sessions** to name a save, update the session you loaded, or choose **Save as new session** to keep the existing save and create another. A favourite stores the current preset and settings, exact combo, referenced WAV copies, and any applied custom beat with its confirmed BPM. Audio is decoded again when a saved item is loaded; no file handles are stored.
+Open **Save and manage sessions** to name a save, update the session you loaded, or choose **Save as new session** to keep the existing save and create another. A favourite stores the current preset and settings, exact combo, referenced WAV copies, any applied custom beat with its confirmed BPM, and the cue/loop regions for the preset and cached custom beat. Audio is decoded again when a saved item is loaded, saved trims are checked against decoded clip lengths, and no file handles are stored. Older version 1 saves without trim fields load with full-clip playback.
 
 Saved data stays in IndexedDB for this browser origin and device; `localhost` and the hosted site have separate libraries. The library supports up to 12 sessions and 30 favourites, with 320 MiB per item and 512 MiB total. Browser storage may have a lower quota and may be cleared or evicted by the browser. Delete saved items from **Save and manage sessions**; unsaved imports still clear when the page reloads.
 

@@ -1727,6 +1727,52 @@ describe('workspace import and transport lifecycle', () => {
     expect(within(screen.getByRole('table')).getByText('Replacement kick')).toBeInTheDocument()
   })
 
+  it('keeps cached custom trim across a preset change and starts the new preset beat at full clip', async () => {
+    waveformHarness.loadWaveform.mockResolvedValue({
+      durationSeconds: 6,
+      peaks: new Float32Array([0.1, 0.8, 0.3, 1]),
+      path: 'M0 10 L1 4 L2 9 L3 1 Z',
+    })
+    const customBeatBuffer = { duration: 6 } as AudioBuffer
+    bpmHarness.analyzeLocalAudioFile.mockResolvedValue({
+      buffer: customBeatBuffer,
+      detection: { status: 'detected', bpm: 120, confidence: 0.72, alternatives: [] },
+      durationSeconds: 6,
+      sampleRate: 44100,
+      channelCount: 2,
+    })
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Session')
+    fireEvent.click(screen.getByText('Manual beat trim'))
+    await waitFor(() => expect(screen.getByRole('img', { name: /Waveform of sounds\/beat\.wav/ })).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText('First downbeat / loop start (seconds)'), { target: { value: '0.25' } })
+    fireEvent.change(screen.getByLabelText('Loop end (seconds)'), { target: { value: '3.5' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply beat trim' }))
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Custom' }))
+    chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['beat'], 'cached-custom.wav', { type: 'audio/wav' })])
+    await screen.findByText(/estimated 120 BPM/)
+    fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
+    fireEvent.change(screen.getByLabelText('First downbeat / loop start (seconds)'), { target: { value: '0.5' } })
+    fireEvent.change(screen.getByLabelText('Loop end (seconds)'), { target: { value: '5.5' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply beat trim' }))
+
+    selectWorkspaceTab('Practice')
+    fireEvent.change(screen.getByLabelText('Quick preset'), { target: { value: 'SSC-096BPM2-01' } })
+    await waitFor(() => expect(document.querySelector('.visually-hidden[aria-live="polite"]')).toHaveTextContent(/96 BPM Set 2 ready/))
+    selectWorkspaceTab('Session')
+    expect(screen.getByRole('radio', { name: 'Custom' })).toBeChecked()
+    expect(screen.getByLabelText('First downbeat / loop start (seconds)')).toHaveValue(0.5)
+    expect(screen.getByLabelText('Loop end (seconds)')).toHaveValue(5.5)
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Preset' }))
+    expect(screen.getByText('Full clip — no manual trim applied.')).toBeInTheDocument()
+    expect(screen.getByLabelText('First downbeat / loop start (seconds)')).toHaveValue(0)
+    expect(screen.getByLabelText('Loop end (seconds)')).toHaveValue(null)
+    expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
+  })
+
   it('keeps the current beat after an invalid custom beat and asks for a BPM when detection is ambiguous', async () => {
     const beatBuffer = { duration: 6 } as AudioBuffer
     bpmHarness.analyzeLocalAudioFile
@@ -1772,5 +1818,99 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByLabelText('Beat bed')).toHaveValue('0')
     expect(screen.getByLabelText('Recorded BPM for custom beat')).toHaveValue(160)
     expect(screen.getByLabelText('BPM')).toHaveValue(160)
+  })
+
+  it('plays per-source manual trims, keeps cached settings across source switches, and resets to full clip', async () => {
+    waveformHarness.loadWaveform.mockResolvedValue({
+      durationSeconds: 6,
+      peaks: new Float32Array([0.1, 0.8, 0.3, 1]),
+      path: 'M0 10 L1 4 L2 9 L3 1 Z',
+    })
+    const customBeatBuffer = { duration: 6 } as AudioBuffer
+    bpmHarness.analyzeLocalAudioFile.mockResolvedValue({
+      buffer: customBeatBuffer,
+      detection: { status: 'detected', bpm: 120, confidence: 0.72, alternatives: [] },
+      durationSeconds: 6,
+      sampleRate: 44100,
+      channelCount: 2,
+    })
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Session')
+    fireEvent.click(screen.getByText('Manual beat trim'))
+    await waitFor(() => expect(screen.getByRole('img', { name: /Waveform of sounds\/beat\.wav/ })).toBeInTheDocument())
+
+    fireEvent.change(screen.getByLabelText('First downbeat / loop start (seconds)'), { target: { value: '0.25' } })
+    fireEvent.change(screen.getByLabelText('Loop end (seconds)'), { target: { value: '3.5' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply beat trim' }))
+    expect(screen.getByText(/Applied: cue 0\.250s · loop end 3\.500s/)).toBeInTheDocument()
+
+    selectWorkspaceTab('Samples')
+    fireEvent.click(screen.getByLabelText('Enable Bundled kick for next combo'))
+    selectWorkspaceTab('Session')
+    expect(screen.getByLabelText('First downbeat / loop start (seconds)')).toHaveValue(0.25)
+    expect(screen.getByLabelText('Loop end (seconds)')).toHaveValue(3.5)
+    selectWorkspaceTab('Samples')
+    fireEvent.click(screen.getByLabelText('Enable Bundled kick for next combo'))
+    selectWorkspaceTab('Practice')
+    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+    await screen.findByRole('img', { name: /Sequence timeline/ })
+    selectWorkspaceTab('Session')
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Custom' }))
+    chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['beat'], 'custom-loop.wav', { type: 'audio/wav' })])
+    await screen.findByText(/estimated 120 BPM/)
+    fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
+    expect(screen.getByText('Full clip — no manual trim applied.')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('First downbeat / loop start (seconds)'), { target: { value: '0.5' } })
+    fireEvent.change(screen.getByLabelText('Loop end (seconds)'), { target: { value: '5.5' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply beat trim' }))
+    expect(screen.getByText(/Applied: cue 0\.500s · loop end 5\.500s/)).toBeInTheDocument()
+
+    chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['replacement'], 'custom-loop.wav', { type: 'audio/wav' })])
+    await screen.findByText(/estimated 120 BPM/)
+    fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
+    expect(screen.getByText('Full clip — no manual trim applied.')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('First downbeat / loop start (seconds)'), { target: { value: '0.5' } })
+    fireEvent.change(screen.getByLabelText('Loop end (seconds)'), { target: { value: '5.5' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply beat trim' }))
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Preset' }))
+    expect(screen.getByLabelText('First downbeat / loop start (seconds)')).toHaveValue(0.25)
+    expect(screen.getByLabelText('Loop end (seconds)')).toHaveValue(3.5)
+    fireEvent.click(screen.getByRole('radio', { name: 'Custom' }))
+    expect(screen.getByLabelText('First downbeat / loop start (seconds)')).toHaveValue(0.5)
+    expect(screen.getByLabelText('Loop end (seconds)')).toHaveValue(5.5)
+
+    selectWorkspaceTab('Practice')
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+    const customOptions = audioHarness.playCyclePlan.mock.calls[0]?.[0] as {
+      beatPlaybackRegion?: { startOffsetSeconds: number; loopEndSeconds: number | null }
+    }
+    expect(customOptions.beatPlaybackRegion).toEqual({ startOffsetSeconds: 0.5, loopEndSeconds: 5.5 })
+
+    selectWorkspaceTab('Session')
+    expect(screen.getByLabelText('First downbeat / loop start (seconds)')).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Reset beat trim' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reset beat trim' }))
+    expect(screen.getByText('Full clip — no manual trim applied.')).toBeInTheDocument()
+    selectWorkspaceTab('Practice')
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(2))
+    const fullCustomOptions = audioHarness.playCyclePlan.mock.calls[1]?.[0] as Record<string, unknown>
+    expect(fullCustomOptions).not.toHaveProperty('beatPlaybackRegion')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    selectWorkspaceTab('Session')
+    fireEvent.click(screen.getByRole('radio', { name: 'Preset' }))
+    selectWorkspaceTab('Practice')
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(3))
+    const presetOptions = audioHarness.playCyclePlan.mock.calls[2]?.[0] as {
+      beatPlaybackRegion?: { startOffsetSeconds: number; loopEndSeconds: number | null }
+    }
+    expect(presetOptions.beatPlaybackRegion).toEqual({ startOffsetSeconds: 0.25, loopEndSeconds: 3.5 })
   })
 })

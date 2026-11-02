@@ -10,6 +10,7 @@ import {
 } from "./timeline";
 import { createTempoPitchProcessor, type TempoPitchProcessorFactory, type TempoPitchProcessorNode } from "./TempoPitchProcessor";
 import { decodeLocalAudioFile, validateLocalAudioBuffer } from "./beatAnalysis";
+import { resolveBeatPlaybackFrameRange, type BeatPlaybackFrameRange, type BeatPlaybackRegion } from "./beatPlaybackRegion";
 
 export type TransportStatus = "idle" | "loading" | "playing" | "completed" | "error" | "disposed";
 
@@ -64,6 +65,8 @@ export interface PlayOptions {
   readonly beatFile?: File;
   /** Optional beat buffer already decoded and validated by `analyzeLocalAudioFile`. */
   readonly beatBuffer?: AudioBuffer;
+  /** Optional manual downbeat cue and loop end in seconds of the decoded beat source. */
+  readonly beatPlaybackRegion?: BeatPlaybackRegion;
   /** Optional 0–100 percent volume from the normalized preset model. */
   readonly beatVolume?: number;
   /** Optional 0–100 percent volume from the normalized preset model. */
@@ -420,6 +423,9 @@ export class AudioTransport {
       if (options.beatFile && options.beatBuffer) {
         throw new Error("Pass either a beat file or its decoded beat buffer, not both.");
       }
+      if (options.beatPlaybackRegion && !hasBeat) {
+        throw new Error("A beat playback region requires a selected beat track.");
+      }
       if (options.beatBuffer) validateLocalAudioBuffer(options.beatBuffer);
       const dynamicCycleConfig = createDynamicCycleConfig(options);
       if (dynamicCycleConfig && !cyclePlan) {
@@ -513,6 +519,9 @@ export class AudioTransport {
       }
 
       const buffers = new Map<string, AudioBuffer>(sampleEntries);
+      const beatPlaybackFrames = beatBuffer && options.beatPlaybackRegion
+        ? resolveBeatPlaybackFrameRange(beatBuffer, options.beatPlaybackRegion)
+        : undefined;
       const processorsToConnect = new Set([processor, dedicatedBeatProcessor].filter(
         (node): node is TempoPitchProcessorNode => node !== undefined,
       ));
@@ -539,7 +548,16 @@ export class AudioTransport {
       const fixtureEndAt = startAt + timeline.totalSeconds;
       const beatOutput = dedicatedBeatProcessor ?? processor ?? context.destination;
       const beat = beatBuffer
-        ? this.scheduleBeat(context, beatBuffer, startAt, cyclePlan ? undefined : fixtureEndAt, this.selectedBeatVolume, beatOutput, beatTempoRatio)
+        ? this.scheduleBeat(
+          context,
+          beatBuffer,
+          startAt,
+          cyclePlan ? undefined : fixtureEndAt,
+          this.selectedBeatVolume,
+          beatOutput,
+          beatTempoRatio,
+          beatPlaybackFrames,
+        )
         : undefined;
       let finishAt = fixtureEndAt;
       let maxSampleDuration = 0;
@@ -1179,6 +1197,7 @@ export class AudioTransport {
     volume: number,
     output: AudioNode,
     tempoRatio: number,
+    playbackFrames?: BeatPlaybackFrameRange,
   ): { readonly gain: GainNode; readonly source: AudioBufferSourceNode } {
     if (!Number.isFinite(buffer.duration) || buffer.duration <= 0) {
       throw new Error("The selected beat WAV has no playable audio.");
@@ -1193,12 +1212,17 @@ export class AudioTransport {
     source.buffer = buffer;
     source.loop = true;
     source.playbackRate.value = tempoRatio;
+    if (playbackFrames) {
+      source.loopStart = playbackFrames.startFrame / buffer.sampleRate;
+      source.loopEnd = playbackFrames.endFrame / buffer.sampleRate;
+    }
     source.connect(gain);
     this.sources.add(source);
     source.onended = () => this.releaseSource(source);
 
     try {
-      source.start(startAt);
+      if (playbackFrames) source.start(startAt, playbackFrames.startFrame / buffer.sampleRate);
+      else source.start(startAt);
       if (stopAt !== undefined) source.stop(stopAt);
     } catch (error) {
       this.releaseSource(source);

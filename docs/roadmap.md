@@ -16,10 +16,12 @@
 - [x] Replace the three file pickers with a staged INI → audio folder/files → review wizard. Retain copied audio in session memory, verify required playback files, preserve the active preset until Load, and support cancellation and repair.
 
 - [x] Save and reload named practice sessions and favourite the exact generated combo from Practice. IndexedDB stores preset/settings/fixture data and referenced local audio bytes; restore validates audio, stays stopped, and never autoplays.
+- [x] Add manual, source-specific beat downbeat and loop-end trim controls to Session. Cue and exclusive end are bounded by decoded duration, Apply affects the next Play, source mode switches retain per-beat settings, and older saved sessions default to full-clip playback.
+
+The beat trim feature is local-ready on `codex/beat-alignment`; Edge and Chrome browser journeys and the Pages build pass. The hosted app still serves merged revision `4a15973` until a reviewed release is published.
 
 ## Queued — ordered follow-ups
 
-- [ ] Beat downbeat alignment and loop trimming.
 - [ ] Count-in and metronome.
 - [ ] Tempo-ramp trainer.
 - [ ] Real pause and resume.

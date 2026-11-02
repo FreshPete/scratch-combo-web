@@ -7,6 +7,13 @@ export type SavedPracticeMode = 'qa' | 'loop'
 export type SavedTimelineView = 'waveform' | 'ttm'
 export type SavedTimelineLayout = 'grid' | 'inline'
 
+export interface SavedBeatTrimRegion {
+  startOffsetSeconds: number
+  loopEndSeconds: number | null
+}
+
+export type SavedBeatTrims = Record<string, SavedBeatTrimRegion>
+
 export interface SavedMedia {
   name: string
   type: string
@@ -43,6 +50,9 @@ export interface SavedSessionData {
   customBeatSelected: boolean
   customBeatReferenceBpm: number | null
   customBeatReferenceBpmInput: string
+  presetBeatTrimId: string
+  customBeatTrimId: string | null
+  beatTrims: SavedBeatTrims
   assets: SavedMedia[]
 }
 
@@ -76,6 +86,8 @@ const MAX_FILE_BYTES = 64 * 1024 * 1024
 const MAX_INI_BYTES = 1024 * 1024
 const MAX_SAMPLES = 500
 const MAX_FIXTURE_EVENTS = 8192
+const MAX_BEAT_TRIM_ENTRIES = MAX_ASSETS_PER_RECORD + 1
+const MAX_BEAT_TRIM_SECONDS = 600
 const DATABASE_VERSION = 1
 const RECORDS_STORE = 'records'
 const PAYLOADS_STORE = 'payloads'
@@ -99,6 +111,15 @@ export function createSavedRecordId(): string {
 
 export function mediaBytes(snapshot: SavedSessionData): number {
   return snapshot.assets.reduce((sum, asset) => sum + asset.size, snapshot.customBeatFile?.size ?? 0)
+}
+
+/** Stable identity for a beat ordinal until the loaded preset is replaced. */
+export function presetBeatTrimKey(presetTrimId: string, beatIndex: number): string {
+  return 'preset:' + presetTrimId + ':' + beatIndex
+}
+
+export function customBeatTrimKey(id: string): string {
+  return 'custom:' + id
 }
 
 export async function listSavedRecords(): Promise<SavedLibraryIndex> {
@@ -293,12 +314,33 @@ export function validateSavedSessionData(value: unknown): SavedSessionData {
     || typeof candidate.customBeatSelected !== 'boolean'
     || !(candidate.customBeatReferenceBpm === null || finite(candidate.customBeatReferenceBpm, 1, 1000))
     || !string(candidate.customBeatReferenceBpmInput, 32)
+    || !(candidate.presetBeatTrimId === undefined || validTrimId(candidate.presetBeatTrimId))
+    || !(candidate.customBeatTrimId === undefined || candidate.customBeatTrimId === null || validTrimId(candidate.customBeatTrimId))
+    || !(candidate.beatTrims === undefined || validBeatTrims(candidate.beatTrims))
     || !Array.isArray(candidate.assets)
     || candidate.assets.length > MAX_ASSETS_PER_RECORD
     || !candidate.assets.every(validMedia)) {
     throw corrupt('The saved session contains invalid settings or audio metadata. Delete it and save the session again.')
   }
-  const data = candidate as unknown as SavedSessionData
+  const legacyCustomBeatTrimId = candidate.customBeatFile
+    ? 'legacy-' + stableHash(candidate.customBeatFile.name + ':' + candidate.customBeatFile.size + ':' + candidate.customBeatFile.lastModified)
+    : null
+  const legacyPresetBeatTrimId = 'legacy-' + stableHash(JSON.stringify([
+    candidate.presetSource,
+    candidate.selectedPresetId,
+    candidate.presetFileName,
+    (candidate.preset as Preset).bpm,
+    (candidate.preset as Preset).beatFiles,
+  ]))
+  const data = {
+    ...candidate,
+    presetBeatTrimId: candidate.presetBeatTrimId === undefined ? legacyPresetBeatTrimId : candidate.presetBeatTrimId,
+    customBeatTrimId: candidate.customBeatTrimId === undefined ? legacyCustomBeatTrimId : candidate.customBeatTrimId,
+    beatTrims: candidate.beatTrims === undefined ? {} : candidate.beatTrims,
+  } as unknown as SavedSessionData
+  if (!validBeatTrimOwnership(data)) {
+    throw corrupt('The saved beat trim refers to a different or unavailable beat source. Delete it and save the session again.')
+  }
   const assetBytes = mediaBytes(data)
   if (!Number.isSafeInteger(assetBytes) || assetBytes > MAX_SAVED_RECORD_BYTES) {
     throw corrupt('The saved session exceeds the supported local audio size. Delete it and save a smaller session.')
@@ -386,6 +428,47 @@ function validMedia(value: unknown): value is SavedMedia {
     && typeof Blob !== 'undefined'
     && value.data instanceof Blob
     && value.data.size === value.size
+}
+
+function validBeatTrims(value: unknown): value is SavedBeatTrims {
+  if (!isObject(value) || Object.keys(value).length > MAX_BEAT_TRIM_ENTRIES) return false
+  return Object.entries(value).every(([key, region]) => {
+    if (!/^(?:preset:[A-Za-z0-9_-]{1,128}:\d{1,3}|custom:[A-Za-z0-9_-]{1,128})$/.test(key) || !isObject(region)) return false
+    if (!finite(region.startOffsetSeconds, 0, MAX_BEAT_TRIM_SECONDS)
+      || !(region.loopEndSeconds === null || finite(region.loopEndSeconds, 0, MAX_BEAT_TRIM_SECONDS))) return false
+    return region.loopEndSeconds === null || region.loopEndSeconds > region.startOffsetSeconds
+  })
+}
+
+function validTrimId(value: unknown): value is string {
+  return nonEmptyString(value, 128) && /^[A-Za-z0-9_-]+$/.test(value)
+}
+
+function validBeatTrimOwnership(data: SavedSessionData): boolean {
+  if (!data.presetBeatTrimId || Boolean(data.customBeatFile) !== (data.customBeatTrimId !== null)) return false
+  const allowedCustomKey = data.customBeatTrimId === null ? null : customBeatTrimKey(data.customBeatTrimId)
+  for (const key of Object.keys(data.beatTrims)) {
+    if (key.startsWith('custom:')) {
+      if (!data.customBeatFile || key !== allowedCustomKey) return false
+      continue
+    }
+
+    const prefix = presetBeatTrimKey(data.presetBeatTrimId, 0).slice(0, -1)
+    if (!key.startsWith(prefix)) return false
+    const indexText = key.slice(prefix.length)
+    const beatIndex = Number(indexText)
+    if (!Number.isSafeInteger(beatIndex) || beatIndex < 0 || beatIndex >= data.preset.beatFiles.length) return false
+  }
+  return true
+}
+
+function stableHash(value: string): string {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(36)
 }
 
 function safeRelativePath(value: unknown): value is string {

@@ -4,6 +4,11 @@ export {
   SOUNDTOUCH_FINITE_DRAIN_SECONDS,
 } from "./AudioTransport";
 export type {
+  BeatPlaybackFrameRange,
+  BeatPlaybackRegion,
+} from "./beatPlaybackRegion";
+export { resolveBeatPlaybackFrameRange } from "./beatPlaybackRegion";
+export type {
   AudioTransportOptions,
   CyclePlanBoundary,
   CyclePlanBoundaryHandler,

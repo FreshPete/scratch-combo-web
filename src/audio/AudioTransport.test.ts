@@ -217,8 +217,19 @@ describe("AudioTransport", () => {
     fake.setOutputLatency(0.04);
     const processor = makeProcessor();
     const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const beatBuffer = makeBuffer(2);
 
-    await transport.play({ fixture, referenceBpm: 85, bpm: 85 });
+    await transport.play({
+      fixture,
+      referenceBpm: 85,
+      bpm: 85,
+      beatBuffer,
+      beatPlaybackRegion: { startOffsetSeconds: 0.25, loopEndSeconds: 1.75 },
+    });
+    const beatSource = fake.sources.find(({ node }) => node.loop);
+    expect(beatSource?.startOffsets).toEqual([0.25]);
+    expect(beatSource?.node.loopStart).toBeCloseTo(0.25);
+    expect(beatSource?.node.loopEnd).toBeCloseTo(1.75);
     expect(transport.getSnapshot().presentation).toMatchObject({
       started: false,
       progress: 0,
@@ -595,6 +606,9 @@ describe("AudioTransport", () => {
 
     const beatSource = fake.sources.find(({ node }) => node.loop);
     expect(beatSource?.startTimes).toEqual([0.05]);
+    expect(beatSource?.startOffsets).toEqual([0]);
+    expect(beatSource?.node.loopStart).toBe(0);
+    expect(beatSource?.node.loopEnd).toBe(0);
     expect(beatSource?.stopTimes).toEqual([]);
 
     fake.setCurrentTime(1.1);
@@ -641,6 +655,7 @@ describe("AudioTransport", () => {
       onPlanBoundary,
       bpm: 120,
       beatFile,
+      beatPlaybackRegion: { startOffsetSeconds: 0.025, loopEndSeconds: 0.175 },
       preloadSampleIds: ["synthBrush"],
     });
 
@@ -679,6 +694,9 @@ describe("AudioTransport", () => {
     expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05, 1.05, 2.05, 3.05, 4.05]);
     expect(fake.sources.filter(({ node }) => node.loop)).toHaveLength(1);
     expect(beatSource?.startTimes).toEqual([0.05]);
+    expect(beatSource?.startOffsets).toEqual([0.025]);
+    expect(beatSource?.node.loopStart).toBeCloseTo(0.025);
+    expect(beatSource?.node.loopEnd).toBeCloseTo(0.175);
     expect(beatSource?.stopTimes).toEqual([]);
     transport.stop();
     transport.dispose();
@@ -1409,14 +1427,19 @@ describe("AudioTransport", () => {
       bpm: 100,
       pitchSemitones: 0,
       beatBuffer,
+      beatPlaybackRegion: { startOffsetSeconds: 0.125, loopEndSeconds: 0.75 },
     });
 
     const beatSource = fake.sources.find(({ node }) => node.loop);
     const sampleSource = fake.sources.find(({ node }) => !node.loop);
+    expect(beatSource?.node.buffer).toBe(beatBuffer);
     expect(sampleProcessor.playbackRate.value).toBeCloseTo(100 / 85);
     expect(sampleSource?.node.playbackRate.value).toBeCloseTo(100 / 85);
     expect(beatProcessor.playbackRate.value).toBeCloseTo(100 / 120);
     expect(beatSource?.node.playbackRate.value).toBeCloseTo(100 / 120);
+    expect(beatSource?.startOffsets).toEqual([0.125]);
+    expect(beatSource?.node.loopStart).toBeCloseTo(0.125);
+    expect(beatSource?.node.loopEnd).toBeCloseTo(0.75);
     expect(sampleProcessor.pitchSemitones.value).toBe(0);
     expect(beatProcessor.pitchSemitones.value).toBe(0);
     expect(fake.gains[0]?.connect).toHaveBeenCalledWith(sampleProcessor.node);
@@ -1430,6 +1453,9 @@ describe("AudioTransport", () => {
     expect(fake.sources.filter(({ node }) => !node.loop).at(-1)?.node.playbackRate.value).toBeCloseTo(105 / 85);
     expect(beatProcessor.playbackRate.value).toBeCloseTo(105 / 120);
     expect(beatSource?.node.playbackRate.value).toBeCloseTo(105 / 120);
+    expect(beatSource?.startOffsets).toEqual([0.125]);
+    expect(beatSource?.node.loopStart).toBeCloseTo(0.125);
+    expect(beatSource?.node.loopEnd).toBeCloseTo(0.75);
     expect(sampleProcessor.pitchSemitones.value).toBe(3);
     expect(beatProcessor.pitchSemitones.value).toBe(3);
     expect(fake.keepAliveSources.map(({ stopTimes }) => stopTimes.at(-1))).toEqual([
@@ -1437,6 +1463,29 @@ describe("AudioTransport", () => {
       fake.keepAliveSources[0]?.stopTimes.at(-1),
     ]);
 
+    transport.dispose();
+  });
+
+  it("rejects a beat region that rounds to an empty decoded-frame range before scheduling", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport } = makeTransport(fake.context);
+    const beatBuffer = makeBuffer(1, 48_000);
+
+    await transport.play({
+      fixture,
+      bpm: 120,
+      beatBuffer,
+      beatPlaybackRegion: {
+        startOffsetSeconds: 0.25,
+        loopEndSeconds: 0.25 + 0.1 / 48_000,
+      },
+    });
+
+    expect(transport.getSnapshot()).toMatchObject({
+      status: "error",
+      error: expect.stringContaining("at least one decoded audio frame"),
+    });
+    expect(fake.sources).toHaveLength(0);
     transport.dispose();
   });
 
