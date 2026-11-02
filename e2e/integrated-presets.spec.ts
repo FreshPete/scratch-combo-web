@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { stageLocalImport } from "./helpers/import-wizard";
 
 declare global {
   interface Window {
@@ -96,17 +97,11 @@ test("loads the 85 BPM Beginner preset without autoplay and resolves all six bui
   const preset = page.getByLabel("Quick preset");
   await expect(page.getByRole("heading", { name: "Generated combo" })).toBeVisible({ timeout: 30_000 });
   await expect(preset).toHaveValue("SSC-085BPM-01");
-  await expect(page.locator(".import-status__copy p")).toContainText(
-    "85 BPM - Beginner ready. All 64 sample references and 2 beat files are loaded",
-    { timeout: 30_000 },
-  );
+  await expect(page.getByLabel("Current session files")).toContainText("85 BPM - Beginner", { timeout: 30_000 });
+  await expect(page.locator(".import-current__count")).toContainText("66 WAV files in session");
+  await page.getByRole("tab", { name: "Session", exact: true }).click();
   await expect(page.getByRole("spinbutton", { name: "BPM" })).toHaveValue("85");
   await expect(page.getByLabel("Beat bed")).toHaveValue("0");
-  await expect(page.getByRole("radio", { name: "Q&A" })).toBeChecked();
-  await expect(page.getByLabel("Large pause")).not.toBeChecked();
-  await expect(page.getByRole("button", { name: "Play sequence" })).toBeEnabled();
-  expect(await page.evaluate(() => window.__presetQaResumeCount)).toBe(0);
-
   const beatBed = page.getByLabel("Beat bed");
   for (const beatName of ["Beat 01 · _BEAT01_85BPM.wav", "Beat 02 · _BEAT02_85BPM.wav"]) {
     await expect(page.getByRole("option", { name: beatName })).toBeEnabled();
@@ -114,21 +109,24 @@ test("loads the 85 BPM Beginner preset without autoplay and resolves all six bui
   await beatBed.selectOption("1");
   await expect(beatBed).toHaveValue("1");
   await beatBed.selectOption("0");
+  await page.getByRole("tab", { name: "Practice", exact: true }).click();
+  await expect(page.getByRole("radio", { name: "Q&A" })).toBeChecked();
+  await expect(page.getByLabel("Large pause")).not.toBeChecked();
+  await expect(page.getByRole("button", { name: "Play sequence" })).toBeEnabled();
+  expect(await page.evaluate(() => window.__presetQaResumeCount)).toBe(0);
 
   for (const [id, label] of presetChoices) {
     await preset.selectOption(id);
-    await expect(page.locator(".import-status__copy p")).toContainText(
-      `${label} ready. All `,
-      { timeout: 30_000 },
-    );
-    await expect(page.locator(".import-status__copy p")).toContainText("sample references and 2 beat files are loaded");
+    await expect(page.getByLabel("Current session files")).toContainText(label, { timeout: 30_000 });
+    await expect(page.locator(".import-current__count")).toContainText("66 WAV files in session");
     await expect(page.getByRole("button", { name: "Play sequence" })).toBeEnabled();
-    await expect(page.getByRole("option", { name: /Beat 01 ·/ })).toBeEnabled();
-    await expect(page.getByRole("option", { name: /Beat 02 ·/ })).toBeEnabled();
   }
   await expect(preset).toHaveValue("SSC-096BPM2-01");
+  await page.getByRole("tab", { name: "Session", exact: true }).click();
   await expect(page.getByRole("spinbutton", { name: "BPM" })).toHaveValue("96");
   await expect(page.getByLabel("Beat bed")).toHaveValue("0");
+  await expect(page.getByRole("option", { name: /Beat 01 ·/ })).toBeEnabled();
+  await expect(page.getByRole("option", { name: /Beat 02 ·/ })).toBeEnabled();
   expectLocalReadOnlyRequests(page.url(), requests);
 });
 
@@ -152,27 +150,27 @@ test("a custom INI and WAV selection wins over a delayed startup preset response
 
   await page.goto("/");
   await expect.poll(() => defaultRequestStarted).toBe(true);
-  await page.getByLabel("Choose WAV files").setInputFiles([
+  await stageLocalImport(page, {
+    name: "override.ini",
+    buffer: Buffer.from(customIni()),
+    mimeType: "text/plain",
+  }, [
     { name: "Wanted.wav", buffer: makeWav(440), mimeType: "audio/wav" },
     { name: "beat.wav", buffer: makeWav(100), mimeType: "audio/wav" },
     { name: "beat-two.wav", buffer: makeWav(120), mimeType: "audio/wav" },
   ]);
-  await page.getByLabel("Choose INI preset").setInputFiles({
-    name: "override.ini",
-    buffer: Buffer.from(customIni()),
-    mimeType: "text/plain",
-  });
-
-  await expect(page.locator(".import-status__copy strong")).toHaveText("override.ini");
-  await expect(page.locator(".import-status__copy p")).toContainText("1 samples and 2 beat files resolved");
-  await expect(page.getByRole("button", { name: "Generate combo" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Load preset" })).toBeEnabled();
   await expect(page.getByLabel("Quick preset")).toHaveValue("custom");
+  await page.getByRole("tab", { name: "Session", exact: true }).click();
   await expect(page.getByRole("spinbutton", { name: "BPM" })).toHaveValue("85");
+  await page.getByRole("tab", { name: "Files", exact: true }).click();
+  await page.getByRole("button", { name: "Load preset" }).click();
+  await expect(page.locator(".sequence-heading")).toContainText("Browser Override");
 
   releaseResponse();
   await expect.poll(() => defaultRouteFinished).toBe(true);
-  await expect(page.locator(".import-status__copy strong")).toHaveText("override.ini");
   await expect(page.locator(".sequence-heading")).toContainText("Browser Override");
+  await page.getByRole("tab", { name: "Practice", exact: true }).click();
   await expect(page.getByRole("button", { name: "Generate combo" })).toBeEnabled();
   expectLocalReadOnlyRequests(page.url(), requests);
 });

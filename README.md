@@ -35,6 +35,16 @@ Use **Practice**, **Session**, **Samples**, and **Files** to focus on one task a
 
 Open **Keyboard shortcuts** for the available keys and the option to disable them: **P** toggles Play/Stop, **G** generates or builds a combo, and **R** resets the session controls. Shortcuts obey the same readiness and playback locks as the buttons and are ignored while typing or interacting with native controls.
 
+## Import your sample preset
+
+Choose **Your files…** from Quick preset, or open **Files**, to use the import wizard:
+
+1. Select the legacy INI preset.
+2. Select the folder containing its WAV files. **Choose files instead** provides a multi-file fallback.
+3. Review the matched samples and beats, fix any required missing or ambiguous references, then choose **Load preset**.
+
+The wizard stages the new setup while your current preset remains loaded. Back retains your draft; Cancel discards it. Loading does not start playback. If the default combo cannot be generated from the preset settings, the preset stays loaded so you can choose a compatible length or edit its samples before generating. Matched audio is copied into session memory. Samples eligible for generation are checked with the browser decoder before the new preset is applied; available beat files are checked too, and unavailable beats can be omitted. Inactive sample references may remain as review warnings. The files remain on your device and are never uploaded or changed. Reloading or closing the page clears the session, so select your files again next time. See [referenced-WAV limits](src/audio/README.md#referenced-wav-snapshots) for supported formats and batch bounds.
+
 ## Your own beat
 
 In Session controls, choose **Preset** or **Custom** as the beat source. The inactive source controls are disabled. Custom activates the WAV/MP3 upload without replacing the selected scratch-sample preset; until a file is applied, it uses no beat. Switching sources retains the previous choices. The file stays in browser memory for the current session. Local BPM analysis offers an estimate; check it by listening and correct the recorded BPM when needed. Half-time and double-time readings are possible, and tracks with weak or changing rhythm may require a manual value.

@@ -46,6 +46,11 @@ export interface LocalAudioAnalysis {
   readonly channelCount: number;
 }
 
+export interface DecodeLocalAudioOptions {
+  /** Optional per-call cap checked after container preflight and before native decoding. */
+  readonly maxDecodedChannelSamples?: number;
+}
+
 interface TempoCandidate {
   readonly bpm: number;
   readonly score: number;
@@ -177,7 +182,11 @@ export async function analyzeLocalAudioFile(
 }
 
 /** Decode a local WAV/MP3 after size, format, duration, and PCM-budget preflight. */
-export async function decodeLocalAudioFile(context: BaseAudioContext, file: File): Promise<AudioBuffer> {
+export async function decodeLocalAudioFile(
+  context: BaseAudioContext,
+  file: File,
+  options: DecodeLocalAudioOptions = {},
+): Promise<AudioBuffer> {
   validateLocalFile(file);
   const bytes = await file.arrayBuffer();
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_LOCAL_AUDIO_FILE_BYTES) {
@@ -187,7 +196,11 @@ export async function decodeLocalAudioFile(context: BaseAudioContext, file: File
   const fileKind = localFileKind(file);
   const metadata = fileKind === "wav" ? inspectWav(bytes) : inspectMp3(bytes);
   validateContextSampleRate(context.sampleRate);
-  validatePreflightMetadata(metadata, context.sampleRate);
+  const projectedChannelSamples = validatePreflightMetadata(metadata, context.sampleRate);
+  if (options.maxDecodedChannelSamples !== undefined
+    && projectedChannelSamples > options.maxDecodedChannelSamples) {
+    throw new Error("This audio file exceeds the remaining decoded-audio budget for this import.");
+  }
 
   let buffer: AudioBuffer;
   try {
@@ -274,8 +287,9 @@ function validateContextSampleRate(sampleRate: number): void {
   }
 }
 
-function validatePreflightMetadata(metadata: PreflightAudioMetadata, outputSampleRate: number): void {
+function validatePreflightMetadata(metadata: PreflightAudioMetadata, outputSampleRate: number): number {
   validateAudioMetadata(metadata, outputSampleRate);
+  return Math.ceil(metadata.durationSeconds * outputSampleRate) * metadata.channelCount;
 }
 
 function validateDecodedBuffer(buffer: AudioBuffer, outputSampleRate: number, name: string): void {

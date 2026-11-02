@@ -27,7 +27,19 @@ export {
   MAX_LOCAL_AUDIO_DURATION_SECONDS,
   MAX_LOCAL_AUDIO_FILE_BYTES,
 } from "./beatAnalysis";
-export type { BpmDetectionResult, LocalAudioAnalysis } from "./beatAnalysis";
+export type { BpmDetectionResult, DecodeLocalAudioOptions, LocalAudioAnalysis } from "./beatAnalysis";
+export {
+  LocalWavSnapshotError,
+  MAX_SNAPSHOT_WAV_BATCH_BYTES,
+  MAX_SNAPSHOT_WAV_DECODED_CHANNEL_SAMPLES,
+  MAX_SNAPSHOT_WAV_FILE_COUNT,
+  snapshotReferencedWavFiles,
+} from "./fileSnapshot";
+export type {
+  ReferencedWavSnapshot,
+  SnapshotFileValidation,
+  SnapshotReferencedWavOptions,
+} from "./fileSnapshot";
 export type {
   CyclePlanSlotTimeline,
   CyclePlanTimeline,

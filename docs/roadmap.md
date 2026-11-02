@@ -13,6 +13,8 @@
 - [x] Make Preset and Custom beat sources mutually exclusive with disabled inactive controls.
 - [x] Focus the workspace with Practice, Session, Samples and Files tabs; keep shared playback controls and add guarded P/G/R shortcuts with help and an off switch.
 
+- [x] Replace the three file pickers with a staged INI → audio folder/files → review wizard. Retain copied audio in session memory, verify required playback files, preserve the active preset until Load, and support cancellation and repair.
+
 ## Queued
 
 - [ ] Expand notation coverage only where reliable technique definitions and clear teaching patterns are available; full WAV transcription is not implemented.

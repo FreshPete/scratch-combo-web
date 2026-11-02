@@ -1,12 +1,21 @@
 import { expect, test, type Page } from '@playwright/test'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
+import { createValidWizardFixture } from './fixtures/import-wizard-fixtures'
+import { expectStepTwoFocus } from './helpers/import-wizard'
 
 declare global {
   interface Window {
     __pagesTtmAudioQa?: {
       beatStarts: number
       beatStops: number
+    }
+    __pagesLocalImportQa?: {
+      files: File[]
+      sourceReadAttempts: number
+      outputTaps: AnalyserNode[]
+      workletNodes: number
+      sourceStarts: Array<{ loop: boolean }>
     }
   }
 }
@@ -30,6 +39,81 @@ async function instrumentBeatSource(page: Page): Promise<void> {
       return originalStop.call(this, when)
     }
   })
+}
+
+async function instrumentProductionLocalImport(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const qa = {
+      files: [] as File[],
+      sourceReadAttempts: 0,
+      outputTaps: [] as AnalyserNode[],
+      workletNodes: 0,
+      sourceStarts: [] as Array<{ loop: boolean }>,
+    }
+    window.__pagesLocalImportQa = qa
+    document.addEventListener('change', (event) => {
+      const input = event.target
+      if (!(input instanceof HTMLInputElement) || input.type !== 'file') return
+      qa.files.push(...Array.from(input.files ?? []).filter((file) => file.name.toLowerCase().endsWith('.wav')))
+    }, true)
+
+    const nativeConnect = AudioNode.prototype.connect as unknown as (this: AudioNode, ...args: unknown[]) => AudioNode
+    AudioNode.prototype.connect = function (...args: unknown[]): AudioNode {
+      const destination = args[0]
+      if (destination === this.context.destination) {
+        const tap = this.context.createAnalyser()
+        tap.fftSize = 2048
+        qa.outputTaps.push(tap)
+        nativeConnect.apply(this, [tap, ...args.slice(1)])
+        nativeConnect.call(tap, destination)
+        return destination as AudioNode
+      }
+      return nativeConnect.apply(this, args)
+    } as typeof AudioNode.prototype.connect
+
+    const nativeStart = AudioBufferSourceNode.prototype.start
+    AudioBufferSourceNode.prototype.start = function (when?: number, offset?: number, duration?: number) {
+      qa.sourceStarts.push({ loop: this.loop })
+      if (duration !== undefined) return nativeStart.call(this, when, offset, duration)
+      if (offset !== undefined) return nativeStart.call(this, when, offset)
+      return nativeStart.call(this, when)
+    }
+
+    if (typeof AudioWorkletNode !== 'undefined') {
+      const NativeWorkletNode = window.AudioWorkletNode
+      window.AudioWorkletNode = new Proxy(NativeWorkletNode, {
+        construct(target, args, newTarget) {
+          qa.workletNodes += 1
+          return Reflect.construct(target, args, newTarget)
+        },
+      })
+    }
+  })
+}
+
+async function sealProductionSourceFiles(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const qa = window.__pagesLocalImportQa
+    if (!qa) throw new Error('The production local-import probe was not installed.')
+    for (const file of qa.files) {
+      Object.defineProperty(file, 'arrayBuffer', {
+        configurable: true,
+        value: async () => {
+          qa.sourceReadAttempts += 1
+          throw new Error('A source picker File was read after the local preset loaded.')
+        },
+      })
+    }
+    return qa.files.length
+  })
+}
+
+async function productionLocalOutputPeak(page: Page): Promise<number> {
+  return page.evaluate(() => Math.max(0, ...(window.__pagesLocalImportQa?.outputTaps ?? []).map((tap) => {
+    const samples = new Float32Array(tap.fftSize)
+    tap.getFloatTimeDomainData(samples)
+    return Math.sqrt(samples.reduce((sum, sample) => sum + sample * sample, 0) / samples.length)
+  })))
 }
 
 async function assertPracticeTopRowsDoNotOverlap(page: Page, expanded: boolean): Promise<void> {
@@ -104,10 +188,8 @@ test('production Pages preview renders 85 BPM TTM guides, assignments, fader sta
   await page.setViewportSize({ width: 1280, height: 900 })
   const filesTab = page.getByRole('tab', { name: 'Files', exact: true })
   await filesTab.click()
-  await expect(page.locator('.import-status__copy p')).toContainText(
-    '85 BPM - Beginner ready. All 64 sample references and 2 beat files are loaded',
-    { timeout: 60_000 },
-  )
+  await expect(page.getByLabel('Current session files')).toContainText('85 BPM - Beginner', { timeout: 60_000 })
+  await expect(page.locator('.import-current__count')).toContainText('66 WAV files in session')
 
   const practiceTab = page.getByRole('tab', { name: 'Practice', exact: true })
   await practiceTab.click()
@@ -287,4 +369,61 @@ test('production Pages preview renders 85 BPM TTM guides, assignments, fader sta
   await expect(page.getByRole('slider', { name: 'Sample level' })).toBeVisible()
   await expect(page.getByRole('slider', { name: 'Beat level' })).toBeVisible()
   await page.screenshot({ path: proofPath('session-controls'), fullPage: false })
+})
+
+test('production Pages path imports a local folder and plays only from session snapshots', async ({ page }, testInfo) => {
+  test.setTimeout(120_000)
+  await instrumentProductionLocalImport(page)
+  const requests: Array<{ url: string; method: string }> = []
+  page.on('request', (request) => requests.push({ url: request.url(), method: request.method() }))
+  await page.setViewportSize({ width: 1280, height: 900 })
+  const fixture = await createValidWizardFixture(testInfo.outputPath('pages-local-import-fixture'))
+
+  await page.goto('/scratch-combo-web/')
+  await expect(page.getByRole('heading', { name: 'Generated combo' })).toBeVisible({ timeout: 30_000 })
+  await page.getByLabel('Quick preset').selectOption('custom')
+  await expect(page.getByRole('heading', { name: 'Choose your INI preset' })).toBeVisible()
+  await page.screenshot({ path: testInfo.outputPath('pages-local-import-step-1.png'), fullPage: true })
+  await page.getByLabel('Choose INI preset').setInputFiles(fixture.iniPath)
+  await expectStepTwoFocus(page)
+  await page.screenshot({ path: testInfo.outputPath('pages-local-import-step-2.png'), fullPage: true })
+  await page.getByLabel('Choose audio folder').setInputFiles(fixture.audioDirectory)
+  await page.getByRole('button', { name: 'Review selection' }).click()
+  await expect(page.getByRole('heading', { name: 'Review and load' })).toBeFocused()
+  await expect(page.getByLabel('Current session files')).toContainText('85 BPM - Beginner')
+  await expect(page.getByRole('button', { name: 'Load preset' })).toBeEnabled()
+  await page.screenshot({ path: testInfo.outputPath('pages-local-import-review.png'), fullPage: true })
+  await page.getByRole('button', { name: 'Load preset' }).click()
+  await expect(page.locator('.sequence-heading')).toContainText('Wizard Memory Fixture', { timeout: 30_000 })
+  await expect(page.getByLabel('Current session files')).toContainText('Wizard Memory Fixture')
+  await page.screenshot({ path: testInfo.outputPath('pages-local-import-loaded.png'), fullPage: true })
+  expect(await sealProductionSourceFiles(page)).toBe(2)
+
+  await page.getByRole('tab', { name: 'Samples', exact: true }).click()
+  const previewSample = page.getByRole('button', { name: 'Preview Wizard Tone' })
+  await previewSample.click()
+  await expect(page.getByRole('button', { name: 'Stop' })).toBeEnabled()
+  await expect.poll(() => page.evaluate(() => window.__pagesLocalImportQa?.workletNodes ?? 0)).toBeGreaterThan(0)
+  await expect.poll(() => productionLocalOutputPeak(page)).toBeGreaterThan(0.001)
+  await expect.poll(() => page.evaluate(() => window.__pagesLocalImportQa?.sourceStarts.length ?? 0)).toBeGreaterThan(0)
+  await expect.poll(() => page.evaluate(() => window.__pagesLocalImportQa?.sourceReadAttempts ?? 0)).toBe(0)
+  await page.getByRole('button', { name: 'Stop' }).click()
+
+  await page.getByRole('tab', { name: 'Practice', exact: true }).click()
+  await page.getByRole('button', { name: 'Generate combo' }).click()
+  await expect(page.getByRole('img', { name: /Sequence timeline: .*legacy ticks, \d+ events/ })).toBeVisible()
+  const startsBeforePlay = await page.evaluate(() => window.__pagesLocalImportQa?.sourceStarts.length ?? 0)
+  await page.getByRole('button', { name: 'Play sequence' }).click()
+  await expect(page.locator('.transport-status')).toContainText('question playback')
+  await expect.poll(() => page.evaluate(() => window.__pagesLocalImportQa?.sourceStarts.length ?? 0)).toBeGreaterThan(startsBeforePlay)
+  await expect.poll(() => productionLocalOutputPeak(page)).toBeGreaterThan(0.001)
+  await expect.poll(() => page.evaluate(() => window.__pagesLocalImportQa?.sourceReadAttempts ?? 0)).toBe(0)
+  await page.getByRole('button', { name: 'Stop' }).click()
+
+  const localSourceNames = ['WizardTone.wav', 'Bed.wav']
+  expect(requests.filter((request) => localSourceNames.some((name) => request.url.includes(name)))).toEqual([])
+  expect(requests.every((request) => {
+    const url = new URL(request.url)
+    return url.origin === new URL(page.url()).origin && ['GET', 'HEAD'].includes(request.method)
+  })).toBe(true)
 })

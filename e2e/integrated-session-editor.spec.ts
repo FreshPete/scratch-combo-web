@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { stageLocalImport } from "./helpers/import-wizard";
 
 declare global {
   interface Window {
@@ -76,26 +77,26 @@ function customIni(): string {
 async function loadCustomFixture(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Generated combo" })).toBeVisible({ timeout: 30_000 });
-  await page.getByLabel("Choose WAV files").setInputFiles([
+  await stageLocalImport(page, {
+    name: "editor.ini",
+    buffer: Buffer.from(customIni()),
+    mimeType: "text/plain",
+  }, [
     { name: "Wanted.wav", buffer: makeWav(440), mimeType: "audio/wav" },
     { name: "beat.wav", buffer: makeWav(100), mimeType: "audio/wav" },
     { name: "beat-two.wav", buffer: makeWav(120), mimeType: "audio/wav" },
   ]);
-  await page.getByLabel("Choose INI preset").setInputFiles({
-    name: "editor.ini",
-    buffer: Buffer.from(customIni()),
-    mimeType: "text/plain",
-  });
-  await expect(page.locator(".import-status__copy p")).toContainText("1 samples and 2 beat files resolved");
+  await expect(page.getByRole("button", { name: "Load preset" })).toBeEnabled();
+  await page.getByRole("button", { name: "Load preset" }).click();
 }
 
 test("session controls stay inside the workspace at narrow, tablet, and desktop widths", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Generated combo" })).toBeVisible({ timeout: 30_000 });
-  await expect(page.locator(".import-status__copy p")).toContainText(
-    "85 BPM - Beginner ready. All 64 sample references and 2 beat files are loaded",
-    { timeout: 30_000 },
-  );
+  await page.getByRole("tab", { name: "Files", exact: true }).click();
+  await expect(page.getByLabel("Current session files")).toContainText("85 BPM - Beginner", { timeout: 30_000 });
+  await expect(page.locator(".import-current__count")).toContainText("66 WAV files in session");
+  await page.getByRole("tab", { name: "Session", exact: true }).click();
   await expect(page.getByRole("spinbutton", { name: "BPM" })).toHaveValue("85");
 
   for (const width of [390, 844, 1280]) {
@@ -278,12 +279,14 @@ test("sample edits save a preserved working INI and leave BPM01 as recorded temp
   });
   await loadCustomFixture(page);
 
+  await page.getByRole("tab", { name: "Session", exact: true }).click();
   await page.getByRole("spinbutton", { name: "BPM" }).fill("100");
   await page.getByRole("slider", { name: "Sample level" }).focus();
   await page.keyboard.press("ArrowLeft");
   await page.getByRole("slider", { name: "Beat level" }).focus();
   await page.keyboard.press("ArrowLeft");
 
+  await page.getByRole("tab", { name: "Samples", exact: true }).click();
   await page.getByRole("button", { name: "Edit Editor sample" }).click();
   const editor = page.getByRole("form", { name: "Edit Editor sample" });
   await expect(editor).toBeVisible();
@@ -310,7 +313,7 @@ test("sample edits save a preserved working INI and leave BPM01 as recorded temp
 
   await page.evaluate(() => { window.__qaSavePickerState!.mode = "save"; });
   await save.click();
-  await expect(page.locator(".import-status__copy p")).toContainText("Working preset copy saved as editor-edited.ini");
+  await expect(page.locator('.visually-hidden[aria-live="polite"]')).toContainText("Working preset copy saved as editor-edited.ini");
   const savedIni = (await page.evaluate(() => window.__qaSavePickerState!.contents[0]))!;
   expect(await page.evaluate(() => window.__qaSavePickerState!.suggestedNames)).toEqual(["editor-edited.ini", "editor-edited.ini"]);
   expect(savedIni).toContain("; retained browser-QA source comment");
@@ -323,13 +326,20 @@ test("sample edits save a preserved working INI and leave BPM01 as recorded temp
   expect(savedIni).toContain("Sample16ths=12");
   expect(savedIni).toMatch(/VOL_B=34\r\nVOL_S=74/);
 
-  await page.getByLabel("Choose INI preset").setInputFiles({
+  await stageLocalImport(page, {
     name: "editor-edited.ini",
     buffer: Buffer.from(savedIni),
     mimeType: "text/plain",
-  });
-  await expect(page.locator(".import-status__copy p")).toContainText("1 samples and 2 beat files resolved");
+  }, [
+    { name: "Wanted.wav", buffer: makeWav(440), mimeType: "audio/wav" },
+    { name: "beat.wav", buffer: makeWav(100), mimeType: "audio/wav" },
+    { name: "beat-two.wav", buffer: makeWav(120), mimeType: "audio/wav" },
+  ]);
+  await expect(page.getByRole("button", { name: "Load preset" })).toBeEnabled();
+  await page.getByRole("button", { name: "Load preset" }).click();
+  await page.getByRole("tab", { name: "Session", exact: true }).click();
   await expect(page.getByRole("spinbutton", { name: "BPM" })).toHaveValue("85");
   await expect(page.getByLabel("Beat bed")).toHaveValue("0");
+  await page.getByRole("tab", { name: "Samples", exact: true }).click();
   await expect(page.locator(".sample-table tbody tr").filter({ hasText: "Editor sample" })).toContainText("12 legacy ticks");
 });

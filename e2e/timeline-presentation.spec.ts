@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
+import { stageLocalImport } from './helpers/import-wizard'
 
 declare global {
   interface Window {
@@ -99,13 +100,14 @@ async function loadFixture(page: Page): Promise<void> {
     return { name: `timeline-tone-${sampleId}.wav`, buffer: makeWav(300 + index * 40), mimeType: 'audio/wav' }
   })
   wavFiles.push({ name: 'timeline-beat.wav', buffer: makeWav(110, 0.3), mimeType: 'audio/wav' })
-  await page.getByLabel('Choose WAV files').setInputFiles(wavFiles)
-  await page.getByLabel('Choose INI preset').setInputFiles({
+  await stageLocalImport(page, {
     name: 'timeline-presentation.ini',
     buffer: Buffer.from(makeIni()),
     mimeType: 'text/plain',
-  })
-  await expect(page.locator('.import-status__copy p')).toContainText('sample references parsed')
+  }, wavFiles)
+  await expect(page.getByRole('button', { name: 'Load preset' })).toBeEnabled()
+  await page.getByRole('button', { name: 'Load preset' }).click()
+  await page.getByRole('tab', { name: 'Practice', exact: true }).click()
   await page.getByLabel('Combo length').selectOption('16')
   await page.getByRole('button', { name: 'Generate combo' }).click()
   await expect(page.getByRole('img', { name: 'Sequence timeline: 256 legacy ticks, 32 events' })).toBeVisible()
@@ -348,10 +350,10 @@ test('the actual 85 BPM preset keeps its audible active wave aligned in Grid and
   await page.setViewportSize({ width: 1280, height: 720 })
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'Generated combo' })).toBeVisible({ timeout: 30_000 })
-  await expect(page.locator('.import-status__copy p')).toContainText(
-    '85 BPM - Beginner ready. All 64 sample references and 2 beat files are loaded',
-    { timeout: 60_000 },
-  )
+  await page.getByRole('tab', { name: 'Files', exact: true }).click()
+  await expect(page.getByLabel('Current session files')).toContainText('85 BPM - Beginner', { timeout: 60_000 })
+  await expect(page.locator('.import-current__count')).toContainText('66 WAV files in session')
+  await page.getByRole('tab', { name: 'Practice', exact: true }).click()
   await expect(page.getByRole('img', { name: /Sequence timeline: 128 legacy ticks/ })).toBeVisible()
   await expect(page.locator('.sequence-waveform path').first()).toBeVisible()
   await expect(page.getByRole('radio', { name: 'Grid' })).toBeChecked()

@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { stageLocalImport } from "./helpers/import-wizard";
 
 declare global {
   interface Window {
@@ -128,14 +129,18 @@ function makeSilentIni(durationTicks = 64): string {
 
 async function loadFastImportedCombo(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/");
-  await page.getByLabel("Choose INI preset").setInputFiles(payload("Fast-QA.ini", Buffer.from(makeIni()), "text/plain"));
-  await page.getByLabel("Choose WAV files").setInputFiles([
+  await stageLocalImport(page, payload("Fast-QA.ini", Buffer.from(makeIni()), "text/plain"), [
     payload("Wanted.wav", makeWav(440), "audio/wav"),
     payload("beat.wav", makeWav(100), "audio/wav"),
   ]);
+  await expect(page.getByRole("button", { name: "Load preset" })).toBeEnabled();
+  await page.getByRole("button", { name: "Load preset" }).click();
+  await page.getByRole("tab", { name: "Practice", exact: true }).click();
   await page.getByLabel("Combo length").selectOption("4");
+  await page.getByRole("tab", { name: "Session", exact: true }).click();
   await page.getByRole("spinbutton", { name: "BPM" }).fill("240");
   await page.getByLabel("Beat bed").selectOption("0");
+  await page.getByRole("tab", { name: "Practice", exact: true }).click();
   await page.getByRole("button", { name: "Generate combo" }).click();
   await expect(page.getByRole("img", { name: "Sequence timeline: 64 legacy ticks, 8 events" })).toBeVisible();
 }
@@ -374,21 +379,22 @@ test("demo Play/Stop uses one running AudioContext, advances progress, and compl
   expect(externalOrMutatingRequests).toEqual([]);
 });
 
-test("import diagnostics recover from missing and case-ambiguous WAV selections", async ({ page }) => {
+test("import review blocks missing and case-ambiguous files before load", async ({ page }) => {
   await page.goto("/");
-  await page.getByLabel("Choose INI preset").setInputFiles(payload("QA.ini", Buffer.from(makeIni()), "text/plain"));
-  await expect(page.getByText(/Wanted\.wav.*not selected/i)).toBeVisible();
-
-  await page.getByRole("button", { name: "Generate combo" }).click();
-  await expect(page.getByRole("img", { name: /Sequence timeline: 128 legacy ticks/ })).toBeVisible();
-  await page.getByRole("button", { name: "Play sequence" }).click();
-  await expect(page.getByRole("alert").filter({ hasText: /This combo uses WAV files that are not ready: QA Tone/ })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Generate combo" })).toBeEnabled();
-
+  const ini = payload("QA.ini", Buffer.from(makeIni()), "text/plain");
   const beat = payload("beat.wav", makeWav(100), "audio/wav");
   const sample = payload("Wanted.wav", makeWav(440), "audio/wav");
-  await page.getByLabel("Choose WAV files").setInputFiles([sample, beat]);
-  await expect(page.getByText(/not selected/i)).toHaveCount(0);
+  await stageLocalImport(page, ini, [beat]);
+  await expect(page.getByRole("button", { name: "Load preset" })).toBeDisabled();
+  await expect(page.getByRole("row").filter({ hasText: "QA Tone" })).toContainText("Required WAV missing");
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByLabel("Quick preset")).not.toHaveValue("custom");
+
+  await stageLocalImport(page, ini, [sample, beat]);
+  await expect(page.getByRole("button", { name: "Load preset" })).toBeEnabled();
+  await page.getByRole("button", { name: "Load preset" }).click();
+  await page.getByRole("tab", { name: "Practice", exact: true }).click();
+  await page.getByLabel("Combo length").selectOption("8");
   await page.getByRole("button", { name: "Generate combo" }).click();
   await expect(page.getByRole("img", { name: /Sequence timeline: 128 legacy ticks/ })).toBeVisible();
   await page.getByRole("button", { name: "Play sequence" }).click();
@@ -396,11 +402,11 @@ test("import diagnostics recover from missing and case-ambiguous WAV selections"
   await page.getByRole("button", { name: "Stop" }).click();
 
   const collision = payload("wanted.wav", makeWav(660), "audio/wav");
-  await page.getByLabel("Choose WAV files").setInputFiles([sample, collision, beat]);
-  await expect(page.getByText(/Selected files collide when paths are compared without case/i)).toBeVisible();
-
-  await page.getByLabel("Choose WAV files").setInputFiles([sample, beat]);
-  await expect(page.getByText(/collide when paths are compared without case|matches more than one selected file/i)).toHaveCount(0);
+  await stageLocalImport(page, ini, [sample, collision, beat]);
+  await expect(page.getByRole("button", { name: "Load preset" })).toBeDisabled();
+  await expect(page.getByRole("row").filter({ hasText: "QA Tone" })).toContainText("Ambiguous");
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.locator(".sequence-heading")).toContainText("Browser Fixture");
 });
 
 test("imported Q&A uses full silent response slots, Large Pause uses three, and Loop repeats until Stop", async ({ page }) => {
@@ -564,7 +570,12 @@ test("captures a narrow-viewport review; mobile layout support remains out of sc
 
 test("imported combo lengths map to 64, 128, 256, and 512 raw legacy ticks", async ({ page }) => {
   await page.goto("/");
-  await page.getByLabel("Choose INI preset").setInputFiles(payload("QA.ini", Buffer.from(makeIni()), "text/plain"));
+  await stageLocalImport(page, payload("QA.ini", Buffer.from(makeIni()), "text/plain"), [
+    payload("Wanted.wav", makeWav(440), "audio/wav"),
+    payload("beat.wav", makeWav(100), "audio/wav"),
+  ]);
+  await page.getByRole("button", { name: "Load preset" }).click();
+  await page.getByRole("tab", { name: "Practice", exact: true }).click();
 
   const comboLength = page.getByLabel("Combo length");
   const generate = page.getByRole("button", { name: "Generate combo" });
@@ -581,12 +592,15 @@ test("imported combo lengths map to 64, 128, 256, and 512 raw legacy ticks", asy
 
 test("silent rows remain enabled when UseSample is false, and infeasible generation returns promptly", async ({ page }) => {
   await page.goto("/");
-  const iniPicker = page.getByLabel("Choose INI preset");
-  await iniPicker.setInputFiles(payload("Silent.ini", Buffer.from(makeSilentIni()), "text/plain"));
+  await stageLocalImport(page, payload("Silent.ini", Buffer.from(makeSilentIni()), "text/plain"), []);
+  await expect(page.getByRole("button", { name: "Load preset" })).toBeEnabled();
+  await page.getByRole("button", { name: "Load preset" }).click();
+  await page.getByRole("tab", { name: "Samples", exact: true }).click();
 
   const silentToggle = page.getByRole("checkbox", { name: "Enable Forced Silent for next combo" });
   await expect(silentToggle).toBeChecked();
   await expect(silentToggle).toBeDisabled();
+  await page.getByRole("tab", { name: "Practice", exact: true }).click();
   await page.getByLabel("Combo length").selectOption("4");
   await page.getByRole("button", { name: "Generate combo" }).click();
   await expect(page.getByRole("img", { name: "Sequence timeline: 64 legacy ticks, 1 events" })).toBeVisible();
@@ -595,7 +609,10 @@ test("silent rows remain enabled when UseSample is false, and infeasible generat
   await expect(page.locator(".transport-status")).toHaveText("Q&A · question playback · cycle 1.");
   await page.getByRole("button", { name: "Stop" }).click();
 
-  await iniPicker.setInputFiles(payload("Infeasible.ini", Buffer.from(makeSilentIni(8)), "text/plain"));
+  await stageLocalImport(page, payload("Infeasible.ini", Buffer.from(makeSilentIni(8)), "text/plain"), []);
+  await page.getByRole("button", { name: "Load preset" }).click();
+  await page.getByRole("tab", { name: "Practice", exact: true }).click();
+  await page.getByLabel("Combo length").selectOption("4");
   const generate = page.getByRole("button", { name: "Generate combo" });
   await generate.click();
   await expect(page.getByRole("alert")).toContainText("within its bounded retries", { timeout: 10_000 });
@@ -603,6 +620,7 @@ test("silent rows remain enabled when UseSample is false, and infeasible generat
 });
 
 test("private 85 BPM preset reaches its Q&A answer slot and stops without uploading files", async ({ page }) => {
+  test.setTimeout(180_000);
   test.skip(!privateWavDirectory, "Set SCRATCH_COMBO_PRIVATE_WAV_DIR to run the local preserved-asset smoke check.");
   const wavDirectory = privateWavDirectory!;
   const ini = privateIniPath ?? path.resolve(wavDirectory, "..", "SSC-085BPM-01.ini");
@@ -619,18 +637,24 @@ test("private 85 BPM preset reaches its Q&A answer slot and stops without upload
   await instrumentWebAudio(page);
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");
-  await page.getByLabel("Choose INI preset").setInputFiles({ name: path.basename(ini), mimeType: "text/plain", buffer: readFileSync(ini) });
-  await page.getByLabel("Choose WAV files").setInputFiles(wavFiles.map((filePath) => ({
+  await stageLocalImport(page, { name: path.basename(ini), mimeType: "text/plain", buffer: readFileSync(ini) }, wavFiles.map((filePath) => ({
     name: path.basename(filePath),
     mimeType: "audio/wav",
     buffer: readFileSync(filePath),
   })));
-
+  await expect(page.getByRole("button", { name: "Load preset" })).toBeEnabled({ timeout: 120_000 });
+  await page.getByRole("button", { name: "Load preset" }).click();
+  await page.getByRole("tab", { name: "Samples", exact: true }).click();
+  await expect(page.locator(".sample-table tbody tr")).toHaveCount(64);
   await expect(page.getByText("64 samples")).toBeVisible();
+  await page.getByRole("tab", { name: "Practice", exact: true }).click();
+
   await expect(page.getByText(/not selected|matches more than one selected file|collide when paths are compared without case/i)).toHaveCount(0);
+  await page.getByRole("tab", { name: "Session", exact: true }).click();
   await expect(page.getByRole("spinbutton", { name: "BPM" })).toHaveValue("85");
   await expect(page.locator(".sequence-heading")).toContainText(presetName!);
 
+  await page.getByRole("tab", { name: "Practice", exact: true }).click();
   const generate = page.getByRole("button", { name: "Generate combo" });
   await generate.click();
   const timeline = page.getByRole("img", { name: /Sequence timeline: 128 legacy ticks, \d+ events/ });

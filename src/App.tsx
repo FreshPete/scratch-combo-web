@@ -2,7 +2,10 @@ import {
   useEffect, useMemo, useRef, useState, useSyncExternalStore,
   type ChangeEvent, type CSSProperties, type InputHTMLAttributes, type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
-import { analyzeLocalAudioFile, AudioTransport, type CyclePlanOptions, type CycleSlot, type PlayOptions } from './audio'
+import {
+  analyzeLocalAudioFile, AudioTransport, LocalWavSnapshotError, snapshotReferencedWavFiles,
+  type CyclePlanOptions, type CycleSlot, type PlayOptions, type SnapshotFileValidation,
+} from './audio'
 import { getTempoRange, SessionControls, type CustomBeatAnalysisStatus } from './SessionControls'
 import {
   buildAssetIndex, buildPreviewFixture, DEMO_PRESET, generateLegacyCombo, parseLegacyIni,
@@ -32,6 +35,9 @@ const AUTO_GENERATE_ROUND_OPTIONS = [1, 2, 4, 8] as const
 const LEGACY_TICKS_PER_BEAT = 16
 const SYNTHETIC_SAMPLE_IDS = new Set(['synthPulse', 'synthBrush', 'synthSilence'])
 const WAV_ACCEPT = '.wav,audio/wav,audio/x-wav'
+const MAX_LOCAL_INI_BYTES = 1024 * 1024
+const MAX_SELECTED_AUDIO_FILE_COUNT = 10_000
+const MAX_LOCAL_IMPORT_REFERENCES = 512
 const TIMELINE_LABEL_COLUMN_WIDTH = 150
 const TIMELINE_MIN_TICK_WIDTH = 8
 const TIMELINE_BOARD_HORIZONTAL_PADDING = 24
@@ -65,6 +71,32 @@ type TimelineLayout = 'grid' | 'inline'
 type WorkspaceSection = 'sequence' | 'files' | 'session' | 'samples'
 type PresetSource = 'loading' | 'builtin' | 'custom' | 'demo'
 type CustomBeatCandidate = { file: File; buffer: AudioBuffer | null }
+type ImportWizardStep = 1 | 2 | 3
+type ImportReferenceCheck = {
+  subject: 'sample' | 'beat'
+  id: string
+  requested: string
+  required: boolean
+  resolution: AssetResolution
+  validation: SnapshotFileValidation | null
+}
+type PreparedLocalImport = {
+  iniFileName: string
+  iniText: string
+  preset: Preset
+  resolution: PresetAssetResolution
+  snapshotResolution: PresetAssetResolution
+  snapshotFiles: File[]
+  selectedAudioFileCount: number
+  checks: ImportReferenceCheck[]
+  copiedFileCount: number
+  copiedBytes: number
+  decodedFileCount: number
+  decodeAttemptCount: number
+  canLoad: boolean
+  applied: boolean
+  blockedMessage: string | null
+}
 
 const WORKSPACE_TABS: ReadonlyArray<{ section: WorkspaceSection; label: string; href: string; id: string }> = [
   { section: 'sequence', label: 'Practice', href: '#sequence-section', id: 'tab-practice' },
@@ -323,6 +355,109 @@ function formatWeight(weight: number): string {
   return Number.isInteger(weight) ? String(weight) : weight.toLocaleString(undefined, { maximumFractionDigits: 2 })
 }
 
+function requiredImportSample(sample: SampleDefinition): boolean {
+  return sample.enabled && !sample.silent && sample.weight > 0 && sample.durationUnits > 0
+}
+
+function resolvedReferencedFiles(resolution: PresetAssetResolution): File[] {
+  const files = new Set<File>()
+  for (const asset of resolution.samplesById.values()) {
+    if (asset.status === 'resolved' && asset.file) files.add(asset.file)
+  }
+  for (const asset of resolution.beats) {
+    if (asset.status === 'resolved' && asset.file) files.add(asset.file)
+  }
+  return [...files]
+}
+
+function referenceChecksForImport(
+  preset: Preset,
+  resolution: PresetAssetResolution,
+  validationBySource: ReadonlyMap<File, SnapshotFileValidation> = new Map(),
+): ImportReferenceCheck[] {
+  const samples = preset.samples.map((sample): ImportReferenceCheck => {
+    const asset = resolution.samplesById.get(sample.id)
+      ?? { status: 'missing', requested: sample.fileName, candidates: [] }
+    return {
+      subject: 'sample',
+      id: sample.id,
+      requested: sample.fileName,
+      required: requiredImportSample(sample),
+      resolution: asset,
+      validation: asset.status === 'resolved' && asset.file ? validationBySource.get(asset.file) ?? null : null,
+    }
+  })
+  const beats = preset.beatFiles.map((fileName, index): ImportReferenceCheck => {
+    const asset = resolution.beats[index]
+      ?? { status: 'missing', requested: fileName, candidates: [] }
+    return {
+      subject: 'beat',
+      id: 'Beat' + String(index + 1).padStart(2, '0'),
+      requested: fileName,
+      required: false,
+      resolution: asset,
+      validation: asset.status === 'resolved' && asset.file ? validationBySource.get(asset.file) ?? null : null,
+    }
+  })
+  return [...samples, ...beats]
+}
+
+function mapPresetResolutionToSnapshots(
+  resolution: PresetAssetResolution,
+  filesBySource: ReadonlyMap<File, File>,
+  validationBySource: ReadonlyMap<File, SnapshotFileValidation>,
+): PresetAssetResolution {
+  const mapOne = (asset: AssetResolution): AssetResolution => {
+    if (asset.status !== 'resolved' || !asset.file) return asset
+    if (validationBySource.get(asset.file)?.status === 'invalid') {
+      const unavailable: AssetResolution = {
+        status: 'missing',
+        requested: asset.requested,
+        candidates: asset.candidates,
+      }
+      if (asset.selectedPath) unavailable.selectedPath = asset.selectedPath
+      return unavailable
+    }
+    const snapshot = filesBySource.get(asset.file)
+    if (!snapshot) throw new Error('A referenced WAV was not copied into session memory.')
+    return { ...asset, file: snapshot }
+  }
+  return {
+    samplesById: new Map(Array.from(resolution.samplesById, ([sampleId, asset]) => [sampleId, mapOne(asset)])),
+    beats: resolution.beats.map(mapOne),
+    diagnostics: resolution.diagnostics,
+  }
+}
+
+function mappedReferenceChecks(
+  checks: ImportReferenceCheck[],
+  resolution: PresetAssetResolution,
+): ImportReferenceCheck[] {
+  let beatIndex = 0
+  return checks.map((check) => {
+    const mapped = check.subject === 'sample'
+      ? resolution.samplesById.get(check.id) ?? check.resolution
+      : resolution.beats[beatIndex++] ?? check.resolution
+    return { ...check, resolution: mapped }
+  })
+}
+
+function snapshotErrorForImport(error: unknown, resolution: PresetAssetResolution): string {
+  if (error instanceof LocalWavSnapshotError && error.file) {
+    const paths = [
+      ...Array.from(resolution.samplesById.values())
+        .filter((asset) => asset.file === error.file)
+        .map((asset) => asset.selectedPath),
+      ...resolution.beats
+        .filter((asset) => asset.file === error.file)
+        .map((asset) => asset.selectedPath),
+    ].filter((path): path is string => Boolean(path))
+    const reference = [...new Set(paths)].join(', ') || error.file.name
+    return reference + ': ' + error.message + ' Choose another folder or smaller referenced WAVs, then review again.'
+  }
+  return describeError(error) + ' Choose another folder or smaller referenced WAVs, then review again.'
+}
+
 function legacyFixtureFor(preset: Preset, requestedRawTicks: number) {
   const result = generateLegacyCombo(preset, requestedRawTicks, web24bitRnd)
   if (
@@ -410,51 +545,198 @@ function LocalFilePicker({
   )
 }
 
-function LocalImportPanel({
-  presetFileName, localFileCount, importMessage, presetError, selectionError,
-  presetSource, isBootstrapLoading, bootstrapError,
-  locked, onRetryBuiltIn, onPresetChange, onFolderChange, onFilesChange,
+function ImportWizard({
+  step, fileMode, stagedIniFileName, stagedPresetName, stagedAudioCount, currentPresetName,
+  currentAudioCount, busy, wizardError, selectionNote, prepared, locked, isBootstrapLoading,
+  bootstrapError, onRetryBuiltIn, onIniChange, onAudioChange, onFileModeChange, onBack,
+  onCancel, onReviewEmptySelection, onLoad, onStartAnother,
 }: {
-  presetFileName: string | null
-  localFileCount: number
-  importMessage: string
-  presetError: string | null
-  selectionError: string | null
-  presetSource: PresetSource
+  step: ImportWizardStep
+  fileMode: 'folder' | 'files'
+  stagedIniFileName: string | null
+  stagedPresetName: string | null
+  stagedAudioCount: number
+  currentPresetName: string
+  currentAudioCount: number
+  busy: boolean
+  wizardError: string | null
+  selectionNote: string | null
+  prepared: PreparedLocalImport | null
+  locked: boolean
   isBootstrapLoading: boolean
   bootstrapError: string | null
-  locked: boolean
   onRetryBuiltIn: () => void
-  onPresetChange: (event: ChangeEvent<HTMLInputElement>) => void
-  onFolderChange: (event: ChangeEvent<HTMLInputElement>) => void
-  onFilesChange: (event: ChangeEvent<HTMLInputElement>) => void
+  onIniChange: (event: ChangeEvent<HTMLInputElement>) => void
+  onAudioChange: (event: ChangeEvent<HTMLInputElement>) => void
+  onFileModeChange: (mode: 'folder' | 'files') => void
+  onBack: () => void
+  onCancel: () => void
+  onReviewEmptySelection: () => void
+  onLoad: () => void
+  onStartAnother: () => void
 }) {
+  const stepTitle = step === 1
+    ? 'Choose your INI preset'
+    : step === 2
+      ? 'Choose the audio files'
+      : 'Review and load'
+  const referenceRows = prepared?.checks ?? []
+  const requiredMissing = referenceRows.filter((check) => check.required && check.resolution.status !== 'resolved')
+  const requiredDecodeFailures = referenceRows.filter((check) => check.required && check.validation?.status === 'invalid')
   return (
     <section id="files-section" className="workspace-section import-section" aria-labelledby="import-heading">
       <div className="section-heading">
         <div>
-          <h2 id="import-heading">Local files</h2>
-          <p>Choose a built-in practice set, or load your own INI and WAV files.</p>
+          <h2 id="import-heading">Your files</h2>
+          <p>Stage a preset and its referenced WAVs, review the matches, then load them into this session.</p>
         </div>
         <span className="section-index" aria-hidden="true">LOCAL</span>
       </div>
-      <div className="file-picker-grid">
-        <LocalFilePicker inputId="preset-file" label="Choose INI preset" description="One .ini file" accept=".ini,text/plain" disabled={locked} onChange={onPresetChange} />
-        <LocalFilePicker inputId="audio-folder" label="Choose audio folder" description="Folder picker for WAV files" accept={WAV_ACCEPT} directory disabled={locked} onChange={onFolderChange} />
-        <LocalFilePicker inputId="audio-files" label="Choose WAV files" description="Multi-file fallback" accept={WAV_ACCEPT} multiple disabled={locked} onChange={onFilesChange} />
-      </div>
-      <div className="import-status">
-        <span className="status-led" aria-hidden="true" />
-        <div className="import-status__copy">
-          <strong>{presetFileName ?? (presetSource === 'loading' ? 'Loading built-in preset' : presetSource === 'custom' ? 'Custom preset' : presetSource === 'builtin' ? 'Built-in preset' : 'Synthetic demo preset')}</strong>
-          <p>{importMessage}</p>
+
+      <div className="import-current" aria-label="Current session files">
+        <div>
+          <span className="import-current__label">Current setup</span>
+          <strong>{currentPresetName}</strong>
         </div>
-        <span className="import-status__count">{localFileCount} WAV {localFileCount === 1 ? 'file' : 'files'}</span>
+        <span className="import-current__count">{currentAudioCount} WAV {currentAudioCount === 1 ? 'file' : 'files'} in session</span>
       </div>
-      {isBootstrapLoading && <p className="inline-status" role="status">Loading the preset and its referenced WAV files. Playback is unavailable until every reference is ready.</p>}
+
+      <ol className="import-steps" aria-label="Preset import steps">
+        {(['INI', 'Audio', 'Review'] as const).map((label, index) => (
+          <li key={label} className={step === index + 1 ? 'import-steps__item import-steps__item--current' : step > index + 1 ? 'import-steps__item import-steps__item--complete' : 'import-steps__item'} aria-current={step === index + 1 ? 'step' : undefined}>
+            <span>{label}</span>
+          </li>
+        ))}
+      </ol>
+
+      <div className="import-wizard" aria-busy={busy}>
+        <div className="import-wizard__heading">
+          <h3 id={'import-step-' + step + '-heading'} tabIndex={-1}>{stepTitle}</h3>
+          {stagedIniFileName && <span className="import-wizard__file-name">{stagedIniFileName}</span>}
+        </div>
+
+        {step === 1 && (
+          <div className="import-wizard__step">
+            <p>Choose one legacy INI file. It will be read in this browser and checked before your current setup changes.</p>
+            {busy && <p className="inline-status" role="status">Reading {stagedIniFileName} locally. Your current setup stays active.</p>}
+            <LocalFilePicker inputId="preset-file" label="Choose INI preset" description="One .ini file · up to 1 MiB" accept=".ini,text/plain" disabled={locked} onChange={onIniChange} />
+          </div>
+        )}
+
+        {step === 2 && (
+          <div className="import-wizard__step">
+            <p>{stagedPresetName ? stagedPresetName + ' is staged. Choose the folder that contains its WAV files.' : 'Choose the folder that contains the WAV files referenced by this INI.'}</p>
+            {fileMode === 'folder' ? (
+              <>
+                <LocalFilePicker inputId="audio-folder" label="Choose audio folder" description="One folder · WAV references are matched locally" accept={WAV_ACCEPT} directory disabled={locked || busy} onChange={onAudioChange} />
+                <button className="button button--text import-wizard__alternate" type="button" disabled={locked || busy} onClick={() => onFileModeChange('files')}>Choose files instead</button>
+              </>
+            ) : (
+              <>
+                <LocalFilePicker inputId="audio-files" label="Choose WAV files" description="Select multiple files for this preset" accept={WAV_ACCEPT} multiple disabled={locked || busy} onChange={onAudioChange} />
+                <button className="button button--text import-wizard__alternate" type="button" disabled={locked || busy} onClick={() => onFileModeChange('folder')}>Choose a folder instead</button>
+              </>
+            )}
+            <p className="import-wizard__selection">{stagedAudioCount} WAV {stagedAudioCount === 1 ? 'file' : 'files'} selected for this draft.</p>
+            <div className="import-wizard__actions">
+              <button className="button button--secondary" type="button" disabled={busy} onClick={onBack}>Back</button>
+              <button className="button button--primary" type="button" disabled={locked || busy} onClick={onReviewEmptySelection}>Review selection</button>
+            </div>
+          </div>
+        )}
+
+        {step === 3 && (
+          <div className="import-wizard__step">
+            {busy ? (
+              <>
+                <p className="inline-status" role="status">Copying referenced WAVs into session memory and checking eligible audio. Your current setup stays active.</p>
+                <div className="import-wizard__actions">
+                  <button className="button button--secondary" type="button" onClick={onBack}>Back</button>
+                  <button className="button button--secondary" type="button" onClick={onCancel}>Cancel</button>
+                </div>
+              </>
+            ) : prepared ? (
+              <>
+                <p className="import-wizard__summary">{prepared.preset.name} · {prepared.selectedAudioFileCount} WAV {prepared.selectedAudioFileCount === 1 ? 'file' : 'files'} selected · {prepared.copiedFileCount} referenced WAV {prepared.copiedFileCount === 1 ? 'file' : 'files'} copied · {prepared.decodedFileCount} of {prepared.decodeAttemptCount} eligible WAVs decoded.</p>
+                {prepared.applied
+                  ? <p className="import-wizard__loaded" role="status">Preset loaded. Generate a combo when you are ready; playback has not started.</p>
+                  : <p className="import-wizard__preserve">Your current setup stays active until you load this preset. Nothing is written back to the selected files.</p>}
+                {(requiredMissing.length > 0 || requiredDecodeFailures.length > 0 || prepared.blockedMessage) && (
+                  <p className="inline-error" role="alert">
+                    {prepared.blockedMessage ?? 'Resolve the required sample WAVs below before loading this preset.'}
+                  </p>
+                )}
+                {selectionNote && <p className="inline-status" role="status">{selectionNote}</p>}
+                <div className="import-review-scroll">
+                  <table className="import-review-table">
+                    <thead><tr><th scope="col">Reference</th><th scope="col">Match</th><th scope="col">Check</th></tr></thead>
+                    <tbody>
+                      {referenceRows.map((check) => {
+                        const resolution = check.resolution
+                        const title = check.subject === 'sample'
+                          ? prepared.preset.samples.find((sample) => sample.id === check.id)?.name ?? check.id
+                          : 'Beat ' + check.id.replace(/^Beat/i, '')
+                        const path = resolution.status === 'resolved'
+                          ? resolution.selectedPath ?? check.requested
+                          : resolution.candidates.join(', ')
+                        const status = check.validation?.status === 'invalid'
+                          ? 'WAV could not decode'
+                          : resolution.status !== 'resolved'
+                            ? resolution.status === 'ambiguous' ? 'Ambiguous' : check.required ? 'Required WAV missing' : 'Not selected'
+                            : check.validation === null
+                              ? 'Matched · not copied or validated'
+                            : check.validation?.status === 'not-requested'
+                              ? 'Copied · decode not needed now'
+                              : 'Copied · audio decoded'
+                        const detail = check.validation?.status === 'invalid'
+                          ? check.validation.message
+                          : resolution.status === 'ambiguous'
+                            ? 'Matches ' + resolution.candidates.join(', ')
+                            : resolution.status === 'missing'
+                              ? 'INI references ' + JSON.stringify(check.requested)
+                              : check.validation === null
+                                ? 'Snapshot copy or validation did not complete for this matched WAV.'
+                              : check.required
+                                ? 'Required for an enabled, audible sample.'
+                                : check.subject === 'beat'
+                                  ? 'Optional beat bed; unavailable beats will stay unselected.'
+                                  : 'Not required now because this sample is disabled, silent, weightless, or zero duration.'
+                        return (
+                          <tr key={check.subject + '-' + check.id} className={check.required && (resolution.status !== 'resolved' || check.validation?.status === 'invalid') ? 'import-review-table__row--error' : undefined}>
+                            <th scope="row"><span>{title}</span><small>{check.subject === 'sample' ? 'Sample' : 'Preset beat'} · {check.id}</small></th>
+                            <td><code>{path || check.requested}</code></td>
+                            <td><strong>{status}</strong><small>{detail}</small></td>
+                          </tr>
+                        )
+                      })}
+                      {referenceRows.length === 0 && <tr><td colSpan={3}>This preset has no sample or beat file references.</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="import-wizard__actions">
+                  {!prepared.applied && <button className="button button--secondary" type="button" disabled={busy} onClick={onBack}>Back</button>}
+                  {!prepared.applied && <button className="button button--secondary" type="button" disabled={busy} onClick={onCancel}>Cancel</button>}
+                  {prepared.applied
+                    ? <button className="button button--primary" type="button" disabled>Preset loaded</button>
+                    : prepared.canLoad
+                      ? <button className="button button--primary" type="button" disabled={locked || busy} onClick={onLoad}>Load preset</button>
+                      : <button className="button button--primary" type="button" disabled>Load preset</button>}
+                  <button className="button button--text" type="button" disabled={locked || busy} onClick={onStartAnother}>Start another import</button>
+                </div>
+              </>
+            ) : (
+              <p className="inline-status" role="status">Select or review an audio folder to prepare this preset.</p>
+            )}
+          </div>
+        )}
+
+        {wizardError && <p className="inline-error" role="alert">{wizardError}</p>}
+        {step === 1 && <div className="import-wizard__actions"><button className="button button--secondary" type="button" onClick={onCancel}>Cancel</button></div>}
+        {step === 2 && <div className="import-wizard__actions import-wizard__actions--cancel"><button className="button button--secondary" type="button" disabled={busy} onClick={onCancel}>Cancel</button></div>}
+      </div>
+
+      {isBootstrapLoading && <p className="inline-status" role="status">Loading the built-in preset. Your current files panel will be ready when it finishes.</p>}
       {bootstrapError && <div className="inline-error" role="alert"><p>{bootstrapError}</p><button className="button button--small" type="button" disabled={locked} onClick={onRetryBuiltIn}>Retry built-in preset</button></div>}
-      {presetError && <p className="inline-error" role="alert">{presetError}</p>}
-      {selectionError && <p className="inline-error inline-error--quiet" role="status">{selectionError}</p>}
     </section>
   )
 }
@@ -836,12 +1118,12 @@ function SequenceTimeline({
 
 function DiagnosticList({ diagnostics }: { diagnostics: AssetDiagnostic[] }) {
   if (diagnostics.length === 0) {
-    return <div className="asset-check asset-check--ready" role="status"><span className="asset-check__mark" aria-hidden="true" /><p>All referenced files are ready.</p></div>
+    return <div className="asset-check asset-check--ready" role="status"><span className="asset-check__mark" aria-hidden="true" /><p>Current setup: all referenced files are ready.</p></div>
   }
   return (
     <div className="diagnostics" role="status" aria-live="polite">
       <div className="diagnostics__heading">
-        <strong>{diagnostics.length} file {diagnostics.length === 1 ? 'reference needs' : 'references need'} attention</strong>
+        <strong>Current setup: {diagnostics.length} file {diagnostics.length === 1 ? 'reference needs' : 'references need'} attention</strong>
         <span>Resolve these locally before playback.</span>
       </div>
       <ul>
@@ -1079,6 +1361,16 @@ export default function App() {
   const [localWavFiles, setLocalWavFiles] = useState<File[]>([])
   const [assetIndex, setAssetIndex] = useState<AssetIndex>(() => buildAssetIndex([]))
   const [assetResolution, setAssetResolution] = useState<PresetAssetResolution>()
+  const [importStep, setImportStep] = useState<ImportWizardStep>(1)
+  const [importFileMode, setImportFileMode] = useState<'folder' | 'files'>('folder')
+  const [stagedIniFile, setStagedIniFile] = useState<File | null>(null)
+  const [stagedIniText, setStagedIniText] = useState<string | null>(null)
+  const [stagedPreset, setStagedPreset] = useState<Preset | null>(null)
+  const [stagedAudioFiles, setStagedAudioFiles] = useState<File[]>([])
+  const [preparedLocalImport, setPreparedLocalImport] = useState<PreparedLocalImport | null>(null)
+  const [isPreparingLocalImport, setIsPreparingLocalImport] = useState(false)
+  const [localImportError, setLocalImportError] = useState<string | null>(null)
+  const [localImportSelectionNote, setLocalImportSelectionNote] = useState<string | null>(null)
   const [isReadingPreset, setIsReadingPreset] = useState(true)
   const [isPresetReady, setIsPresetReady] = useState(false)
   const [presetSource, setPresetSource] = useState<PresetSource>('loading')
@@ -1088,8 +1380,6 @@ export default function App() {
   const [bootstrapError, setBootstrapError] = useState<string | null>(null)
   const [isGenerating, setIsGenerating] = useState(false)
   const [importMessage, setImportMessage] = useState('Loading the 85 BPM Beginner preset and its referenced WAV files.')
-  const [presetError, setPresetError] = useState<string | null>(null)
-  const [selectionError, setSelectionError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [bpm, setBpm] = useState(String(DEMO_PRESET.bpm))
   const [pitchSemitones, setPitchSemitones] = useState(0)
@@ -1125,10 +1415,12 @@ export default function App() {
 
   const assetIndexRef = useRef(assetIndex)
   const presetImportGeneration = useRef(0)
+  const localImportGeneration = useRef(0)
+  const localImportController = useRef<AbortController | undefined>(undefined)
+  const activeQuickPresetIdRef = useRef(DEFAULT_BUILTIN_PRESET_ID)
   const presetSourceRef = useRef<PresetSource>('loading')
   const activePresetLoadRef = useRef<AbortController | undefined>(undefined)
   const builtInCatalogRef = useRef<BuiltInPresetCatalog | undefined>(undefined)
-  const customWavFilesRef = useRef<File[]>([])
   const customBeatAnalysisGeneration = useRef(0)
   const lifecycleGeneration = useRef(0)
   const autoGenerateGeneration = useRef(0)
@@ -1175,6 +1467,36 @@ export default function App() {
     ? practiceMode === 'loop' ? 1 : largePause ? 4 : 2
     : 1
 
+  const cancelLocalImportWork = () => {
+    localImportGeneration.current += 1
+    localImportController.current?.abort()
+    localImportController.current = undefined
+    setIsPreparingLocalImport(false)
+  }
+
+  const clearLocalImportDraft = (restoreQuickPreset = false) => {
+    cancelLocalImportWork()
+    setImportStep(1)
+    setImportFileMode('folder')
+    setStagedIniFile(null)
+    setStagedIniText(null)
+    setStagedPreset(null)
+    setStagedAudioFiles([])
+    setPreparedLocalImport(null)
+    setLocalImportError(null)
+    setLocalImportSelectionNote(null)
+    if (restoreQuickPreset) setSelectedPresetId(activeQuickPresetIdRef.current)
+  }
+
+  const focusLocalImportTarget = (step: ImportWizardStep, fileMode = importFileMode, target: 'heading' | 'picker' = 'heading') => {
+    requestAnimationFrame(() => {
+      const targetId = target === 'heading'
+        ? 'import-step-' + step + '-heading'
+        : step === 1 ? 'preset-file' : step === 2 ? fileMode === 'folder' ? 'audio-folder' : 'audio-files' : 'import-step-3-heading'
+      requestAnimationFrame(() => document.getElementById(targetId)?.focus({ preventScroll: true }))
+    })
+  }
+
   const invalidateAutoGeneration = () => {
     autoGenerateGeneration.current += 1
   }
@@ -1185,6 +1507,7 @@ export default function App() {
   }
 
   const startBuiltInPresetLoad = (presetId: string) => {
+    clearLocalImportDraft()
     resetAutoGeneration()
     setTtmAnnotations({})
     const generation = ++presetImportGeneration.current
@@ -1192,6 +1515,7 @@ export default function App() {
     const controller = new AbortController()
     activePresetLoadRef.current = controller
     presetSourceRef.current = 'builtin'
+    activeQuickPresetIdRef.current = presetId
     setPresetSource('builtin')
     setSelectedPresetId(presetId)
     setPresetFileName(null)
@@ -1203,8 +1527,6 @@ export default function App() {
     setIsBootstrapLoading(true)
     setIsReadingPreset(true)
     setBootstrapError(null)
-    setPresetError(null)
-    setSelectionError(null)
     setActionError(null)
     setFixture(null)
     setPlaybackTarget(null)
@@ -1287,15 +1609,16 @@ export default function App() {
   }
 
   const selectDemoPreset = () => {
+    clearLocalImportDraft()
     resetAutoGeneration()
     setTtmAnnotations({})
     ++presetImportGeneration.current
     activePresetLoadRef.current?.abort()
     activePresetLoadRef.current = undefined
     presetSourceRef.current = 'demo'
+    activeQuickPresetIdRef.current = 'demo'
     setPresetSource('demo')
     setSelectedPresetId('demo')
-    setPresetError(null)
     setBootstrapError(null)
     setIsBootstrapLoading(false)
     setIsReadingPreset(false)
@@ -1332,43 +1655,19 @@ export default function App() {
   }
 
   const selectCustomFiles = () => {
-    resetAutoGeneration()
-    setTtmAnnotations({})
+    clearLocalImportDraft()
     ++presetImportGeneration.current
     activePresetLoadRef.current?.abort()
     activePresetLoadRef.current = undefined
-    presetSourceRef.current = 'custom'
-    setPresetSource('custom')
-    setSelectedPresetId('custom')
-    setPresetError(null)
-    setBootstrapError(null)
     setIsBootstrapLoading(false)
     setIsReadingPreset(false)
-    setIsPresetReady(false)
-    setPresetFileName(null)
-    setSourceIniText(null)
-    setEditingSample(null)
-    setIsSavingIni(false)
-    setSaveIniError(null)
-    setFixture(null)
-    setAssetResolution(undefined)
-    setOmittedZeroDurationCount(0)
-    setActionError(null)
-    setPlaybackTarget(null)
-    const customIndex = buildAssetIndex(customWavFilesRef.current)
-    assetIndexRef.current = customIndex
-    setAssetIndex(customIndex)
-    setLocalWavFiles(customWavFilesRef.current)
-    setImportMessage('Choose your own INI and WAV files below. Playback stays disabled until the INI is read.')
-    setTransportNote('Choose your own preset files to continue.')
-    transport.stop()
-    transport.resetAssets()
+    setSelectedPresetId('custom')
     setActiveSection('files')
     if (window.location.hash !== '#files-section') window.history.pushState(null, '', '#files-section')
     requestAnimationFrame(() => {
       const filesSection = document.getElementById('files-section')
       filesSection?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
-      document.getElementById('preset-file')?.focus()
+      focusLocalImportTarget(1, importFileMode, 'picker')
     })
   }
 
@@ -1449,135 +1748,298 @@ export default function App() {
     if (transportSnapshot.status === 'error') setTransportNote(transportSnapshot.error ?? 'Playback could not start.')
   }, [transportSnapshot.status, transportSnapshot.error, presentationCycleSlotKind, presentationCycleSlotIndex, presentationCycleIteration, presentationCyclePlanIndex, playbackTarget, practiceMode, cycleSlotCount])
 
-  const handlePresetChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.currentTarget.files?.[0]
-    event.currentTarget.value = ''
+  const handleLocalIniChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget
+    const file = input.files?.[0]
+    input.value = ''
     if (!file || isPlaybackLockedNow()) return
 
-    const generation = ++presetImportGeneration.current
-    resetAutoGeneration()
-    setTtmAnnotations({})
+    cancelLocalImportWork()
+    ++presetImportGeneration.current
     activePresetLoadRef.current?.abort()
     activePresetLoadRef.current = undefined
+    setIsBootstrapLoading(false)
+    setIsReadingPreset(false)
+    const generation = ++localImportGeneration.current
+    setSelectedPresetId('custom')
+    setStagedIniFile(file)
+    setStagedIniText(null)
+    setStagedPreset(null)
+    setStagedAudioFiles([])
+    setPreparedLocalImport(null)
+    setLocalImportError(null)
+    setLocalImportSelectionNote(null)
+    setImportStep(1)
+    if (!file.name.toLowerCase().endsWith('.ini')) {
+      setLocalImportError('Choose a file ending in .ini for the legacy preset.')
+      return
+    }
+    if (file.size > MAX_LOCAL_INI_BYTES) {
+      setLocalImportError('This INI is larger than 1 MiB. Choose the original preset file or a smaller copy.')
+      return
+    }
+
+    setIsPreparingLocalImport(true)
+    void file.text()
+      .then((text) => {
+        if (generation !== localImportGeneration.current) return
+        const nextPreset = parseLegacyIni(text)
+        const referenceCount = nextPreset.samples.length + nextPreset.beatFiles.length
+        if (referenceCount > MAX_LOCAL_IMPORT_REFERENCES) {
+          throw new Error('This INI has more than ' + MAX_LOCAL_IMPORT_REFERENCES + ' sample and beat references. Choose a smaller preset file.')
+        }
+        setStagedIniText(text)
+        setStagedPreset(nextPreset)
+        setLocalImportError(null)
+        setImportStep(2)
+        focusLocalImportTarget(2)
+      })
+      .catch((error: unknown) => {
+        if (generation !== localImportGeneration.current) return
+        setLocalImportError('Could not read ' + file.name + ': ' + describeError(error) + ' Choose a valid legacy INI to try again.')
+      })
+      .finally(() => {
+        if (generation === localImportGeneration.current) setIsPreparingLocalImport(false)
+      })
+  }
+
+  const handleLocalAudioSelection = (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget
+    const fileList = input.files
+    const selectedFileCount = fileList?.length ?? 0
+    if (selectedFileCount > MAX_SELECTED_AUDIO_FILE_COUNT) {
+      input.value = ''
+      if (isPlaybackLockedNow() || !stagedPreset) return
+      setStagedAudioFiles([])
+      setPreparedLocalImport(null)
+      setLocalImportError('This selection contains more than ' + MAX_SELECTED_AUDIO_FILE_COUNT.toLocaleString() + ' files. Choose a smaller folder or select WAV files instead.')
+      setLocalImportSelectionNote(null)
+      return
+    }
+    // Copy the browser-owned FileList before clearing the input so the staged files remain stable.
+    const chosenFiles = Array.from(fileList ?? [])
+    input.value = ''
+    if (isPlaybackLockedNow() || !stagedPreset) return
+    if (chosenFiles.length === 0) {
+      setStagedAudioFiles([])
+      setPreparedLocalImport(null)
+      setLocalImportSelectionNote(null)
+      setLocalImportError('No WAV files were found in that selection. Choose another folder or use the file picker.')
+      return
+    }
+    const wavFiles = chosenFiles.filter((file) => file.name.toLowerCase().endsWith('.wav'))
+    const ignoredCount = chosenFiles.length - wavFiles.length
+    setStagedAudioFiles(wavFiles)
+    setPreparedLocalImport(null)
+    setLocalImportError(wavFiles.length === 0
+      ? 'No .wav files were found in that selection. Choose another folder or use the file picker.'
+      : null)
+    setLocalImportSelectionNote(ignoredCount > 0
+      ? ignoredCount + ' non-WAV ' + (ignoredCount === 1 ? 'file was' : 'files were') + ' ignored. Only referenced WAV files are copied into session memory.'
+      : null)
+  }
+
+  const handleReviewLocalImport = () => {
+    if (isPlaybackLockedNow() || !stagedIniFile || !stagedIniText || !stagedPreset) return
+
+    cancelLocalImportWork()
+    const generation = ++localImportGeneration.current
+    const controller = new AbortController()
+    localImportController.current = controller
+    const audioIndex = buildAssetIndex(stagedAudioFiles)
+    const resolution = resolvePresetAssets(stagedPreset, audioIndex)
+    const baseChecks = referenceChecksForImport(stagedPreset, resolution)
+    const requiredMissing = baseChecks.filter((check) => check.required && check.resolution.status !== 'resolved')
+    const base: PreparedLocalImport = {
+      iniFileName: stagedIniFile.name,
+      iniText: stagedIniText,
+      preset: stagedPreset,
+      resolution,
+      snapshotResolution: resolution,
+      snapshotFiles: [],
+      selectedAudioFileCount: stagedAudioFiles.length,
+      checks: baseChecks,
+      copiedFileCount: 0,
+      copiedBytes: 0,
+      decodedFileCount: 0,
+      decodeAttemptCount: 0,
+      canLoad: false,
+      applied: false,
+      blockedMessage: null,
+    }
+    setLocalImportError(null)
+    setPreparedLocalImport(null)
+    setIsPreparingLocalImport(true)
+    setImportStep(3)
+    focusLocalImportTarget(3)
+
+    const referencedFiles = resolvedReferencedFiles(resolution)
+    const decodeFiles = [
+      ...stagedPreset.samples
+        .filter(requiredImportSample)
+        .flatMap((sample) => {
+          const asset = resolution.samplesById.get(sample.id)
+          return asset?.status === 'resolved' && asset.file ? [asset.file] : []
+        }),
+      ...resolution.beats.flatMap((asset) => asset.status === 'resolved' && asset.file ? [asset.file] : []),
+    ]
+
+    void (async () => {
+      try {
+        const snapshot = await snapshotReferencedWavFiles(referencedFiles, {
+          decodeFiles,
+          signal: controller.signal,
+        })
+        if (generation !== localImportGeneration.current) return
+        const snapshotResolution = mapPresetResolutionToSnapshots(
+          resolution,
+          snapshot.filesBySource,
+          snapshot.validationBySource,
+        )
+        const checks = referenceChecksForImport(stagedPreset, resolution, snapshot.validationBySource)
+        const requiredDecodeFailures = checks.filter((check) => check.required && check.validation?.status === 'invalid')
+        const failed = requiredDecodeFailures[0]
+        const blockedMessage = requiredMissing.length > 0
+          ? requiredDecodeFailures.length > 0
+            ? 'Resolve missing or ambiguous sample references and replace any required WAVs that failed decoding before loading this preset.'
+            : 'Resolve the missing or ambiguous WAV files for enabled, audible samples before loading this preset.'
+          : failed
+            ? (failed.resolution.selectedPath ?? failed.requested) + ': this required sample WAV could not be decoded. ' + (failed.validation?.status === 'invalid' ? failed.validation.message : '') + ' Choose a valid WAV, then review the selection again.'
+            : null
+        const prepared: PreparedLocalImport = {
+          ...base,
+          resolution,
+          snapshotResolution,
+          snapshotFiles: resolvedReferencedFiles(snapshotResolution),
+          checks,
+          copiedFileCount: snapshot.copiedFileCount,
+          copiedBytes: snapshot.copiedBytes,
+          decodedFileCount: snapshot.decodedFileCount,
+          decodeAttemptCount: snapshot.decodeAttemptCount,
+          canLoad: requiredMissing.length === 0 && requiredDecodeFailures.length === 0,
+          blockedMessage,
+        }
+        setPreparedLocalImport(prepared)
+      } catch (error) {
+        if (controller.signal.aborted || generation !== localImportGeneration.current) return
+        setPreparedLocalImport({
+          ...base,
+          checks: referenceChecksForImport(stagedPreset, resolution),
+          blockedMessage: snapshotErrorForImport(error, resolution),
+        })
+      } finally {
+        if (generation === localImportGeneration.current) {
+          setIsPreparingLocalImport(false)
+          if (localImportController.current === controller) localImportController.current = undefined
+        }
+      }
+    })()
+  }
+
+  const handleLocalImportBack = () => {
+    if (isPreparingLocalImport) cancelLocalImportWork()
+    if (importStep === 3) {
+      setPreparedLocalImport(null)
+      setLocalImportError(null)
+      setImportStep(2)
+      focusLocalImportTarget(2, importFileMode, 'picker')
+    } else if (importStep === 2) {
+      setLocalImportError(null)
+      setImportStep(1)
+      focusLocalImportTarget(1, importFileMode, 'picker')
+    }
+  }
+
+  const handleLocalImportCancel = () => {
+    clearLocalImportDraft(true)
+    focusLocalImportTarget(1, importFileMode, 'picker')
+  }
+
+  const handleStartAnotherLocalImport = () => {
+    if (isPlaybackLockedNow()) return
+    clearLocalImportDraft(true)
+    focusLocalImportTarget(1, importFileMode, 'picker')
+  }
+
+  const handleLoadLocalImport = () => {
+    const prepared = preparedLocalImport
+    if (!prepared?.canLoad || prepared.applied || isPlaybackLockedNow()) return
+
+    const nextIndex = buildAssetIndex(prepared.snapshotFiles)
+    let generated: ReturnType<typeof legacyFixtureFor> | null = null
+    let generationNote: string | null = null
+    try {
+      generated = legacyFixtureFor(prepared.preset, DEFAULT_COMBO_BEATS * LEGACY_TICKS_PER_BEAT)
+    } catch (error) {
+      const hasEligibleSample = prepared.preset.samples.some(requiredImportSample)
+      generationNote = hasEligibleSample
+        ? 'The preset loaded, but its default 8-beat combo could not be prepared: ' + describeError(error) + ' Choose a compatible combo length or adjust sample settings, then generate.'
+        : 'The preset loaded without an initial combo because it has no eligible audible samples. Adjust sample settings before generating.'
+    }
+    const firstReadyBeat = prepared.snapshotResolution.beats.findIndex((asset) => asset.status === 'resolved' && Boolean(asset.file))
+    const nextTempo = String(initialPracticeTempo(prepared.preset.bpm, customBeatSelected ? customBeatReferenceBpm : null))
+
+    resetAutoGeneration()
+    setTtmAnnotations({})
+    ++presetImportGeneration.current
+    activePresetLoadRef.current?.abort()
+    activePresetLoadRef.current = undefined
+    assetIndexRef.current = nextIndex
     presetSourceRef.current = 'custom'
+    activeQuickPresetIdRef.current = 'custom'
     setPresetSource('custom')
     setSelectedPresetId('custom')
-    setIsPresetReady(false)
     setIsBootstrapLoading(false)
-    setIsReadingPreset(true)
-    setPresetFileName(null)
-    setSourceIniText(null)
+    setIsReadingPreset(false)
+    setIsPresetReady(true)
+    setPreset(prepared.preset)
+    setPresetFileName(prepared.iniFileName)
+    setSourceIniText(prepared.iniText)
     setEditingSample(null)
     setIsSavingIni(false)
     setSaveIniError(null)
     setBootstrapError(null)
+    setAssetIndex(nextIndex)
+    setLocalWavFiles(prepared.snapshotFiles)
+    setAssetResolution(prepared.snapshotResolution)
+    setFixture(generated?.fixture ?? null)
+    setTimebase('legacy')
+    setComboBeats(DEFAULT_COMBO_BEATS)
+    setOmittedZeroDurationCount(generated?.zeroDurationCount ?? 0)
+    setBpm(nextTempo)
+    setPitchSemitones(0)
+    setSampleVolume(prepared.preset.sampleVolume)
+    setBeatVolume(prepared.preset.beatVolume)
+    setSelectedBeatIndex(firstReadyBeat >= 0 ? String(firstReadyBeat) : 'none')
+    sourceControlDefaultsRef.current = {
+      bpm: prepared.preset.bpm,
+      sampleVolume: prepared.preset.sampleVolume,
+      beatVolume: prepared.preset.beatVolume,
+    }
+    setActionError(null)
+    setPlaybackTarget(null)
     transport.resetAssets()
     transport.stop()
-    setPlaybackTarget(null)
-    setFixture(null)
-    setTimebase('legacy')
-    setOmittedZeroDurationCount(0)
-    setActionError(null)
-    setPresetError(null)
-    setSelectionError(null)
-    const customIndex = buildAssetIndex(customWavFilesRef.current)
-    assetIndexRef.current = customIndex
-    setAssetIndex(customIndex)
-    setLocalWavFiles(customWavFilesRef.current)
-    setAssetResolution(undefined)
-    setImportMessage('Reading preset locally...')
-    setTransportNote('Reading preset. Playback is stopped until import completes.')
-    void file.text()
-      .then((text) => {
-        if (generation !== presetImportGeneration.current) return
-        const nextPreset = parseLegacyIni(text)
-        const nextIndex = buildAssetIndex(customWavFilesRef.current)
-        assetIndexRef.current = nextIndex
-        const nextResolution = resolvePresetAssets(nextPreset, nextIndex)
-        setPreset(nextPreset)
-        setPresetFileName(file.name)
-        setSourceIniText(text)
-        setAssetIndex(nextIndex)
-        setAssetResolution(nextResolution)
-        setFixture(null)
-        setTimebase('legacy')
-        setComboBeats(DEFAULT_COMBO_BEATS)
-        setOmittedZeroDurationCount(0)
-        setBpm(String(initialPracticeTempo(nextPreset.bpm, customBeatSelected ? customBeatReferenceBpm : null)))
-        setPitchSemitones(0)
-        setSampleVolume(nextPreset.sampleVolume)
-        setBeatVolume(nextPreset.beatVolume)
-        setSelectedBeatIndex(nextResolution.beats[0]?.status === 'resolved' ? '0' : 'none')
-        const resolvedSamples = Array.from(nextResolution.samplesById.values()).filter((item) => item.status === 'resolved').length
-        const resolvedBeats = nextResolution.beats.filter((item) => item.status === 'resolved').length
-        setIsPresetReady(true)
-        sourceControlDefaultsRef.current = {
-          bpm: nextPreset.bpm,
-          sampleVolume: nextPreset.sampleVolume,
-          beatVolume: nextPreset.beatVolume,
-        }
-        transport.setPitchSemitones(0)
-        transport.setSampleVolume(nextPreset.sampleVolume)
-        transport.setBeatVolume(nextPreset.beatVolume)
-        setImportMessage(nextPreset.samples.length + ' sample references parsed; ' + resolvedSamples + ' samples and ' + resolvedBeats + ' beat files resolved from your selected WAVs.')
-        setTransportNote('Preset loaded. Generate a combo when ready.')
-      })
-      .catch((error: unknown) => {
-        if (generation !== presetImportGeneration.current) return
-        setPresetError('Could not read ' + file.name + ': ' + describeError(error))
-        setIsPresetReady(false)
-        setImportMessage('Preset data is not ready. Choose a valid INI file to try again.')
-      })
-      .finally(() => {
-        if (generation === presetImportGeneration.current) setIsReadingPreset(false)
-      })
-  }
-
-  const handleWavChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const input = event.currentTarget
-    const chosenFiles = Array.from(input.files ?? [])
-    input.value = ''
-    if (chosenFiles.length === 0 || isPlaybackLockedNow()) return
-
-    const wavFiles = chosenFiles.filter((file) => file.name.toLowerCase().endsWith('.wav'))
-    const ignoredCount = chosenFiles.length - wavFiles.length
-    customWavFilesRef.current = wavFiles
-    setLocalWavFiles(wavFiles)
-    setSelectionError(
-      wavFiles.length === 0
-        ? 'No .wav files were found in that selection. Choose a folder or multiple WAV files.'
-        : ignoredCount > 0
-          ? ignoredCount + ' non-WAV ' + (ignoredCount === 1 ? 'file was' : 'files were') + ' ignored.'
-          : null,
-    )
-
-    if (presetSourceRef.current === 'custom') {
-      const nextIndex = buildAssetIndex(wavFiles)
-      assetIndexRef.current = nextIndex
-      setAssetIndex(nextIndex)
-      transport.resetAssets()
-      transport.stop()
-      invalidateAutoGeneration()
-      setPlaybackTarget(null)
-      setFixture(null)
-      setOmittedZeroDurationCount(0)
-      setActionError(null)
-      if (presetFileName) {
-        const nextResolution = resolvePresetAssets(preset, nextIndex)
-        setAssetResolution(nextResolution)
-        const foundSamples = Array.from(nextResolution.samplesById.values()).filter((entry) => entry.status === 'resolved').length
-        const foundBeats = nextResolution.beats.filter((entry) => entry.status === 'resolved').length
-        if (selectedBeatIndex === 'none' && nextResolution.beats[0]?.status === 'resolved') setSelectedBeatIndex('0')
-        setImportMessage(foundSamples + ' of ' + preset.samples.length + ' sample references and ' + foundBeats + ' of ' + nextResolution.beats.length + ' beat files resolved from local WAVs.')
-      } else {
-        setImportMessage(wavFiles.length + ' custom WAV ' + (wavFiles.length === 1 ? 'file is' : 'files are') + ' staged for the selected INI.')
-      }
-    } else if (presetSourceRef.current !== 'builtin' && presetSourceRef.current !== 'loading') {
-      const nextIndex = buildAssetIndex(wavFiles)
-      assetIndexRef.current = nextIndex
-      setAssetIndex(nextIndex)
-      setImportMessage(wavFiles.length + ' custom WAV ' + (wavFiles.length === 1 ? 'file is' : 'files are') + ' held in this session. Choose a custom INI to match filenames.')
-    }
+    transport.setPitchSemitones(0)
+    transport.setSampleVolume(prepared.preset.sampleVolume)
+    transport.setBeatVolume(prepared.preset.beatVolume)
+    const resolvedSamples = Array.from(prepared.snapshotResolution.samplesById.values()).filter((item) => item.status === 'resolved').length
+    const resolvedBeats = prepared.snapshotResolution.beats.filter((item) => item.status === 'resolved').length
+    setImportMessage(prepared.preset.name + ' loaded. ' + resolvedSamples + ' sample WAVs and ' + resolvedBeats + ' preset beats are available in this session.')
+    setTransportNote(generationNote ?? (generated ? 'Preset loaded. Combo generated; ready to play.' : 'Preset loaded. Generate a combo when ready.'))
+    const appliedChecks = mappedReferenceChecks(prepared.checks, prepared.snapshotResolution)
+    setPreparedLocalImport({
+      ...prepared,
+      iniText: '',
+      resolution: prepared.snapshotResolution,
+      checks: appliedChecks,
+      applied: true,
+    })
+    setStagedIniFile(null)
+    setStagedIniText(null)
+    setStagedAudioFiles([])
+    setStagedPreset(prepared.preset)
+    if (generationNote) setActionError(generationNote)
   }
 
   const handleBuiltInPresetChange = (presetId: string) => {
@@ -2134,6 +2596,12 @@ export default function App() {
   const comboLengthTicks = comboBeats * LEGACY_TICKS_PER_BEAT
   const activeBuiltInEntry = builtInCatalog?.presets.find((entry) => entry.id === selectedPresetId)
   const activeWavCount = presetSource === 'builtin' ? assetIndex.files.length : localWavFiles.length
+  const currentPresetName = !isPresetReady
+    ? presetSource === 'loading' ? 'Loading built-in preset' : 'No ready preset'
+    : preset.name || activeBuiltInEntry?.label || 'Current preset'
+  const visibleStagedIniName = stagedIniFile?.name ?? preparedLocalImport?.iniFileName ?? null
+  const visibleStagedPresetName = stagedPreset?.name ?? preparedLocalImport?.preset.name ?? null
+  const visibleStagedAudioCount = stagedAudioFiles.length || preparedLocalImport?.selectedAudioFileCount || 0
   const sessionControlsDisabled = !isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy
   const resetControlsDisabled = sessionControlsDisabled
 
@@ -2326,20 +2794,30 @@ export default function App() {
         </div>
 
         <div id="panel-files" role="tabpanel" aria-labelledby="tab-files" tabIndex={0} hidden={activeSection !== 'files'}>
-        <LocalImportPanel
+        <ImportWizard
+          step={importStep}
+          fileMode={importFileMode}
+          stagedIniFileName={visibleStagedIniName}
+          stagedPresetName={visibleStagedPresetName}
+          stagedAudioCount={visibleStagedAudioCount}
+          currentPresetName={currentPresetName}
+          currentAudioCount={activeWavCount}
+          busy={isPreparingLocalImport}
+          wizardError={localImportError}
+          selectionNote={localImportSelectionNote}
+          prepared={preparedLocalImport}
           locked={isPlaybackLocked}
-          presetFileName={presetFileName}
-          localFileCount={activeWavCount}
-          importMessage={importMessage}
-          presetError={presetError}
-          selectionError={selectionError}
-          presetSource={presetSource}
           isBootstrapLoading={isBootstrapLoading}
           bootstrapError={bootstrapError}
           onRetryBuiltIn={handleRetryBuiltIn}
-          onPresetChange={handlePresetChange}
-          onFolderChange={handleWavChange}
-          onFilesChange={handleWavChange}
+          onIniChange={handleLocalIniChange}
+          onAudioChange={handleLocalAudioSelection}
+          onFileModeChange={(mode) => { setImportFileMode(mode); focusLocalImportTarget(2, mode, 'picker') }}
+          onBack={handleLocalImportBack}
+          onCancel={handleLocalImportCancel}
+          onReviewEmptySelection={handleReviewLocalImport}
+          onLoad={handleLoadLocalImport}
+          onStartAnother={handleStartAnotherLocalImport}
         />
         {assetResolution && <DiagnosticList diagnostics={diagnostics} />}
         </div>

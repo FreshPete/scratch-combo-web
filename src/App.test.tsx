@@ -61,6 +61,27 @@ const audioHarness = vi.hoisted(() => {
   const stop = vi.fn(() => { tempoAvailable = false; emit({ status: 'idle', progress: 0 }) })
   const resetAssets = vi.fn(() => { tempoAvailable = false; emit({ status: 'idle', progress: 0 }) })
   const dispose = vi.fn(() => { tempoAvailable = false; emit({ status: 'disposed', progress: 0 }) })
+  const snapshotReferencedWavFiles = vi.fn(async (
+    files: readonly File[],
+    options?: { decodeFiles?: readonly File[] },
+  ) => {
+    const uniqueFiles = [...new Set(files)]
+    const decodeFiles = new Set(options?.decodeFiles ?? [])
+    const filesBySource = new Map(uniqueFiles.map((file) => [file, new File([file], file.name, { type: file.type, lastModified: file.lastModified })]))
+    const validationBySource = new Map(uniqueFiles.map((file) => [file, decodeFiles.has(file)
+      ? { status: 'valid' as const, durationSeconds: 0.1, sampleRate: 44100, channelCount: 1, decodedChannelSamples: Math.max(1, file.size) }
+      : { status: 'not-requested' as const }]))
+    return {
+      filesBySource,
+      validationBySource,
+      copiedFileCount: uniqueFiles.length,
+      copiedBytes: uniqueFiles.reduce((total, file) => total + file.size, 0),
+      decodeAttemptCount: decodeFiles.size,
+      decodedFileCount: decodeFiles.size,
+      decodedChannelSamples: decodeFiles.size,
+      decodedDurationSeconds: decodeFiles.size * 0.1,
+    }
+  })
   const reset = () => {
     snapshot = { status: 'idle', progress: 0 }
     tempoAvailable = false
@@ -74,11 +95,30 @@ const audioHarness = vi.hoisted(() => {
     stop.mockClear()
     resetAssets.mockClear()
     dispose.mockClear()
+    snapshotReferencedWavFiles.mockReset()
+    snapshotReferencedWavFiles.mockImplementation(async (files, options) => {
+      const uniqueFiles = [...new Set(files)]
+      const decodeFiles = new Set(options?.decodeFiles ?? [])
+      const filesBySource = new Map(uniqueFiles.map((file) => [file, new File([file], file.name, { type: file.type, lastModified: file.lastModified })]))
+      const validationBySource = new Map(uniqueFiles.map((file) => [file, decodeFiles.has(file)
+        ? { status: 'valid' as const, durationSeconds: 0.1, sampleRate: 44100, channelCount: 1, decodedChannelSamples: Math.max(1, file.size) }
+        : { status: 'not-requested' as const }]))
+      return {
+        filesBySource,
+        validationBySource,
+        copiedFileCount: uniqueFiles.length,
+        copiedBytes: uniqueFiles.reduce((total, file) => total + file.size, 0),
+        decodeAttemptCount: decodeFiles.size,
+        decodedFileCount: decodeFiles.size,
+        decodedChannelSamples: decodeFiles.size,
+        decodedDurationSeconds: decodeFiles.size * 0.1,
+      }
+    })
   }
   return {
     listeners, subscribe, getSnapshot, getProgress, play, playCyclePlan,
     setTempo, setPitchSemitones, setSampleVolume, setBeatVolume,
-    stop, resetAssets, dispose, emit, reset,
+    stop, resetAssets, dispose, snapshotReferencedWavFiles, emit, reset,
   }
 })
 
@@ -98,6 +138,7 @@ const waveformHarness = vi.hoisted(() => ({
 
 vi.mock('./audio', () => ({
   analyzeLocalAudioFile: bpmHarness.analyzeLocalAudioFile,
+  snapshotReferencedWavFiles: audioHarness.snapshotReferencedWavFiles,
   AudioTransport: class {
     subscribe = audioHarness.subscribe
     getSnapshot = audioHarness.getSnapshot
@@ -154,7 +195,7 @@ function samplePreset(configName: string, sampleName: string, fileName: string):
     'SamplePlayFq=1',
     'SampleIsSilent=False',
     'SampleRepeatsPoss=True',
-    'SampleRepeatMax=2',
+    'SampleRepeatMax=512',
     'SampleFileName=' + fileName,
     'SampleDisplayName=' + sampleName,
     'SampleStartsForward=True',
@@ -167,6 +208,31 @@ function samplePreset(configName: string, sampleName: string, fileName: string):
 function chooseFiles(input: HTMLInputElement, files: File[]) {
   Object.defineProperty(input, 'files', { configurable: true, value: files })
   fireEvent.change(input)
+}
+
+async function stageLocalImport(
+  iniFile: File,
+  audioFiles: File[] = [],
+  options: { load?: boolean; fileMode?: 'folder' | 'files' } = {},
+) {
+  selectWorkspaceTab('Files')
+  chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [iniFile])
+  await screen.findByRole('heading', { name: 'Choose the audio files' })
+
+  if (options.fileMode === 'files') fireEvent.click(screen.getByRole('button', { name: 'Choose files instead' }))
+  if (audioFiles.length > 0) {
+    chooseFiles(screen.getByLabelText(options.fileMode === 'files' ? 'Choose WAV files' : 'Choose audio folder') as HTMLInputElement, audioFiles)
+  }
+  fireEvent.click(screen.getByRole('button', { name: 'Review selection' }))
+  await screen.findByRole('heading', { name: 'Review and load' })
+  await waitFor(() => expect(document.querySelector('.import-wizard')).toHaveAttribute('aria-busy', 'false'))
+
+  if (options.load !== false) {
+    const load = screen.getByRole('button', { name: 'Load preset' })
+    await waitFor(() => expect(load).toBeEnabled())
+    fireEvent.click(load)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Preset loaded' })).toBeDisabled())
+  }
 }
 
 function fileWithPath(fileName: string, relativePath: string) {
@@ -460,16 +526,20 @@ describe('workspace import and transport lifecycle', () => {
 
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
-    chooseFiles(screen.getByLabelText('Choose WAV files') as HTMLInputElement, [file])
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [
+    await stageLocalImport(
       new File([samplePreset('Local preset', 'Local kick', 'kick.wav')], 'local.ini', { type: 'text/plain' }),
-    ])
-    await screen.findByText('Local kick')
+      [file],
+    )
+    selectWorkspaceTab('Practice')
+    await screen.findAllByText('Local kick')
     await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
 
     await waitFor(() => expect(document.querySelectorAll('.sequence-event').length).toBeGreaterThan(0))
-    expect(waveformHarness.loadWaveform).toHaveBeenCalledWith(file)
+    const retainedWav = waveformHarness.loadWaveform.mock.calls.at(-1)?.[0]
+    expect(retainedWav).toBeInstanceOf(File)
+    expect(retainedWav).not.toBe(file)
+    expect(retainedWav?.name).toBe(file.name)
     expect(document.querySelector('.sequence-event--waveform')).not.toBeInTheDocument()
     expect(document.querySelector('.sequence-event--silent')).toBeInTheDocument()
     expect(audioHarness.play).not.toHaveBeenCalled()
@@ -569,8 +639,10 @@ describe('workspace import and transport lifecycle', () => {
 
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
-    selectWorkspaceTab('Files')
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'unknown-ttm.ini', { type: 'text/plain' })])
+    await stageLocalImport(
+      new File([ini], 'unknown-ttm.ini', { type: 'text/plain' }),
+      [new File(['mystery audio'], 'mystery.wav', { type: 'audio/wav' })],
+    )
     selectWorkspaceTab('Practice')
     await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
@@ -690,8 +762,8 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByLabelText('Quick preset')).toBeDisabled()
     selectWorkspaceTab('Files')
     expect(screen.getByLabelText('Choose INI preset')).toBeDisabled()
-    expect(screen.getByLabelText('Choose audio folder')).toBeDisabled()
-    expect(screen.getByLabelText('Choose WAV files')).toBeDisabled()
+    expect(screen.queryByLabelText('Choose audio folder')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Choose WAV files')).not.toBeInTheDocument()
     selectWorkspaceTab('Samples')
     expect(screen.getByLabelText('Enable Bundled kick for next combo')).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Preview Bundled kick' })).toBeDisabled()
@@ -760,15 +832,15 @@ describe('workspace import and transport lifecycle', () => {
     const secondSample = [
       '', '[Sample02]', 'SamplePlayFq=1', 'SampleIsSilent=False', 'SampleRepeatsPoss=True', 'SampleRepeatMax=512',
       'SampleFileName=missing.wav', 'SampleDisplayName=Missing row', 'SampleStartsForward=True', 'SampleEndsForward=False',
-      'Sample16ths=8', 'UseSample=True',
+      'Sample16ths=8', 'UseSample=False',
     ].join('\n')
     const ini = samplePreset('Local preset', 'Available kick', 'kick.wav').replace('SampleRepeatMax=2', 'SampleRepeatMax=512') + '\n' + secondSample
 
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
-    chooseFiles(screen.getByLabelText('Choose WAV files') as HTMLInputElement, [availableFile])
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'local.ini', { type: 'text/plain' })])
-    await screen.findByText('Missing row')
+    await stageLocalImport(new File([ini], 'local.ini', { type: 'text/plain' }), [availableFile])
+    await screen.findAllByText('Missing row')
+    selectWorkspaceTab('Practice')
     await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
     fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
@@ -778,6 +850,7 @@ describe('workspace import and transport lifecycle', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+    fireEvent.click(screen.getByLabelText('Enable Missing row for next combo'))
     fireEvent.click(screen.getByRole('checkbox', { name: /Auto-generate/ }))
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
     expect(document.querySelector('.auto-generation-help')).toHaveTextContent('Missing row')
@@ -792,7 +865,8 @@ describe('workspace import and transport lifecycle', () => {
 
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'silent-only.ini', { type: 'text/plain' })])
+    await stageLocalImport(new File([ini], 'silent-only.ini', { type: 'text/plain' }))
+    selectWorkspaceTab('Practice')
     await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
     await screen.findByRole('img', { name: 'Sequence timeline: 128 legacy ticks, 8 events' })
@@ -847,16 +921,17 @@ describe('workspace import and transport lifecycle', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
     await waitFor(() => expect(waveformHarness.loadWaveform).toHaveBeenCalledWith(originalFile))
 
-    chooseFiles(screen.getByLabelText('Choose WAV files') as HTMLInputElement, [replacementFile])
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [
+    await stageLocalImport(
       new File([samplePreset('Replacement preset', 'Replacement kick', 'replacement.wav').replace('SampleRepeatMax=2', 'SampleRepeatMax=512')], 'replacement.ini', { type: 'text/plain' }),
-    ])
-    await screen.findByText('Replacement kick')
+      [replacementFile],
+    )
+    await screen.findAllByText('Replacement kick')
+    selectWorkspaceTab('Practice')
     await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     waveformHarness.loadWaveform.mockClear()
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
 
-    await waitFor(() => expect(waveformHarness.loadWaveform).toHaveBeenCalledWith(replacementFile))
+    await waitFor(() => expect(waveformHarness.loadWaveform.mock.calls.at(-1)?.[0]?.name).toBe(replacementFile.name))
     await waitFor(() => expect(document.querySelector('.sequence-event--waveform path')).toHaveAttribute('d', replacementWaveform.path))
     await act(async () => { resolveOriginal(originalWaveform); await originalDecode })
 
@@ -867,66 +942,181 @@ describe('workspace import and transport lifecycle', () => {
 
   it('keeps the latest INI when an older file read finishes last', async () => {
     render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Files')
     const input = screen.getByLabelText('Choose INI preset') as HTMLInputElement
     const older = delayedIniFile('older.ini')
     const newer = delayedIniFile('newer.ini')
 
     chooseFiles(input, [older.file])
-    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+    expect(screen.getAllByText('Bundled kick').length).toBeGreaterThan(0)
     chooseFiles(input, [newer.file])
 
     await act(async () => {
       newer.resolve(samplePreset('Current preset', 'Current sample', 'current.wav'))
       await Promise.resolve()
     })
-    await screen.findAllByText('Current sample')
+    await screen.findByRole('heading', { name: 'Choose the audio files' })
 
     await act(async () => {
       older.resolve(samplePreset('Stale preset', 'Stale sample', 'stale.wav'))
       await Promise.resolve()
     })
-    expect(screen.getAllByText('Current sample')).toHaveLength(1)
-    expect(screen.queryByText('Stale sample')).not.toBeInTheDocument()
+    expect(screen.getByText('Current preset is staged. Choose the folder that contains its WAV files.')).toBeInTheDocument()
+    expect(screen.queryByText(/Stale preset is staged/)).not.toBeInTheDocument()
+    expect(screen.getAllByText('Bundled kick').length).toBeGreaterThan(0)
+    selectWorkspaceTab('Practice')
     expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    selectWorkspaceTab('Files')
+    chooseFiles(screen.getByLabelText('Choose audio folder') as HTMLInputElement, [new File(['current'], 'current.wav', { type: 'audio/wav' })])
+    fireEvent.click(screen.getByRole('button', { name: 'Review selection' }))
+    await screen.findByRole('heading', { name: 'Review and load' })
+    await waitFor(() => expect(document.querySelector('.import-wizard')).toHaveAttribute('aria-busy', 'false'))
+    fireEvent.click(screen.getByRole('button', { name: 'Load preset' }))
+    await screen.findAllByText('Current sample')
+    expect(screen.queryByText('Stale sample')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
   })
 
-  it('resolves against WAV files selected while an INI read is pending', async () => {
-    render(<App />)
-    selectWorkspaceTab('Practice')
-    const ini = delayedIniFile('local.ini')
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [ini.file])
-    const wav = new File(['local audio'], 'kick.wav', { type: 'audio/wav' })
-    chooseFiles(screen.getByLabelText('Choose WAV files') as HTMLInputElement, [wav])
-
-    await act(async () => {
-      ini.resolve(samplePreset('Local preset', 'Local kick', 'kick.wav'))
-      await Promise.resolve()
+  it('cancels a pending WAV snapshot and ignores its late result without replacing the active preset', async () => {
+    let resolveSnapshot: (value: Awaited<ReturnType<typeof audioHarness.snapshotReferencedWavFiles>>) => void = () => undefined
+    const pendingSnapshot = new Promise<Awaited<ReturnType<typeof audioHarness.snapshotReferencedWavFiles>>>((resolve) => {
+      resolveSnapshot = resolve
     })
+    audioHarness.snapshotReferencedWavFiles.mockImplementationOnce(() => pendingSnapshot)
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Files')
+    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [
+      new File([samplePreset('Cancelled candidate', 'Cancel kick', 'cancel.wav')], 'cancel.ini', { type: 'text/plain' }),
+    ])
+    await screen.findByRole('heading', { name: 'Choose the audio files' })
+    const sourceWav = new File(['candidate audio'], 'cancel.wav', { type: 'audio/wav' })
+    chooseFiles(screen.getByLabelText('Choose audio folder') as HTMLInputElement, [sourceWav])
+    fireEvent.click(screen.getByRole('button', { name: 'Review selection' }))
+    await screen.findByRole('heading', { name: 'Review and load' })
+    await waitFor(() => expect(document.querySelector('.import-wizard')).toHaveAttribute('aria-busy', 'true'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await screen.findByRole('heading', { name: 'Choose your INI preset' })
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Choose INI preset')))
+    expect(screen.getByLabelText('Current session files')).toHaveTextContent('85 BPM - Beginner')
+
+    const snapshotWav = new File([sourceWav], sourceWav.name, { type: sourceWav.type })
+    await act(async () => {
+      resolveSnapshot({
+        filesBySource: new Map([[sourceWav, snapshotWav]]),
+        validationBySource: new Map([[sourceWav, {
+          status: 'valid', durationSeconds: 0.1, sampleRate: 44100, channelCount: 1, decodedChannelSamples: 1,
+        }]]),
+        copiedFileCount: 1,
+        copiedBytes: sourceWav.size,
+        decodeAttemptCount: 1,
+        decodedFileCount: 1,
+        decodedChannelSamples: 1,
+        decodedDurationSeconds: 0.1,
+      })
+      await pendingSnapshot
+    })
+
+    expect(screen.getByRole('heading', { name: 'Choose your INI preset' })).toBeInTheDocument()
+    expect(screen.queryByText('Cancelled candidate')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Current session files')).toHaveTextContent('85 BPM - Beginner')
+    selectWorkspaceTab('Practice')
+    expect(screen.getByLabelText('Quick preset')).toHaveValue('SSC-085BPM-01')
+  })
+
+  it('resolves folder paths, keeps byte snapshots, and previews the copied WAV', async () => {
+    render(<App />)
+    const wav = fileWithPath('kick.wav', 'sounds/kick.wav')
+    await stageLocalImport(
+      new File([samplePreset('Local preset', 'Local kick', 'kick.wav')], 'local.ini', { type: 'text/plain' }),
+      [wav],
+    )
+    expect(screen.getAllByText('sounds/kick.wav').length).toBeGreaterThan(0)
 
     selectWorkspaceTab('Samples')
     const preview = await screen.findByRole('button', { name: 'Preview Local kick' })
     fireEvent.click(preview)
     await waitFor(() => expect(audioHarness.play).toHaveBeenCalledTimes(1))
     const options = audioHarness.play.mock.calls[0]?.[0] as { assets: ReadonlyMap<string, File> }
-    expect(options.assets.get('Sample01')).toBe(wav)
+    const retainedWav = options.assets.get('Sample01')
+    expect(retainedWav).toBeInstanceOf(File)
+    expect(retainedWav).not.toBe(wav)
+    expect(retainedWav?.name).toBe('kick.wav')
   })
 
-  it('gates build, sequence play, and sample preview while reading an INI', async () => {
+  it('loads a valid snapshotted preset when only a shorter combo length can generate, then plays that combo', async () => {
+    const sourceWav = new File(['compatible audio'], 'compatible.wav', { type: 'audio/wav' })
+    const ini = samplePreset('Compatible length preset', 'Compatible hit', 'compatible.wav')
+      .replace('SampleRepeatMax=512', 'SampleRepeatMax=1')
+      .replace('Sample16ths=8', 'Sample16ths=64')
+      .replace('SampleEndsForward=False', 'SampleEndsForward=True')
+
     render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    vi.mocked(domain.generateLegacyCombo).mockImplementation((_preset, requestedRawTicks) => requestedRawTicks === 128
+      ? {
+        events: [], requestedRawTicks, completedRawTicks: 0, remainingRawTicks: requestedRawTicks,
+        terminalReason: 'selection-exhausted', restarts: 16,
+      }
+      : {
+        events: [{
+          eventNumber: 1, sampleNumber: 1, sampleId: 'Sample01', startTick: 0, durationTicks: 64,
+          startForward: true, endForward: true, silent: false,
+        }],
+        requestedRawTicks, completedRawTicks: 64, remainingRawTicks: 0,
+        terminalReason: 'length-budget-complete', restarts: 0,
+      })
+    await stageLocalImport(new File([ini], 'compatible.ini', { type: 'text/plain' }), [sourceWav])
+    expect(screen.getByRole('button', { name: 'Preset loaded' })).toBeDisabled()
+    expect(audioHarness.play).not.toHaveBeenCalled()
+    expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
+
+    selectWorkspaceTab('Practice')
+    expect(screen.getByRole('alert')).toHaveTextContent(/default 8-beat combo could not be prepared/i)
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Combo length'), { target: { value: '4' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+    await screen.findByRole('img', { name: 'Sequence timeline: 64 legacy ticks, 1 events' })
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+    const options = audioHarness.playCyclePlan.mock.calls[0]?.[0] as { assets: ReadonlyMap<string, File> }
+    const snapshottedWav = options.assets.get('Sample01')
+    expect(snapshottedWav).toBeInstanceOf(File)
+    expect(snapshottedWav).not.toBe(sourceWav)
+    expect(snapshottedWav?.name).toBe(sourceWav.name)
+  })
+
+  it('keeps the current preset usable while a candidate INI is being read', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Files')
     const pending = delayedIniFile('pending.ini')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [pending.file])
 
-    expect(screen.getByRole('button', { name: 'Build preview' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
-    expect(screen.queryByRole('button', { name: 'Preview Tone' })).not.toBeInTheDocument()
+    selectWorkspaceTab('Practice')
+    expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+    expect(screen.getAllByText('Bundled kick').length).toBeGreaterThan(0)
 
+    selectWorkspaceTab('Files')
     await act(async () => {
       pending.resolve(samplePreset('Ready preset', 'Ready sample', 'ready.wav'))
       await Promise.resolve()
     })
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
-    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    await screen.findByRole('heading', { name: 'Choose the audio files' })
+    selectWorkspaceTab('Practice')
+    expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+    expect(screen.getAllByText('Bundled kick').length).toBeGreaterThan(0)
+    selectWorkspaceTab('Files')
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.getByLabelText('Quick preset')).toHaveValue('SSC-085BPM-01')
   })
 
   it('keeps the transport usable when a page is restored from the back-forward cache', async () => {
@@ -972,17 +1162,16 @@ describe('workspace import and transport lifecycle', () => {
     await waitFor(() => expect(presetHarness.loadBuiltInPreset).toHaveBeenCalledTimes(1))
 
     const custom = new File([samplePreset('Custom choice', 'Custom row', 'custom.wav')], 'custom.ini', { type: 'text/plain' })
-    selectWorkspaceTab('Files')
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [custom])
-    await screen.findByText('Custom row')
+    await stageLocalImport(custom, [new File(['custom audio'], 'custom.wav', { type: 'audio/wav' })])
+    await screen.findAllByText('Custom row')
 
     await act(async () => {
       resolveBuiltIn(presetHarness.loaded)
       await Promise.resolve()
     })
-    expect(screen.getByText(/Custom choice/)).toBeInTheDocument()
-    expect(screen.getByText('Custom row')).toBeInTheDocument()
-    expect(screen.queryByText('Bundled kick')).not.toBeInTheDocument()
+    expect(screen.getAllByText(/Custom choice/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Custom row').length).toBeGreaterThan(0)
+    expect(screen.getByLabelText('Current session files')).toHaveTextContent('Custom choice')
     selectWorkspaceTab('Practice')
     expect(screen.getByLabelText('Quick preset')).toHaveValue('custom')
   })
@@ -1153,7 +1342,7 @@ describe('workspace import and transport lifecycle', () => {
       expect(savedText).toContain('VOL_S=55')
       expect(savedText).toContain('VOL_B=40')
       expect(savedText).not.toContain('BPM01=100')
-      await waitFor(() => expect(within(document.querySelector('.import-status') as HTMLElement).getByText(/Working preset copy saved as SSC-085BPM-01-edited\.ini/)).toBeInTheDocument())
+      await waitFor(() => expect(document.querySelector('.visually-hidden[aria-live="polite"]')).toHaveTextContent(/Working preset copy saved as SSC-085BPM-01-edited\.ini/))
       selectWorkspaceTab('Session')
       fireEvent.click(screen.getByRole('button', { name: 'Reset controls' }))
       expect(screen.getByLabelText('Sample level')).toHaveValue('80')
@@ -1188,7 +1377,7 @@ describe('workspace import and transport lifecycle', () => {
 
       expect(write).toHaveBeenCalledOnce()
       expect(abort).not.toHaveBeenCalled()
-      expect(within(document.querySelector('.import-status') as HTMLElement).getByText(/85 BPM - Average ready/)).toBeInTheDocument()
+      expect(document.querySelector('.visually-hidden[aria-live="polite"]')).toHaveTextContent(/85 BPM - Average ready/)
       expect(screen.queryByText(/Working preset copy saved as SSC-085BPM-01-edited\.ini/)).not.toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Save Sample Data' })).toBeEnabled()
     } finally {
@@ -1198,9 +1387,11 @@ describe('workspace import and transport lifecycle', () => {
 
   it('allows unchanged legacy values above the web edit cap but rejects changed out-of-range values', async () => {
     render(<App />)
-    selectWorkspaceTab('Files')
     const ini = samplePreset('Long legacy field', 'Long kick', 'kick.wav').replace('Sample16ths=8', 'Sample16ths=513')
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'long.ini', { type: 'text/plain' })])
+    await stageLocalImport(
+      new File([ini], 'long.ini', { type: 'text/plain' }),
+      [new File(['kick'], 'kick.wav', { type: 'audio/wav' })],
+    )
     selectWorkspaceTab('Samples')
     await screen.findByRole('button', { name: 'Edit Long kick' })
 
@@ -1240,7 +1431,8 @@ describe('workspace import and transport lifecycle', () => {
       .replace('SampleRepeatMax=2', 'SampleRepeatMax=512')
       .replace('Sample16ths=8', 'Sample16ths=16')
       .replace('UseSample=True', 'UseSample=False')
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'ticks.ini', { type: 'text/plain' })])
+    await stageLocalImport(new File([ini], 'ticks.ini', { type: 'text/plain' }))
+    selectWorkspaceTab('Practice')
     await screen.findByRole('button', { name: 'Generate combo' })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
 
@@ -1265,7 +1457,8 @@ describe('workspace import and transport lifecycle', () => {
       .replace('SampleRepeatMax=2', 'SampleRepeatMax=512')
       .replace('Sample16ths=8', 'Sample16ths=16')
       .replace('UseSample=True', 'UseSample=False')
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'qa.ini', { type: 'text/plain' })])
+    await stageLocalImport(new File([ini], 'qa.ini', { type: 'text/plain' }))
+    selectWorkspaceTab('Practice')
     await screen.findByRole('button', { name: 'Generate combo' })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     fireEvent.change(screen.getByLabelText('Combo length'), { target: { value: '4' } })
@@ -1318,7 +1511,7 @@ describe('workspace import and transport lifecycle', () => {
     const ini = samplePreset('Silent tick fixture', 'Silent pad', 'silent.wav')
       .replace('SampleIsSilent=False', 'SampleIsSilent=True')
       .replace('UseSample=True', 'UseSample=False')
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'silent.ini', { type: 'text/plain' })])
+    await stageLocalImport(new File([ini], 'silent.ini', { type: 'text/plain' }))
     selectWorkspaceTab('Samples')
 
     const silentToggle = await screen.findByRole('checkbox', { name: 'Enable Silent pad for next combo' })
@@ -1327,20 +1520,18 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByText('Always included')).toBeInTheDocument()
   })
 
-  it('allows generation without WAVs but blocks playback when the chosen event is unresolved', async () => {
+  it('blocks loading a preset when an enabled audible sample WAV is missing', async () => {
     render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
     const ini = samplePreset('Unresolved tick fixture', 'Unresolved kick', 'kick.wav')
       .replace('SampleRepeatMax=2', 'SampleRepeatMax=512')
       .replace('Sample16ths=8', 'Sample16ths=16')
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'unresolved.ini', { type: 'text/plain' })])
-    await screen.findByRole('button', { name: 'Generate combo' })
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
-    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+    await stageLocalImport(new File([ini], 'unresolved.ini', { type: 'text/plain' }), [], { load: false })
 
-    await screen.findByRole('img', { name: 'Sequence timeline: 128 legacy ticks, 8 events' })
-    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('WAV files that are not ready: Unresolved kick')
+    expect(screen.getByRole('button', { name: 'Load preset' })).toBeDisabled()
+    expect(screen.getByText('Required WAV missing')).toBeInTheDocument()
+    expect(screen.getAllByText('kick.wav').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Bundled kick').length).toBeGreaterThan(0)
     expect(audioHarness.play).not.toHaveBeenCalled()
     expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
   })
@@ -1351,7 +1542,10 @@ describe('workspace import and transport lifecycle', () => {
     const ini = samplePreset('Toggle tick fixture', 'Kick', 'kick.wav')
       .replace('SampleRepeatMax=2', 'SampleRepeatMax=512')
       .replace('Sample16ths=8', 'Sample16ths=16')
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'toggle.ini', { type: 'text/plain' })])
+    await stageLocalImport(
+      new File([ini], 'toggle.ini', { type: 'text/plain' }),
+      [new File(['kick'], 'kick.wav', { type: 'audio/wav' })],
+    )
     selectWorkspaceTab('Practice')
     await screen.findByRole('button', { name: 'Generate combo' })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
@@ -1367,7 +1561,7 @@ describe('workspace import and transport lifecycle', () => {
   })
 
   it('omits zero-duration native picks only from the playable fixture and resolves only later audio picks', async () => {
-    vi.mocked(domain.generateLegacyCombo).mockReturnValueOnce({
+    vi.mocked(domain.generateLegacyCombo).mockReturnValue({
       events: [
         { eventNumber: 1, sampleNumber: 1, sampleId: 'Sample01', startTick: 0, durationTicks: 0, startForward: true, endForward: true, silent: false },
         { eventNumber: 2, sampleNumber: 2, sampleId: 'Sample02', startTick: 0, durationTicks: 16, startForward: true, endForward: false, silent: false },
@@ -1388,10 +1582,9 @@ describe('workspace import and transport lifecycle', () => {
       'Sample16ths=16', 'UseSample=True',
     ].join('\n')
     render(<App />)
-    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'zero-duration.ini', { type: 'text/plain' })])
-    await screen.findByRole('button', { name: 'Generate combo' })
     const positiveWav = new File(['local audio'], 'positive.wav', { type: 'audio/wav' })
-    chooseFiles(screen.getByLabelText('Choose WAV files') as HTMLInputElement, [positiveWav])
+    await stageLocalImport(new File([ini], 'zero-duration.ini', { type: 'text/plain' }), [positiveWav])
+    selectWorkspaceTab('Practice')
     fireEvent.change(screen.getByLabelText('Combo length'), { target: { value: '4' } })
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
 
@@ -1411,7 +1604,9 @@ describe('workspace import and transport lifecycle', () => {
       expect.objectContaining({ sampleId: 'Sample02', durationUnits: 16 }),
       expect.objectContaining({ sampleId: '__rest__', durationUnits: 48 }),
     ])
-    expect(playOptions.assets.get('Sample02')).toBe(positiveWav)
+    expect(playOptions.assets.get('Sample02')).toBeInstanceOf(File)
+    expect(playOptions.assets.get('Sample02')).not.toBe(positiveWav)
+    expect(playOptions.assets.get('Sample02')?.name).toBe(positiveWav.name)
     expect(playOptions.assets.has('Sample01')).toBe(false)
     expect(playOptions.unitsPerBeat).toBe(16)
   })
@@ -1505,7 +1700,7 @@ describe('workspace import and transport lifecycle', () => {
 
     selectWorkspaceTab('Practice')
     fireEvent.change(screen.getByLabelText('Quick preset'), { target: { value: 'SSC-096BPM2-01' } })
-    await screen.findByText(/96 BPM Set 2 ready/, { selector: 'p' })
+    await waitFor(() => expect(document.querySelector('.visually-hidden[aria-live="polite"]')).toHaveTextContent(/96 BPM Set 2 ready/))
     selectWorkspaceTab('Session')
     expect(screen.getByRole('radio', { name: 'Custom' })).toBeChecked()
     expect(screen.getByLabelText('Beat bed')).toHaveValue('0')

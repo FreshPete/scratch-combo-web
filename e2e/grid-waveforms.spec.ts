@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
+import { stageLocalImport } from './helpers/import-wizard'
 
 declare global {
   interface Window {
@@ -108,24 +109,37 @@ async function installWaveformDecoderControls(page: Page): Promise<void> {
 
 async function importCustomFixture(
   page: Page,
-  options: { name?: string; fileName?: string; silent?: boolean; wav?: Buffer; includeBeat?: boolean } = {},
+  options: {
+    name?: string
+    fileName?: string
+    silent?: boolean
+    wav?: Buffer
+    includeBeat?: boolean
+    failWaveformDecodeOnLoad?: boolean
+    blockWaveformDecodeOnLoad?: boolean
+  } = {},
   navigate = true,
 ): Promise<void> {
   if (navigate) {
     await page.goto('/')
     await expect(page.getByRole('heading', { name: 'Generated combo' })).toBeVisible({ timeout: 30_000 })
   }
-  await page.getByRole('tab', { name: 'Files', exact: true }).click()
   const files = []
   if (options.wav) files.push({ name: options.fileName ?? 'waveform-sample.wav', buffer: options.wav, mimeType: 'audio/wav' })
   if (options.includeBeat !== false) files.push({ name: 'waveform-beat.wav', buffer: makeWav('sine', 0.3), mimeType: 'audio/wav' })
-  if (files.length > 0) await page.getByLabel('Choose WAV files').setInputFiles(files)
-  await page.getByLabel('Choose INI preset').setInputFiles({
+  await stageLocalImport(page, {
     name: 'focused-waveform.ini',
     buffer: Buffer.from(makeIni(options)),
     mimeType: 'text/plain',
-  })
-  await expect(page.locator('.import-status__copy p')).toContainText('sample references parsed')
+  }, files)
+  if (options.failWaveformDecodeOnLoad || options.blockWaveformDecodeOnLoad) {
+    await page.evaluate((behavior) => {
+      if (behavior.fail) window.__waveformQa!.failNext = true
+      if (behavior.block) window.__waveformQa!.blockNext = true
+    }, { fail: Boolean(options.failWaveformDecodeOnLoad), block: Boolean(options.blockWaveformDecodeOnLoad) })
+  }
+  await expect(page.getByRole('button', { name: 'Load preset' })).toBeEnabled()
+  await page.getByRole('button', { name: 'Load preset' }).click()
   await page.getByRole('tab', { name: 'Practice', exact: true }).click()
   await page.getByLabel('Combo length').selectOption('4')
 }
@@ -216,22 +230,19 @@ test('real WAV peaks sit inside their event slot and the timeline grid stays ali
   }
 })
 
-test('silent, missing, and decoder-failed audio keep events visible without invented peaks', async ({ page }) => {
+test('silent and decoder-failed audio keep events visible without invented peaks', async ({ page }) => {
   await installWaveformDecoderControls(page)
   await loadCustomFixture(page, { name: 'Silent row', fileName: 'silent-row.wav', silent: true, includeBeat: false })
   await expect(page.locator('.sequence-event--silent')).toHaveCount(8)
   await expect(page.locator('.sequence-waveform')).toHaveCount(0)
 
-  await importCustomFixture(page, { name: 'Missing row', fileName: 'missing-row.wav', includeBeat: false }, false)
-  await generateCombo(page)
-  await expect(page.getByText(/missing-row\.wav.*not selected/i)).toBeVisible()
-  await expect(page.locator('.sequence-event')).toHaveCount(8)
-  await expect(page.locator('.sequence-waveform')).toHaveCount(0)
-
-  await importCustomFixture(page, { name: 'Corrupt row', fileName: 'corrupt-row.wav', includeBeat: false }, false)
-  await page.evaluate(() => { window.__waveformQa!.failNext = true })
-  const corruptWav = Buffer.from('RIFF----WAVE broken payload')
-  await page.getByLabel('Choose WAV files').setInputFiles({ name: 'corrupt-row.wav', buffer: corruptWav, mimeType: 'audio/wav' })
+  await importCustomFixture(page, {
+    name: 'Corrupt row',
+    fileName: 'corrupt-row.wav',
+    wav: makeWav(),
+    includeBeat: false,
+    failWaveformDecodeOnLoad: true,
+  }, false)
   await generateCombo(page)
   await expect.poll(() => page.evaluate(() => window.__waveformQa!.calls)).toBeGreaterThan(0)
   await expect(page.locator('.sequence-event')).toHaveCount(8)
@@ -241,12 +252,17 @@ test('silent, missing, and decoder-failed audio keep events visible without inve
 
 test('a preset and file change makes an older pending waveform decode stale', async ({ page }) => {
   await installWaveformDecoderControls(page)
-  await importCustomFixture(page, { name: 'Decode race', fileName: 'race.wav', wav: makeWav() })
-  await page.evaluate(() => { window.__waveformQa!.blockNext = true })
+  await importCustomFixture(page, {
+    name: 'Decode race',
+    fileName: 'race.wav',
+    wav: makeWav(),
+    blockWaveformDecodeOnLoad: true,
+  })
+  await expect.poll(() => page.evaluate(() => window.__waveformQa!.blocked)).toBe(true)
   await generateCombo(page)
   await expect.poll(() => page.evaluate(() => window.__waveformQa!.blocked)).toBe(true)
 
-  await page.getByLabel('Choose WAV files').setInputFiles({ name: 'race.wav', buffer: makeWav('silence'), mimeType: 'audio/wav' })
+  await importCustomFixture(page, { name: 'Decode race', fileName: 'race.wav', wav: makeWav('silence') }, false)
   await expect(page.getByRole('img', { name: /Sequence timeline/ })).toHaveCount(0)
   await generateCombo(page)
   await expect(page.locator('.sequence-waveform')).toHaveCount(8, { timeout: 10_000 })

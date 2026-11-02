@@ -42,10 +42,8 @@ async function openWorkspace(page: Page): Promise<void> {
   await page.goto('/')
   await expect(page.getByLabel('Quick preset')).toHaveValue('SSC-085BPM-01')
   await page.getByRole('tab', { name: 'Files', exact: true }).click()
-  await expect(page.locator('.import-status__copy p')).toContainText(
-    '85 BPM - Beginner ready. All 64 sample references and 2 beat files are loaded',
-    { timeout: 60_000 },
-  )
+  await expect(page.getByLabel('Current session files')).toContainText('85 BPM - Beginner', { timeout: 60_000 })
+  await expect(page.locator('.import-current__count')).toContainText('66 WAV files in session')
   await page.getByRole('tab', { name: 'Practice', exact: true }).click()
   await expect(page.getByRole('heading', { name: /Generated combo|Sequence preview/ })).toBeVisible()
   await expect(page.locator('.timeline-scroll')).toBeVisible()

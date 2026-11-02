@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { stageLocalImport } from './helpers/import-wizard'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 
@@ -113,17 +114,18 @@ async function installGenerationInstrumentation(page: Page): Promise<void> {
 async function loadFixture(page: Page): Promise<void> {
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'Generated combo' })).toBeVisible({ timeout: 30_000 })
-  await page.getByLabel('Choose WAV files').setInputFiles([
+  await stageLocalImport(page, {
+    name: 'dynamic-boundary.ini',
+    buffer: Buffer.from(makeIni()),
+    mimeType: 'text/plain',
+  }, [
     { name: 'alpha.wav', buffer: makeWav(440), mimeType: 'audio/wav' },
     { name: 'beta.wav', buffer: makeWav(660), mimeType: 'audio/wav' },
     { name: 'dynamic-bed.wav', buffer: makeWav(110, 0.4), mimeType: 'audio/wav' },
   ])
-  await page.getByLabel('Choose INI preset').setInputFiles({
-    name: 'dynamic-boundary.ini',
-    buffer: Buffer.from(makeIni()),
-    mimeType: 'text/plain',
-  })
-  await expect(page.locator('.import-status__copy p')).toContainText('2 samples and 1 beat files resolved')
+  await expect(page.getByRole('button', { name: 'Load preset' })).toBeEnabled()
+  await page.getByRole('button', { name: 'Load preset' }).click()
+  await page.getByRole('tab', { name: 'Practice', exact: true }).click()
   await page.getByLabel('Combo length').selectOption('4')
   await page.evaluate(() => { window.__generationQa!.randomEnabled = true; window.__generationQa!.randomValue = 0 })
   await page.getByRole('button', { name: 'Generate combo' }).click()
