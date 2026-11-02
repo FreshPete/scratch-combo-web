@@ -259,6 +259,9 @@ async function waitForBeatOutputTone(page: Page, expectedHz: number): Promise<nu
     : best, Number.POSITIVE_INFINITY)
   expect(Math.abs(closestReading - expectedHz), `expected ${expectedHz.toFixed(1)} Hz; sampled ${readings.join(', ')}`)
     .toBeLessThanOrEqual(18)
+  const measuredMin = Math.min(...readings)
+  const measuredMax = Math.max(...readings)
+  console.log(`[custom-beat-qa] target ${expectedHz.toFixed(1)} Hz; sampled ${measuredMin.toFixed(1)}–${measuredMax.toFixed(1)} Hz across ${readings.length} worklet frames`)
   return readings
 }
 
@@ -384,6 +387,12 @@ test('WAV custom beat keeps the scratch library, follows tempo at neutral pitch,
   await page.getByLabel('Beat bed').selectOption('custom')
   await expect(page.getByLabel('Beat bed')).toHaveValue('custom')
   await expect(page.getByRole('spinbutton', { name: 'BPM', exact: true })).toHaveValue(String(customBeatBpm))
+  await page.getByRole('button', { name: 'Play sequence' }).click()
+  await expect(page.getByRole('button', { name: 'Stop' })).toBeEnabled()
+  await expect.poll(() => page.evaluate(() => window.__customBeatQa?.sourceStarts.filter((source) => source.loop).length ?? 0))
+    .toBeGreaterThan(1)
+  await page.getByRole('button', { name: 'Stop' }).click()
+  await expect(page.locator('.transport-status')).toHaveText('Playback stopped.')
 
   const externalOrMutatingRequests = requests.filter((request) => {
     const url = new URL(request.url)
