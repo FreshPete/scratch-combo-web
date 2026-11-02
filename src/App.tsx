@@ -7,6 +7,7 @@ import {
   type CyclePlanOptions, type CycleSlot, type PlayOptions, type SnapshotFileValidation,
 } from './audio'
 import { getTempoRange, SessionControls, type CustomBeatAnalysisStatus } from './SessionControls'
+import { PracticeLibrary } from './PracticeLibrary'
 import {
   buildAssetIndex, buildPreviewFixture, DEMO_PRESET, generateLegacyCombo, parseLegacyIni,
   patchLegacyIniText, resolvePresetAssets, REST_SAMPLE_ID, web24bitRnd, type AssetDiagnostic, type AssetIndex,
@@ -27,6 +28,10 @@ import {
   WAVEFORM_VIEWBOX_HEIGHT, type WaveformData,
 } from './waveforms/waveform'
 import { sampleColorForName } from './waveforms/sample-color'
+import {
+  deleteSavedRecord, listSavedRecords, loadSavedRecord, saveSavedRecord, SessionLibraryError,
+  type SavedLibraryIndex, type SavedMedia, type SavedRecordSummary, type SavedSessionData,
+} from './session-library/storage'
 
 const TARGET_UNITS = 32
 const DEFAULT_COMBO_BEATS = 8
@@ -1384,6 +1389,16 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false)
   const [importMessage, setImportMessage] = useState('Loading the 85 BPM Beginner preset and its referenced WAV files.')
   const [actionError, setActionError] = useState<string | null>(null)
+  const [savedLibrary, setSavedLibrary] = useState<SavedLibraryIndex>({ sessions: [], favorites: [], lastSavedSessionId: null })
+  const [savedLibraryAvailable, setSavedLibraryAvailable] = useState(false)
+  const [savedLibraryBusy, setSavedLibraryBusy] = useState(false)
+  const [savedLibraryMessage, setSavedLibraryMessage] = useState('')
+  const [savedLibraryError, setSavedLibraryError] = useState<string | null>(null)
+  const [savedSessionName, setSavedSessionName] = useState('')
+  const [favoriteComboName, setFavoriteComboName] = useState('')
+  const [selectedSavedSessionId, setSelectedSavedSessionId] = useState('')
+  const [selectedFavoriteId, setSelectedFavoriteId] = useState('')
+  const [activeSavedSessionId, setActiveSavedSessionId] = useState<string | null>(null)
   const [bpm, setBpm] = useState(String(DEMO_PRESET.bpm))
   const [pitchSemitones, setPitchSemitones] = useState(0)
   const [sampleVolume, setSampleVolume] = useState(DEMO_PRESET.sampleVolume)
@@ -1470,6 +1485,364 @@ export default function App() {
     ? practiceMode === 'loop' ? 1 : largePause ? 4 : 2
     : 1
 
+  const refreshSavedLibrary = async () => {
+    try {
+      const next = await listSavedRecords()
+      setSavedLibrary(next)
+      setSavedLibraryAvailable(true)
+      setSavedLibraryError(null)
+      setSelectedSavedSessionId((current) => next.sessions.some((record) => record.id === current)
+        ? current
+        : next.lastSavedSessionId ?? next.sessions[0]?.id ?? '')
+      setSelectedFavoriteId((current) => next.favorites.some((record) => record.id === current)
+        ? current
+        : next.favorites[0]?.id ?? '')
+      return next
+    } catch (error) {
+      setSavedLibraryAvailable(false)
+      if (error instanceof SessionLibraryError && error.code === 'unavailable') {
+        setSavedLibraryMessage('Saved sessions and favourites are unavailable in this browser.')
+        setSavedLibraryError(null)
+      } else {
+        setSavedLibraryError(describeError(error))
+      }
+      return null
+    }
+  }
+
+  const captureCurrentSession = (): SavedSessionData => {
+    if (!isPresetReady || presetSource === 'loading') throw new Error('Wait for a preset to finish loading before saving this session.')
+    const persistedAssetPath = (file: File, fallback: string) => {
+      const resolutions = assetResolution
+        ? [...assetResolution.samplesById.values(), ...assetResolution.beats]
+        : []
+      return resolutions.find((asset) => asset.status === 'resolved' && asset.file === file && asset.selectedPath)?.selectedPath ?? fallback
+    }
+    const assets: SavedMedia[] = assetIndex.files.map(({ file, relativePath }) => ({
+      name: file.name,
+      type: file.type,
+      lastModified: file.lastModified,
+      relativePath: persistedAssetPath(file, relativePath),
+      size: file.size,
+      data: file.slice(0, file.size, file.type),
+    }))
+    const customBeat = customBeatFile ? {
+      name: customBeatFile.name,
+      type: customBeatFile.type,
+      lastModified: customBeatFile.lastModified,
+      relativePath: customBeatFile.name,
+      size: customBeatFile.size,
+      data: customBeatFile.slice(0, customBeatFile.size, customBeatFile.type),
+    } satisfies SavedMedia : null
+    return {
+      version: 1,
+      presetSource,
+      selectedPresetId,
+      preset: {
+        ...preset,
+        beatFiles: [...preset.beatFiles],
+        samples: preset.samples.map((sample) => ({ ...sample })),
+      },
+      fixture: fixture ? { totalUnits: fixture.totalUnits, events: fixture.events.map((event) => ({ ...event })) } : null,
+      timebase,
+      timelineView,
+      timelineLayout,
+      ttmAnnotations: Object.fromEntries(Object.entries(ttmAnnotations).map(([sampleId, selection]) => [sampleId, typeof selection === 'string' ? selection : selection.kind])),
+      comboBeats,
+      practiceMode,
+      largePause,
+      autoGenerate,
+      autoGenerateRounds,
+      omittedZeroDurationCount,
+      presetFileName,
+      sourceIniText,
+      bpm,
+      pitchSemitones,
+      sampleVolume,
+      beatVolume,
+      selectedBeatIndex,
+      customBeatFile: customBeat,
+      customBeatSelected,
+      customBeatReferenceBpm,
+      customBeatReferenceBpmInput,
+      assets,
+    }
+  }
+
+  const handleSaveSession = async (saveAsNew = false) => {
+    if (!savedLibraryAvailable || savedLibraryBusy || isPlaybackLockedNow() || isReadingPreset || isGenerating || isSavingIni) return
+    setSavedLibraryBusy(true)
+    setSavedLibraryError(null)
+    setSavedLibraryMessage('Saving the session and copying its referenced audio into this browser…')
+    try {
+      const snapshot = captureCurrentSession()
+      const name = savedSessionName.trim() || currentPresetName
+      const record = await saveSavedRecord({
+        ...(!saveAsNew && activeSavedSessionId ? { id: activeSavedSessionId } : {}),
+        kind: 'session',
+        name,
+        snapshot,
+      })
+      setActiveSavedSessionId(record.id)
+      setSavedSessionName(record.name)
+      setSelectedSavedSessionId(record.id)
+      setSavedLibraryMessage('Saved “' + record.name + '” in this browser. Press Reload last saved after a page refresh to restore it.')
+      void refreshSavedLibrary()
+    } catch (error) {
+      setSavedLibraryError(describeError(error))
+    } finally {
+      setSavedLibraryBusy(false)
+    }
+  }
+
+  const handleSaveFavorite = async () => {
+    if (!savedLibraryAvailable || savedLibraryBusy || isPlaybackLockedNow() || isReadingPreset || isGenerating || isSavingIni || !fixture) return
+    setSavedLibraryBusy(true)
+    setSavedLibraryError(null)
+    setSavedLibraryMessage('Saving the exact combo and copying its referenced audio into this browser…')
+    try {
+      const snapshot = captureCurrentSession()
+      const name = favoriteComboName.trim() || (currentPresetName + ' · ' + (isImportedPreset ? comboBeats + ' beat' : 'demo') + ' combo')
+      const record = await saveSavedRecord({ kind: 'favorite', name, snapshot })
+      setFavoriteComboName('')
+      setSelectedFavoriteId(record.id)
+      setSavedLibraryMessage('Saved the exact current combo as “' + record.name + '”.')
+      void refreshSavedLibrary()
+    } catch (error) {
+      setSavedLibraryError(describeError(error))
+    } finally {
+      setSavedLibraryBusy(false)
+    }
+  }
+
+  const restoreSavedRecord = async (summary: SavedRecordSummary) => {
+    if (!savedLibraryAvailable || savedLibraryBusy || isPlaybackLockedNow() || isReadingPreset || isGenerating || isPreparingLocalImport || isSavingIni) return
+    setSavedLibraryBusy(true)
+    setSavedLibraryError(null)
+    setSavedLibraryMessage('Checking saved audio and rebuilding the session. Playback stays stopped.')
+    setIsReadingPreset(true)
+    invalidateAutoGeneration()
+    transport.stop()
+    setPlaybackTarget(null)
+    setVisibleCyclePlanIndex(null)
+    try {
+      const record = await loadSavedRecord(summary.id)
+      if (record.kind !== summary.kind) throw new SessionLibraryError('corrupt', 'That saved item changed while it was being loaded. Refresh the list and try again.')
+      const data = record.snapshot
+      if (data.fixture) {
+        const samplesById = new Map(data.preset.samples.map((sample) => [sample.id, sample]))
+        for (const event of data.fixture.events) {
+          const sample = samplesById.get(event.sampleId)
+          if ((event.sampleId === REST_SAMPLE_ID && !event.silent)
+            || (event.sampleId !== REST_SAMPLE_ID && (!sample || event.silent !== sample.silent))) {
+            throw new SessionLibraryError('corrupt', 'The saved combo refers to a missing or mismatched sample. Delete it and save again.')
+          }
+        }
+        if (data.presetFileName !== null && data.fixture.totalUnits !== data.comboBeats * LEGACY_TICKS_PER_BEAT) {
+          throw new SessionLibraryError('corrupt', 'The saved combo length does not match its session settings. Delete it and save again.')
+        }
+      }
+      if (data.presetSource === 'custom') parseLegacyIni(data.sourceIniText ?? '')
+
+      const storedFiles = data.assets.map((asset) => {
+        const file = new File([asset.data], asset.name, { type: asset.type, lastModified: asset.lastModified })
+        Object.defineProperty(file, 'webkitRelativePath', { configurable: true, value: asset.relativePath })
+        return file
+      })
+      let nextIndex = buildAssetIndex(storedFiles)
+      let nextResolution: PresetAssetResolution | undefined = data.presetSource === 'demo'
+        ? undefined
+        : resolvePresetAssets(data.preset, nextIndex)
+      const selectedBeatNumber = data.selectedBeatIndex === 'none' ? null : Number(data.selectedBeatIndex)
+      if (data.selectedBeatIndex !== 'none' && (!Number.isSafeInteger(selectedBeatNumber) || selectedBeatNumber === null
+        || selectedBeatNumber < 0 || selectedBeatNumber >= (nextResolution?.beats.length ?? 0))) {
+        throw new SessionLibraryError('corrupt', 'The saved beat selection is outside this preset. Delete it and save again.')
+      }
+
+      const filesToDecode = new Set<File>()
+      const requiredFilesBySampleId = new Map<string, File>()
+      let selectedPresetBeatFile: File | null = null
+      if (nextResolution) {
+        for (const sample of data.preset.samples.filter(requiredImportSample)) {
+          const resolution = nextResolution.samplesById.get(sample.id)
+          if (resolution?.status !== 'resolved' || !resolution.file) {
+            throw new SessionLibraryError('corrupt', 'The saved session is missing the WAV for “' + sample.name + '”. Save it again while the required audio is available.')
+          }
+          filesToDecode.add(resolution.file)
+          requiredFilesBySampleId.set(sample.id, resolution.file)
+        }
+        if (selectedBeatNumber !== null) {
+          const resolution = nextResolution.beats[selectedBeatNumber]
+          if (resolution?.status !== 'resolved' || !resolution.file) {
+            throw new SessionLibraryError('corrupt', 'The saved session is missing its selected preset beat. Save it again while the beat is available.')
+          }
+          filesToDecode.add(resolution.file)
+          selectedPresetBeatFile = resolution.file
+        }
+      }
+
+      const copied = storedFiles.length > 0
+        ? await snapshotReferencedWavFiles(storedFiles, { decodeFiles: [...filesToDecode] })
+        : undefined
+      const restoredFiles = storedFiles.map((file, index) => {
+        const restored = copied?.filesBySource.get(file) ?? file
+        const path = data.assets[index]?.relativePath
+        if (path) Object.defineProperty(restored, 'webkitRelativePath', { configurable: true, value: path })
+        return restored
+      })
+      nextIndex = buildAssetIndex(restoredFiles)
+      nextResolution = data.presetSource === 'demo' ? undefined : resolvePresetAssets(data.preset, nextIndex)
+
+      if (nextResolution) {
+        for (const sample of data.preset.samples.filter(requiredImportSample)) {
+          const resolution = nextResolution.samplesById.get(sample.id)
+          const originalFile = requiredFilesBySampleId.get(sample.id)
+          const expectedSnapshot = originalFile ? copied?.filesBySource.get(originalFile) : undefined
+          const validation = originalFile ? copied?.validationBySource.get(originalFile) : undefined
+          if (resolution?.status !== 'resolved' || !resolution.file || resolution.file !== expectedSnapshot || validation?.status !== 'valid') {
+            throw new SessionLibraryError('corrupt', 'Could not decode the saved WAV for “' + sample.name + '”. Delete the saved item and check the original audio file.')
+          }
+        }
+        if (selectedBeatNumber !== null) {
+          const resolution = nextResolution.beats[selectedBeatNumber]
+          const originalFile = selectedPresetBeatFile
+          const expectedSnapshot = originalFile ? copied?.filesBySource.get(originalFile) : undefined
+          const validation = originalFile ? copied?.validationBySource.get(originalFile) : undefined
+          if (resolution?.status !== 'resolved' || !resolution.file || resolution.file !== expectedSnapshot || validation?.status !== 'valid') {
+            throw new SessionLibraryError('corrupt', 'Could not decode the saved preset beat. Delete the saved item and check the original audio file.')
+          }
+        }
+      }
+
+      let restoredCustomBeatFile: File | null = null
+      let restoredCustomBeatBuffer: AudioBuffer | null = null
+      if (data.customBeatFile) {
+        const asset = data.customBeatFile
+        restoredCustomBeatFile = new File([asset.data], asset.name, { type: asset.type, lastModified: asset.lastModified })
+        let context: AudioContext | undefined
+        try {
+          context = new AudioContext()
+          restoredCustomBeatBuffer = (await analyzeLocalAudioFile(context, restoredCustomBeatFile)).buffer
+        } catch (error) {
+          throw new SessionLibraryError('corrupt', 'Could not decode the saved custom beat: ' + describeError(error) + ' Delete the saved item and choose a readable audio file.')
+        } finally {
+          if (context && context.state !== 'closed') await context.close().catch(() => undefined)
+        }
+      }
+
+      if (data.selectedBeatIndex !== 'none' && selectedBeatNumber === null) {
+        throw new SessionLibraryError('corrupt', 'The saved beat selection is invalid. Delete it and save again.')
+      }
+      clearLocalImportDraft()
+      transport.resetAssets()
+      transport.stop()
+      assetIndexRef.current = nextIndex
+      presetSourceRef.current = data.presetSource
+      activeQuickPresetIdRef.current = data.presetSource === 'builtin' ? data.selectedPresetId : data.presetSource
+      setPresetSource(data.presetSource)
+      setSelectedPresetId(data.selectedPresetId)
+      setPreset(data.preset)
+      setFixture(data.fixture)
+      setTimebase(data.timebase)
+      setTimelineView(import.meta.env.DEV ? data.timelineView : 'waveform')
+      setTimelineLayout(data.timelineLayout)
+      setTtmAnnotations(import.meta.env.DEV
+        ? Object.fromEntries(Object.entries(data.ttmAnnotations).map(([id, value]) => [id, value === UNTRANSCRIBED.kind || Object.values(TTM_GUIDES).some((guide) => guide.id === value) ? value as TtmSampleGuideSelection : UNTRANSCRIBED]))
+        : {})
+      setComboBeats(data.comboBeats)
+      setPracticeMode(data.practiceMode)
+      setLargePause(data.largePause)
+      setAutoGenerate(data.autoGenerate)
+      setAutoGenerateRounds(data.autoGenerateRounds)
+      setOmittedZeroDurationCount(data.omittedZeroDurationCount)
+      setPresetFileName(data.presetFileName)
+      setSourceIniText(data.sourceIniText)
+      setLocalWavFiles(data.presetSource === 'custom' ? restoredFiles : [])
+      setAssetIndex(nextIndex)
+      setAssetResolution(nextResolution)
+      setBpm(data.bpm)
+      setPitchSemitones(data.pitchSemitones)
+      setSampleVolume(data.sampleVolume)
+      setBeatVolume(data.beatVolume)
+      setSelectedBeatIndex(data.selectedBeatIndex)
+      setCustomBeatFile(restoredCustomBeatFile)
+      setCustomBeatBuffer(restoredCustomBeatBuffer)
+      setCustomBeatSelected(data.customBeatSelected)
+      setCustomBeatReferenceBpm(data.customBeatReferenceBpm)
+      setCustomBeatReferenceBpmInput(data.customBeatReferenceBpmInput)
+      setCustomBeatCandidate(null)
+      setCustomBeatCandidateBpm('')
+      setCustomBeatAnalysisStatus('idle')
+      setCustomBeatAnalysisMessage('')
+      setEditingSample(null)
+      setIsSavingIni(false)
+      setSaveIniError(null)
+      sourceControlDefaultsRef.current = {
+        bpm: data.preset.bpm,
+        sampleVolume: data.preset.sampleVolume,
+        beatVolume: data.preset.beatVolume,
+      }
+      transport.setPitchSemitones(data.pitchSemitones)
+      transport.setSampleVolume(data.sampleVolume)
+      transport.setBeatVolume(data.beatVolume)
+      setIsPresetReady(true)
+      setIsBootstrapLoading(false)
+      setBootstrapError(null)
+      setActionError(null)
+      setPlaybackTarget(null)
+      setVisibleCyclePlanIndex(null)
+      setActiveSavedSessionId(record.kind === 'session' ? record.id : null)
+      setSavedSessionName(record.kind === 'session' ? record.name : '')
+      if (record.kind === 'session') setSelectedSavedSessionId(record.id)
+      else setSelectedFavoriteId(record.id)
+      setImportMessage('Restored “' + record.name + '” from this browser. Saved audio was rechecked locally.')
+      setTransportNote('Loaded “' + record.name + '”. Playback is stopped; press Play when ready.')
+      setSavedLibraryMessage('Loaded “' + record.name + '”. Playback is stopped; press Play when ready.')
+    } catch (error) {
+      setSavedLibraryMessage('')
+      setSavedLibraryError(describeError(error))
+      setTransportNote('Could not restore the saved item. Playback is stopped; the current preset remains active.')
+    } finally {
+      setIsReadingPreset(false)
+      setSavedLibraryBusy(false)
+    }
+  }
+
+  const handleLoadSelectedSession = () => {
+    const record = savedLibrary.sessions.find((candidate) => candidate.id === selectedSavedSessionId)
+    if (record) void restoreSavedRecord(record)
+  }
+
+  const handleReloadLastSession = () => {
+    const record = savedLibrary.sessions.find((candidate) => candidate.id === savedLibrary.lastSavedSessionId)
+    if (record) void restoreSavedRecord(record)
+  }
+
+  const handleLoadSelectedFavorite = () => {
+    const record = savedLibrary.favorites.find((candidate) => candidate.id === selectedFavoriteId)
+    if (record) void restoreSavedRecord(record)
+  }
+
+  const handleDeleteSelectedSavedItem = async (kind: 'session' | 'favorite') => {
+    const record = kind === 'session'
+      ? savedLibrary.sessions.find((candidate) => candidate.id === selectedSavedSessionId)
+      : savedLibrary.favorites.find((candidate) => candidate.id === selectedFavoriteId)
+    if (!record || !window.confirm('Delete “' + record.name + '” and its saved audio from this browser?')) return
+    setSavedLibraryBusy(true)
+    setSavedLibraryError(null)
+    setSavedLibraryMessage('Deleting the selected item and its local audio…')
+    try {
+      await deleteSavedRecord(record.id)
+      if (activeSavedSessionId === record.id) setActiveSavedSessionId(null)
+      setSavedLibraryMessage('Deleted “' + record.name + '” and its locally saved audio.')
+      void refreshSavedLibrary()
+    } catch (error) {
+      setSavedLibraryError(describeError(error))
+    } finally {
+      setSavedLibraryBusy(false)
+    }
+  }
+
   const cancelLocalImportWork = () => {
     localImportGeneration.current += 1
     localImportController.current?.abort()
@@ -1512,6 +1885,8 @@ export default function App() {
   const startBuiltInPresetLoad = (presetId: string) => {
     clearLocalImportDraft()
     resetAutoGeneration()
+    setActiveSavedSessionId(null)
+    setSavedSessionName('')
     setTtmAnnotations({})
     const generation = ++presetImportGeneration.current
     activePresetLoadRef.current?.abort()
@@ -1614,6 +1989,8 @@ export default function App() {
   const selectDemoPreset = () => {
     clearLocalImportDraft()
     resetAutoGeneration()
+    setActiveSavedSessionId(null)
+    setSavedSessionName('')
     setTtmAnnotations({})
     ++presetImportGeneration.current
     activePresetLoadRef.current?.abort()
@@ -1983,6 +2360,8 @@ export default function App() {
     const nextTempo = String(initialPracticeTempo(prepared.preset.bpm, customBeatSelected ? customBeatReferenceBpm : null))
 
     resetAutoGeneration()
+    setActiveSavedSessionId(null)
+    setSavedSessionName('')
     setTtmAnnotations({})
     ++presetImportGeneration.current
     activePresetLoadRef.current?.abort()
@@ -2571,7 +2950,7 @@ export default function App() {
     setTransportNote('Playback stopped.')
   }
 
-  const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating || isCustomBeatAnalysisBusy || isPlaybackLocked || autoGenerateBlocked || !customBeatReferenceInputValid || !sessionTempoValid
+  const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating || isCustomBeatAnalysisBusy || isPlaybackLocked || autoGenerateBlocked || !customBeatReferenceInputValid || !sessionTempoValid || savedLibraryBusy
   const stopDisabled = transportSnapshot.status !== 'playing' && transportSnapshot.status !== 'loading'
   const isSequencePlaying = playbackTarget?.kind === 'sequence' && transportSnapshot.status === 'playing'
   const displayedProgress = transportSnapshot.status === 'playing' ? presentation?.progress : undefined
@@ -2605,7 +2984,8 @@ export default function App() {
   const visibleStagedIniName = stagedIniFile?.name ?? preparedLocalImport?.iniFileName ?? null
   const visibleStagedPresetName = stagedPreset?.name ?? preparedLocalImport?.preset.name ?? null
   const visibleStagedAudioCount = stagedAudioFiles.length || preparedLocalImport?.selectedAudioFileCount || 0
-  const sessionControlsDisabled = !isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy
+  const sessionControlsDisabled = !isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy || savedLibraryBusy
+  const savedLibraryControlsBusy = savedLibraryBusy || isReadingPreset || isGenerating || isPreparingLocalImport || isPlaybackLocked || isCustomBeatAnalysisBusy || isSavingIni
   const resetControlsDisabled = sessionControlsDisabled
 
   shortcutActionsRef.current = {
@@ -2621,6 +3001,10 @@ export default function App() {
   useEffect(() => {
     try { window.localStorage.setItem('scratch-combo-shortcuts', shortcutsEnabled ? 'on' : 'off') } catch { /* Private browsing can disable storage. */ }
   }, [shortcutsEnabled])
+
+  useEffect(() => {
+    void refreshSavedLibrary()
+  }, [])
 
   useEffect(() => {
     if (!shortcutsEnabled || shortcutsHelpOpen) return
@@ -2686,7 +3070,7 @@ export default function App() {
       <main className="workspace" id="workspace">
         <header className="workspace-header">
           <div><h1>Scratch Combo</h1><p>Practice workspace</p></div>
-          <div className="session-state"><span className="session-state__dot" aria-hidden="true" /><span>Private browser session</span></div>
+          <div className="session-state"><span className="session-state__dot" aria-hidden="true" /><span>Local browser workspace</span></div>
         </header>
 
         <section className="transport-dock" aria-label="Playback controls">
@@ -2731,12 +3115,12 @@ export default function App() {
               {isImportedPreset && (
                 <label className="combo-length-control" htmlFor="combo-length">
                   <span>Combo length</span>
-                  <select id="combo-length" value={comboBeats} onChange={(event) => handleComboLengthChange(event.currentTarget.value)} disabled={!isPresetReady || isReadingPreset || isGenerating || isPlaybackLocked}>
+                  <select id="combo-length" value={comboBeats} onChange={(event) => handleComboLengthChange(event.currentTarget.value)} disabled={!isPresetReady || isReadingPreset || isGenerating || isPlaybackLocked || savedLibraryBusy}>
                     {COMBO_BEAT_OPTIONS.map((beats) => <option key={beats} value={beats}>{beats} Beats</option>)}
                   </select>
                 </label>
               )}
-              <button className="button button--primary" type="button" onClick={handleBuildPreview} disabled={!isPresetReady || isReadingPreset || isGenerating || isPlaybackLocked}>
+              <button className="button button--primary" type="button" onClick={handleBuildPreview} disabled={!isPresetReady || isReadingPreset || isGenerating || isPlaybackLocked || savedLibraryBusy}>
                 {isGenerating ? 'Generating…' : isImportedPreset ? 'Generate combo' : 'Build preview'}
               </button>
             </div>
@@ -2744,9 +3128,37 @@ export default function App() {
           <QuickPresetControl
             builtInCatalog={builtInCatalog}
             selectedPresetId={selectedPresetId}
-            locked={isPlaybackLocked}
+            locked={isPlaybackLocked || isReadingPreset || savedLibraryBusy}
             isBootstrapLoading={isBootstrapLoading}
             onChange={handleBuiltInPresetChange}
+          />
+          <PracticeLibrary
+            sessionName={savedSessionName}
+            favoriteName={favoriteComboName}
+            sessions={savedLibrary.sessions}
+            favorites={savedLibrary.favorites}
+            lastSavedSessionId={savedLibrary.lastSavedSessionId}
+            selectedSessionId={selectedSavedSessionId}
+            selectedFavoriteId={selectedFavoriteId}
+            currentSessionName={currentPresetName}
+            busy={savedLibraryControlsBusy}
+            canSave={isPresetReady}
+            available={savedLibraryAvailable}
+            hasFixture={Boolean(fixture)}
+            message={savedLibraryMessage}
+            error={savedLibraryError}
+            onSessionNameChange={setSavedSessionName}
+            onFavoriteNameChange={setFavoriteComboName}
+            onSelectedSessionChange={setSelectedSavedSessionId}
+            onSelectedFavoriteChange={setSelectedFavoriteId}
+            onSaveSession={() => { void handleSaveSession() }}
+            onSaveSessionAsNew={() => { void handleSaveSession(true) }}
+            onLoadSession={handleLoadSelectedSession}
+            onReloadLast={handleReloadLastSession}
+            onDeleteSession={() => { void handleDeleteSelectedSavedItem('session') }}
+            onSaveFavorite={() => { void handleSaveFavorite() }}
+            onLoadFavorite={handleLoadSelectedFavorite}
+            onDeleteFavorite={() => { void handleDeleteSelectedSavedItem('favorite') }}
           />
           <details className="preview-help">
             <summary>About this preview</summary>
@@ -2758,7 +3170,7 @@ export default function App() {
             <PracticeCycleControls
               mode={practiceMode}
               largePause={largePause}
-              disabled={isReadingPreset || isGenerating || isPlaybackLocked}
+              disabled={isReadingPreset || isGenerating || isPlaybackLocked || savedLibraryBusy}
               autoGenerate={autoGenerate}
               autoGenerateRounds={autoGenerateRounds}
               autoGenerateHint={autoGenerateHint}
@@ -2809,7 +3221,7 @@ export default function App() {
           wizardError={localImportError}
           selectionNote={localImportSelectionNote}
           prepared={preparedLocalImport}
-          locked={isPlaybackLocked}
+          locked={isPlaybackLocked || savedLibraryBusy || isReadingPreset}
           isBootstrapLoading={isBootstrapLoading}
           bootstrapError={bootstrapError}
           onRetryBuiltIn={handleRetryBuiltIn}
@@ -2845,7 +3257,7 @@ export default function App() {
           customBeatCandidateMessage={customBeatAnalysisMessage}
           customBeatCandidateReady={Boolean(customBeatCandidate?.buffer)}
           disabled={sessionControlsDisabled}
-          beatSelectionDisabled={isPlaybackLocked || isCustomBeatAnalysisBusy}
+          beatSelectionDisabled={isPlaybackLocked || isCustomBeatAnalysisBusy || savedLibraryBusy}
           onBpmChange={handleBpmChange}
           onPitchChange={handlePitchChange}
           onSampleVolumeChange={handleSampleVolumeChange}
@@ -2864,7 +3276,7 @@ export default function App() {
           ? <SampleTable
               preset={preset}
               resolution={assetResolution}
-              actionsDisabled={isReadingPreset || isGenerating || isSavingIni || isPlaybackLocked}
+              actionsDisabled={isReadingPreset || isGenerating || isSavingIni || isPlaybackLocked || savedLibraryBusy}
               legacyMode={isImportedPreset}
               sourceAvailable={sourceIniText !== null}
               editingSample={editingSample}
@@ -2884,8 +3296,8 @@ export default function App() {
         </div>
 
         <footer className="workspace-footer">
-          <span>Files remain on this device for the current session.</span>
-          <span>Nothing is written back to the selected INI or WAV files.</span>
+          <span>Unsaved files stay in this browser session. Saved audio stays local until deleted or browser storage is cleared.</span>
+          <span>Saved audio stays in this browser on this device and is never uploaded; localhost and the hosted site keep separate copies.</span>
         </footer>
       </main>
       <span className="visually-hidden" aria-live="polite" aria-atomic="true">{importMessage}</span>
