@@ -2,8 +2,8 @@ import {
   useEffect, useMemo, useRef, useState, useSyncExternalStore,
   type ChangeEvent, type CSSProperties, type InputHTMLAttributes,
 } from 'react'
-import { AudioTransport, type CyclePlanOptions, type CycleSlot, type PlayOptions } from './audio'
-import { SessionControls } from './SessionControls'
+import { analyzeLocalAudioFile, AudioTransport, type CyclePlanOptions, type CycleSlot, type PlayOptions } from './audio'
+import { getTempoRange, SessionControls, type CustomBeatAnalysisStatus } from './SessionControls'
 import {
   buildAssetIndex, buildPreviewFixture, DEMO_PRESET, generateLegacyCombo, parseLegacyIni,
   patchLegacyIniText, resolvePresetAssets, REST_SAMPLE_ID, web24bitRnd, type AssetDiagnostic, type AssetIndex,
@@ -64,9 +64,44 @@ type TimelineView = 'waveform' | 'ttm'
 type TimelineLayout = 'grid' | 'inline'
 type WorkspaceSection = 'sequence' | 'files' | 'session' | 'samples'
 type PresetSource = 'loading' | 'builtin' | 'custom' | 'demo'
+type CustomBeatCandidate = { file: File; buffer: AudioBuffer | null }
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function describeBpmDetection(fileName: string, detection: {
+  status: 'detected' | 'ambiguous' | 'insufficient'
+  bpm?: number
+  alternatives?: readonly number[]
+  candidates?: readonly number[]
+  reason?: string
+}): string {
+  if (detection.status === 'detected') {
+    const alternatives = detection.alternatives?.length
+      ? ' Other possible tempos: ' + detection.alternatives.join(', ') + ' BPM.'
+      : ''
+    return fileName + ': estimated ' + detection.bpm + ' BPM. Check for half or double time before applying.' + alternatives
+  }
+  if (detection.status === 'ambiguous') {
+    const candidates = detection.candidates?.length ? ' Possible tempos: ' + detection.candidates.join(', ') + ' BPM.' : ''
+    return fileName + ': the pulse is ambiguous. Choose the recorded BPM manually.' + candidates
+  }
+  const reason = detection.reason === 'too-short'
+    ? 'The beat is too short for a useful estimate.'
+    : detection.reason === 'silence'
+      ? 'No clear rhythmic pulse was found.'
+      : detection.reason === 'invalid-audio'
+        ? 'The audio could not provide a usable BPM estimate.'
+        : 'A reliable periodic tempo could not be estimated.'
+  return fileName + ': ' + reason + ' Enter the BPM recorded with the beat.'
+}
+
+function initialPracticeTempo(scratchReferenceBpm: number, beatReferenceBpm?: number | null): number {
+  const range = getTempoRange(scratchReferenceBpm, beatReferenceBpm)
+  if (!range) return scratchReferenceBpm
+  const preferred = beatReferenceBpm ?? scratchReferenceBpm
+  return Math.min(range.max, Math.max(range.min, preferred))
 }
 
 function assetMapFor(resolution: PresetAssetResolution | undefined): ReadonlyMap<string, File> {
@@ -889,6 +924,15 @@ export default function App() {
   const [sampleVolume, setSampleVolume] = useState(DEMO_PRESET.sampleVolume)
   const [beatVolume, setBeatVolume] = useState(DEMO_PRESET.beatVolume)
   const [selectedBeatIndex, setSelectedBeatIndex] = useState('none')
+  const [customBeatFile, setCustomBeatFile] = useState<File | null>(null)
+  const [customBeatBuffer, setCustomBeatBuffer] = useState<AudioBuffer | null>(null)
+  const [customBeatSelected, setCustomBeatSelected] = useState(false)
+  const [customBeatReferenceBpm, setCustomBeatReferenceBpm] = useState<number | null>(null)
+  const [customBeatReferenceBpmInput, setCustomBeatReferenceBpmInput] = useState('')
+  const [customBeatCandidate, setCustomBeatCandidate] = useState<CustomBeatCandidate | null>(null)
+  const [customBeatCandidateBpm, setCustomBeatCandidateBpm] = useState('')
+  const [customBeatAnalysisStatus, setCustomBeatAnalysisStatus] = useState<CustomBeatAnalysisStatus>('idle')
+  const [customBeatAnalysisMessage, setCustomBeatAnalysisMessage] = useState('')
   const [playbackTarget, setPlaybackTarget] = useState<PlaybackTarget>(null)
   const [transportNote, setTransportNote] = useState('Ready to play.')
   const [activeSection, setActiveSection] = useState<WorkspaceSection>('sequence')
@@ -899,6 +943,7 @@ export default function App() {
   const activePresetLoadRef = useRef<AbortController | undefined>(undefined)
   const builtInCatalogRef = useRef<BuiltInPresetCatalog | undefined>(undefined)
   const customWavFilesRef = useRef<File[]>([])
+  const customBeatAnalysisGeneration = useRef(0)
   const lifecycleGeneration = useRef(0)
   const autoGenerateGeneration = useRef(0)
   const sourceControlDefaultsRef = useRef({
@@ -908,7 +953,20 @@ export default function App() {
   })
   const sampleAssets = useMemo(() => assetMapFor(assetResolution), [assetResolution])
   const selectedBeatResolution = selectedBeatIndex === 'none' ? undefined : assetResolution?.beats[Number(selectedBeatIndex)]
-  const selectedBeatFile = selectedBeatResolution?.status === 'resolved' ? selectedBeatResolution.file : undefined
+  const selectedBeatFile = customBeatSelected
+    ? undefined
+    : selectedBeatResolution?.status === 'resolved' ? selectedBeatResolution.file : undefined
+  const selectedBeatReferenceBpm = customBeatSelected ? customBeatReferenceBpm : null
+  const selectedTempoRange = getTempoRange(preset.bpm, selectedBeatReferenceBpm)
+  const isCustomBeatAnalysisBusy = customBeatAnalysisStatus === 'analyzing'
+  const customBeatReferenceInputNumber = Number(customBeatReferenceBpmInput)
+  const customBeatReferenceInputValid = !customBeatSelected
+    || (Number.isFinite(customBeatReferenceInputNumber) && customBeatReferenceInputNumber >= 1)
+  const sessionTempoNumber = Number(bpm)
+  const sessionTempoValid = selectedTempoRange !== null
+    && Number.isFinite(sessionTempoNumber)
+    && sessionTempoNumber >= selectedTempoRange.min
+    && sessionTempoNumber <= selectedTempoRange.max
   const diagnostics = assetResolution?.diagnostics ?? []
   const autoGenerateSampleIds = preset.samples
     .filter((sample) => sample.enabled && !sample.silent && sample.weight > 0)
@@ -1013,7 +1071,7 @@ export default function App() {
         setTimebase('legacy')
         setComboBeats(DEFAULT_COMBO_BEATS)
         setOmittedZeroDurationCount(generated.zeroDurationCount)
-        setBpm(String(loaded.preset.bpm))
+        setBpm(String(initialPracticeTempo(loaded.preset.bpm, customBeatSelected ? customBeatReferenceBpm : null)))
         setPitchSemitones(0)
         setSampleVolume(loaded.preset.sampleVolume)
         setBeatVolume(loaded.preset.beatVolume)
@@ -1071,7 +1129,7 @@ export default function App() {
     setFixture(buildPreviewFixture(DEMO_PRESET, TARGET_UNITS))
     setTimebase('demo')
     setOmittedZeroDurationCount(0)
-    setBpm(String(DEMO_PRESET.bpm))
+    setBpm(String(initialPracticeTempo(DEMO_PRESET.bpm, customBeatSelected ? customBeatReferenceBpm : null)))
     setPitchSemitones(0)
     setSampleVolume(DEMO_PRESET.sampleVolume)
     setBeatVolume(DEMO_PRESET.beatVolume)
@@ -1136,6 +1194,7 @@ export default function App() {
     window.addEventListener('pagehide', stopOnPageHide)
     return () => {
       window.removeEventListener('pagehide', stopOnPageHide)
+      customBeatAnalysisGeneration.current += 1
       queueMicrotask(() => {
         if (lifecycleGeneration.current === generation) transport.dispose()
       })
@@ -1280,7 +1339,7 @@ export default function App() {
         setTimebase('legacy')
         setComboBeats(DEFAULT_COMBO_BEATS)
         setOmittedZeroDurationCount(0)
-        setBpm(String(nextPreset.bpm))
+        setBpm(String(initialPracticeTempo(nextPreset.bpm, customBeatSelected ? customBeatReferenceBpm : null)))
         setPitchSemitones(0)
         setSampleVolume(nextPreset.sampleVolume)
         setBeatVolume(nextPreset.beatVolume)
@@ -1377,14 +1436,97 @@ export default function App() {
       : selectedPresetId)
   }
 
+  const handleCustomBeatFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget
+    const file = input.files?.[0]
+    input.value = ''
+    if (!file || isPlaybackLockedNow() || isCustomBeatAnalysisBusy) return
+
+    const generation = ++customBeatAnalysisGeneration.current
+    setCustomBeatCandidate({ file, buffer: null })
+    setCustomBeatCandidateBpm('')
+    setCustomBeatAnalysisStatus('analyzing')
+    setCustomBeatAnalysisMessage('Analyzing ' + file.name + ' locally. Your current beat stays selected until you apply this file.')
+    setActionError(null)
+    setTransportNote('Analyzing the custom beat locally. Playback is paused until its BPM is ready for review.')
+
+    void (async () => {
+      let context: AudioContext | undefined
+      try {
+        context = new AudioContext()
+        const analysis = await analyzeLocalAudioFile(context, file)
+        if (generation !== customBeatAnalysisGeneration.current) return
+        setCustomBeatCandidate({ file, buffer: analysis.buffer })
+        setCustomBeatAnalysisStatus(analysis.detection.status)
+        setCustomBeatCandidateBpm(analysis.detection.status === 'detected' ? String(analysis.detection.bpm) : '')
+        setCustomBeatAnalysisMessage(describeBpmDetection(file.name, analysis.detection))
+        setTransportNote('Beat analysis ready for review. Check the recorded BPM and apply the beat when ready.')
+      } catch (error) {
+        if (generation !== customBeatAnalysisGeneration.current) return
+        setCustomBeatCandidate({ file, buffer: null })
+        setCustomBeatAnalysisStatus('error')
+        setCustomBeatAnalysisMessage('Could not analyze ' + file.name + ': ' + describeError(error) + ' Your current beat remains selected. Choose a WAV or MP3 file that can be read locally.')
+        setTransportNote('The custom beat could not be analyzed. Your current beat is still selected.')
+      } finally {
+        if (context && context.state !== 'closed') {
+          await context.close().catch(() => undefined)
+        }
+      }
+    })()
+  }
+
+  const handleUseCustomBeat = () => {
+    if (isPlaybackLockedNow() || isCustomBeatAnalysisBusy || !customBeatCandidate?.buffer) return
+    const referenceBpm = Number(customBeatCandidateBpm)
+    const tempoRange = getTempoRange(preset.bpm, referenceBpm)
+    if (!Number.isFinite(referenceBpm) || referenceBpm < 1 || !tempoRange) return
+
+    const practiceTempo = Math.min(tempoRange.max, Math.max(tempoRange.min, referenceBpm))
+    setCustomBeatFile(customBeatCandidate.file)
+    setCustomBeatBuffer(customBeatCandidate.buffer)
+    setCustomBeatSelected(true)
+    setCustomBeatReferenceBpm(referenceBpm)
+    setCustomBeatReferenceBpmInput(String(referenceBpm))
+    setBpm(String(practiceTempo))
+    setCustomBeatCandidate(null)
+    setCustomBeatCandidateBpm('')
+    setCustomBeatAnalysisStatus('idle')
+    setCustomBeatAnalysisMessage('')
+    setActionError(null)
+    setTransportNote(
+      'Custom beat selected at a recorded ' + referenceBpm + ' BPM. Practice tempo set to ' + practiceTempo + ' BPM. Playback has not started.'
+      + (practiceTempo !== referenceBpm ? ' The selected tempo is clamped to the supported range for both sources.' : ''),
+    )
+  }
+
   const handleBpmChange = (value: string) => {
     setBpm(value)
     const nextBpm = Number(value)
-    const minBpm = Math.max(1, preset.bpm * 0.5)
-    const maxBpm = Math.max(minBpm, preset.bpm * 2)
-    if (Number.isFinite(nextBpm) && nextBpm >= minBpm && nextBpm <= maxBpm) {
+    if (selectedTempoRange && Number.isFinite(nextBpm) && nextBpm >= selectedTempoRange.min && nextBpm <= selectedTempoRange.max) {
       if (transportSnapshot.status === 'playing' || transportSnapshot.status === 'loading') transport.setTempo(nextBpm)
       setActionError(null)
+    }
+  }
+
+  const handleCustomBeatReferenceBpmChange = (value: string) => {
+    setCustomBeatReferenceBpmInput(value)
+    const nextReferenceBpm = Number(value)
+    if (!Number.isFinite(nextReferenceBpm) || nextReferenceBpm < 1) return
+
+    setCustomBeatReferenceBpm(nextReferenceBpm)
+    const nextRange = getTempoRange(preset.bpm, nextReferenceBpm)
+    const currentTempo = Number(bpm)
+    if (!nextRange) {
+      setTransportNote('The custom beat and scratch preset have no shared playback range. Correct the beat BPM or choose a different beat.')
+      return
+    }
+
+    if (Number.isFinite(currentTempo) && (currentTempo < nextRange.min || currentTempo > nextRange.max)) {
+      const clampedTempo = Math.min(nextRange.max, Math.max(nextRange.min, currentTempo))
+      setBpm(String(clampedTempo))
+      setTransportNote('Tempo moved to ' + clampedTempo + ' BPM, the nearest value supported by both recorded sources.')
+    } else {
+      setTransportNote('Custom beat recorded BPM corrected to ' + nextReferenceBpm + '. Both layers continue to follow the Tempo setting.')
     }
   }
 
@@ -1405,22 +1547,51 @@ export default function App() {
 
   const handleResetSessionControls = () => {
     const defaults = sourceControlDefaultsRef.current
-    const resetBpm = String(defaults.bpm)
+    const customRange = customBeatSelected && customBeatReferenceBpm !== null
+      ? getTempoRange(preset.bpm, customBeatReferenceBpm)
+      : null
+    const resetBpmValue = customRange
+      ? Math.min(customRange.max, Math.max(customRange.min, customBeatReferenceBpm ?? defaults.bpm))
+      : defaults.bpm
+    const resetBpm = String(resetBpmValue)
     setBpm(resetBpm)
     setPitchSemitones(0)
     setSampleVolume(defaults.sampleVolume)
     setBeatVolume(defaults.beatVolume)
-    if (transportSnapshot.status === 'playing' || transportSnapshot.status === 'loading') transport.setTempo(defaults.bpm)
+    if (transportSnapshot.status === 'playing' || transportSnapshot.status === 'loading') transport.setTempo(resetBpmValue)
     transport.setPitchSemitones(0)
     transport.setSampleVolume(defaults.sampleVolume)
     transport.setBeatVolume(defaults.beatVolume)
     setActionError(null)
-    setTransportNote('Controls reset to the selected preset defaults. Playback continues.')
+    setTransportNote(customRange
+      ? 'Controls reset. Practice tempo is ' + resetBpmValue + ' BPM for the selected custom beat. Playback continues.'
+      : 'Controls reset to the selected preset defaults. Playback continues.')
   }
 
   const handleBeatSelectionChange = (value: string) => {
-    if (isPlaybackLockedNow() || value === selectedBeatIndex) return
+    if (isPlaybackLockedNow() || isCustomBeatAnalysisBusy) return
+    if (value === 'custom') {
+      if (!customBeatFile || !customBeatBuffer || customBeatReferenceBpm === null) return
+      const range = getTempoRange(preset.bpm, customBeatReferenceBpm)
+      if (!range) return
+      const target = Math.min(range.max, Math.max(range.min, customBeatReferenceBpm))
+      setCustomBeatSelected(true)
+      setBpm(String(target))
+      setActionError(null)
+      setTransportNote('Custom beat selected. Practice tempo set to ' + target + ' BPM; playback has not started.')
+      return
+    }
+    if (value === selectedBeatIndex && !customBeatSelected) return
+    const range = getTempoRange(preset.bpm)
+    const currentTempo = Number(bpm)
+    if (range && Number.isFinite(currentTempo)) {
+      const target = Math.min(range.max, Math.max(range.min, currentTempo))
+      if (target !== currentTempo) setBpm(String(target))
+    }
     setSelectedBeatIndex(value)
+    setCustomBeatSelected(false)
+    setActionError(null)
+    setTransportNote(value === 'none' ? 'No beat bed selected.' : 'Built-in beat selected. Playback has not started.')
   }
 
   const handleTtmGuideChange = (sampleId: string, selection: string) => {
@@ -1633,12 +1804,18 @@ export default function App() {
   }
 
   const startPlayback = (playFixture: Fixture, target: PlaybackTarget, includeBeat: boolean) => {
-    if (!isPresetReady || isReadingPreset || isGenerating || isPlaybackLockedNow()) return
+    if (!isPresetReady || isReadingPreset || isGenerating || isCustomBeatAnalysisBusy || isPlaybackLockedNow()) return
     const bpmValue = Number(bpm)
-    const minBpm = Math.max(1, preset.bpm * 0.5)
-    const maxBpm = Math.max(minBpm, preset.bpm * 2)
-    if (!Number.isFinite(bpmValue) || bpmValue < minBpm || bpmValue > maxBpm) {
-      setActionError('BPM must stay between ' + minBpm + ' and ' + maxBpm + ' for this preset.')
+    const beatReferenceBpm = includeBeat && customBeatSelected ? customBeatReferenceBpm : null
+    const tempoRange = getTempoRange(preset.bpm, beatReferenceBpm)
+    if (includeBeat && customBeatSelected && (!customBeatReferenceInputValid || !customBeatBuffer)) {
+      setActionError('Enter a valid recorded BPM for the custom beat before playback.')
+      setTransportNote('Playback needs a valid custom beat BPM.')
+      return
+    }
+    if (!tempoRange || !Number.isFinite(bpmValue) || bpmValue < tempoRange.min || bpmValue > tempoRange.max) {
+      const rangeText = tempoRange ? tempoRange.min + '–' + tempoRange.max : 'no shared'
+      setActionError('Tempo must stay within ' + rangeText + ' BPM for the selected audio sources.')
       setTransportNote('Playback needs a valid BPM value.')
       return
     }
@@ -1655,6 +1832,9 @@ export default function App() {
       sampleVolume,
       beatVolume,
       ...(includeBeat && selectedBeatFile ? { beatFile: selectedBeatFile } : {}),
+      ...(includeBeat && customBeatSelected && customBeatBuffer && beatReferenceBpm !== null
+        ? { beatBuffer: customBeatBuffer, beatReferenceBpm }
+        : {}),
     }
     if (target?.kind === 'sequence' && presetFileName) {
       if (autoGenerate) {
@@ -1723,7 +1903,7 @@ export default function App() {
   }
 
   const handlePlaySequence = () => {
-    if (!fixture || !isPresetReady || isPlaybackLockedNow()) return
+    if (!fixture || !isPresetReady || isCustomBeatAnalysisBusy || isPlaybackLockedNow()) return
     if (autoGenerateBlocked) {
       const message = 'Auto-generate needs local WAV files for: ' + autoGenerateMissingSampleNames.join(', ') + '.'
       setActionError(message)
@@ -1756,7 +1936,7 @@ export default function App() {
     setTransportNote('Playback stopped.')
   }
 
-  const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating || isPlaybackLocked || autoGenerateBlocked
+  const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating || isCustomBeatAnalysisBusy || isPlaybackLocked || autoGenerateBlocked || !customBeatReferenceInputValid || !sessionTempoValid
   const stopDisabled = transportSnapshot.status !== 'playing' && transportSnapshot.status !== 'loading'
   const isSequencePlaying = playbackTarget?.kind === 'sequence' && transportSnapshot.status === 'playing'
   const displayedProgress = transportSnapshot.status === 'playing' ? presentation?.progress : undefined
@@ -1837,6 +2017,7 @@ export default function App() {
             />
           )}
           {isPlaybackLocked && <p className="playback-lock-note" role="status">Stop playback to change combo options or sample settings.</p>}
+          {isCustomBeatAnalysisBusy && <p className="playback-lock-note" role="status">Custom beat is loading locally. Playback will stay stopped until analysis finishes.</p>}
           <div className="transport-row">
             <div className="transport-actions">
               <button className="button button--play" type="button" onClick={handlePlaySequence} disabled={playDisabled || isReadingPreset}>
@@ -1916,13 +2097,26 @@ export default function App() {
           beatFiles={preset.beatFiles}
           beatResolutions={assetResolution?.beats}
           selectedBeatIndex={selectedBeatIndex}
-          disabled={!isPresetReady || isReadingPreset || isGenerating || isSavingIni}
-          beatSelectionDisabled={isPlaybackLocked}
+          customBeatFileName={customBeatFile?.name ?? null}
+          customBeatSelected={customBeatSelected}
+          customBeatReferenceBpm={customBeatReferenceBpm}
+          customBeatReferenceBpmInput={customBeatReferenceBpmInput}
+          customBeatAnalysisStatus={customBeatAnalysisStatus}
+          customBeatCandidateFileName={customBeatCandidate?.file.name ?? null}
+          customBeatCandidateBpm={customBeatCandidateBpm}
+          customBeatCandidateMessage={customBeatAnalysisMessage}
+          customBeatCandidateReady={Boolean(customBeatCandidate?.buffer)}
+          disabled={!isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy}
+          beatSelectionDisabled={isPlaybackLocked || isCustomBeatAnalysisBusy}
           onBpmChange={handleBpmChange}
           onPitchChange={handlePitchChange}
           onSampleVolumeChange={handleSampleVolumeChange}
           onBeatVolumeChange={handleBeatVolumeChange}
           onBeatSelectionChange={handleBeatSelectionChange}
+          onCustomBeatFileChange={handleCustomBeatFileChange}
+          onCustomBeatCandidateBpmChange={setCustomBeatCandidateBpm}
+          onUseCustomBeat={handleUseCustomBeat}
+          onCustomBeatReferenceBpmChange={handleCustomBeatReferenceBpmChange}
           onReset={handleResetSessionControls}
         />
 

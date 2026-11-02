@@ -15,7 +15,7 @@ interface FakeKeepAliveRecord {
   readonly stopTimes: number[];
 }
 
-function makeBuffer(duration = 0.2, sampleRate = 1_000): AudioBuffer {
+function makeBuffer(duration = 0.2, sampleRate = 48_000): AudioBuffer {
   const length = Math.max(1, Math.round(duration * sampleRate));
   const channel = new Float32Array(length);
   return {
@@ -67,7 +67,7 @@ function makeFakeAudioContext(decodeAudioData?: (data: ArrayBuffer) => Promise<A
       contextTime: fixedOutputContextTime ?? Math.max(0, currentTime - outputLatencySeconds),
       performanceTime: globalThis.performance.now(),
     })),
-    sampleRate: 1_000,
+    sampleRate: 48_000,
     destination: {} as AudioNode,
     resume: vi.fn(async () => { state = "running"; }),
     close: vi.fn(async () => { state = "closed"; }),
@@ -164,6 +164,33 @@ const fixture: Fixture = {
   ],
   totalUnits: 12,
 };
+
+function makeBeatFile(name: string): File {
+  const bytes = new ArrayBuffer(46);
+  const view = new DataView(bytes);
+  const writeAscii = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+  };
+  writeAscii(0, "RIFF");
+  view.setUint32(4, bytes.byteLength - 8, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, 48_000, true);
+  view.setUint32(28, 96_000, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, 2, true);
+  return {
+    name,
+    type: "audio/wav",
+    size: bytes.byteLength,
+    arrayBuffer: vi.fn(async () => bytes.slice(0)),
+  } as unknown as File;
+}
 
 describe("AudioTransport", () => {
   it("schedules requested source times from the context clock", async () => {
@@ -461,10 +488,7 @@ describe("AudioTransport", () => {
   it("loops an optional beat buffer only through the finite fixture duration", async () => {
     const fake = makeFakeAudioContext();
     const { transport } = makeTransport(fake.context);
-    const beatFile = {
-      name: "beat.wav",
-      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
-    } as unknown as File;
+    const beatFile = makeBeatFile("beat.wav");
 
     await transport.play({
       fixture: { events: [fixture.events[0]!], totalUnits: 4 },
@@ -485,10 +509,7 @@ describe("AudioTransport", () => {
   it("plays a legacy raw-tick fixture with an optional looping beat through the recovered finite length", async () => {
     const fake = makeFakeAudioContext();
     const { transport, runScheduler } = makeTransport(fake.context);
-    const beatFile = {
-      name: "beat.wav",
-      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
-    } as unknown as File;
+    const beatFile = makeBeatFile("beat.wav");
     const legacyFixture: Fixture = {
       events: [
         { id: "first", sampleId: "synthPulse", startUnits: 0, durationUnits: 64, silent: false },
@@ -564,10 +585,7 @@ describe("AudioTransport", () => {
   it("keeps one beat source looping across cycle boundaries until Stop", async () => {
     const fake = makeFakeAudioContext();
     const { transport, runScheduler } = makeTransport(fake.context);
-    const beatFile = {
-      name: "looping-beat.wav",
-      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
-    } as unknown as File;
+    const beatFile = makeBeatFile("looping-beat.wav");
 
     await transport.playCyclePlan({
       slots: [{ kind: "fixture", fixture: { events: [fixture.events[0]!], totalUnits: 4 } }],
@@ -597,10 +615,7 @@ describe("AudioTransport", () => {
   it("generates distinct plans after full audible and silent rounds without restarting the beat bed", async () => {
     const fake = makeFakeAudioContext();
     const { transport, runScheduler } = makeTransport(fake.context);
-    const beatFile = {
-      name: "auto-generate-beat.wav",
-      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
-    } as unknown as File;
+    const beatFile = makeBeatFile("auto-generate-beat.wav");
     const fixtureFor = (id: string, sampleId: string): Fixture => ({
       events: [{ id, sampleId, startUnits: 0, durationUnits: 4, silent: false }],
       totalUnits: 4,
@@ -1017,10 +1032,7 @@ describe("AudioTransport", () => {
   it("finishes the current full round before reporting a synchronous provider failure", async () => {
     const fake = makeFakeAudioContext();
     const { transport, runScheduler } = makeTransport(fake.context);
-    const beatFile = {
-      name: "provider-error-beat.wav",
-      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
-    } as unknown as File;
+    const beatFile = makeBeatFile("provider-error-beat.wav");
     const oneRound: Fixture = {
       events: [{ id: "round-hit", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
       totalUnits: 4,
@@ -1103,10 +1115,7 @@ describe("AudioTransport", () => {
       name: `${id}.wav`,
       arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
     } as unknown as File] as const));
-    const beatFile = {
-      name: "bounded-beat.wav",
-      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
-    } as unknown as File;
+    const beatFile = makeBeatFile("bounded-beat.wav");
     const initialFixture: Fixture = {
       events: [{ id: "current", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
       totalUnits: 4,
@@ -1137,10 +1146,7 @@ describe("AudioTransport", () => {
     const fake = makeFakeAudioContext();
     const processor = makeProcessor();
     const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
-    const beatFile = {
-      name: "auto-tempo-beat.wav",
-      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
-    } as unknown as File;
+    const beatFile = makeBeatFile("auto-tempo-beat.wav");
     const fixtureFor = (id: string, sampleId: string): Fixture => ({
       events: [{ id, sampleId, startUnits: 0, durationUnits: 16, silent: false }],
       totalUnits: 16,
@@ -1280,10 +1286,7 @@ describe("AudioTransport", () => {
     });
     const nextPlan = vi.fn(() => ({ slots: [{ kind: "fixture" as const, fixture: fixtureFor("catch-up") }] }));
     const onPlanBoundary = vi.fn();
-    const beatFile = {
-      name: "catch-up-beat.wav",
-      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
-    } as unknown as File;
+    const beatFile = makeBeatFile("catch-up-beat.wav");
 
     await transport.playCyclePlan({
       slots: [{ kind: "fixture", fixture: fixtureFor("initial-catch-up") }],
@@ -1310,10 +1313,7 @@ describe("AudioTransport", () => {
   it("changes sample and beat gain independently without restarting either source", async () => {
     const fake = makeFakeAudioContext();
     const { transport } = makeTransport(fake.context);
-    const beatFile = {
-      name: "levels-beat.wav",
-      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
-    } as unknown as File;
+    const beatFile = makeBeatFile("levels-beat.wav");
 
     await transport.playCyclePlan({
       slots: [{ kind: "fixture", fixture: { events: [fixture.events[0]!], totalUnits: 4 } }],
@@ -1340,10 +1340,7 @@ describe("AudioTransport", () => {
     const fake = makeFakeAudioContext();
     const processor = makeProcessor();
     const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
-    const beatFile = {
-      name: "tempo-beat.wav",
-      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
-    } as unknown as File;
+    const beatFile = makeBeatFile("tempo-beat.wav");
     const tempoFixture: Fixture = {
       events: [
         { id: "start", sampleId: "synthPulse", startUnits: 0, durationUnits: 2, silent: false },
@@ -1394,6 +1391,52 @@ describe("AudioTransport", () => {
     expect(beatSource?.startTimes).toEqual([0.05]);
     expect(beatSource?.node.playbackRate.value).toBeCloseTo(100 / 85);
     transport.stop();
+    transport.dispose();
+  });
+
+  it("keeps scratch and custom beat pitch neutral with independent tempo references", async () => {
+    const fake = makeFakeAudioContext();
+    const sampleProcessor = makeProcessor();
+    const beatProcessor = makeProcessor();
+    const processors = [sampleProcessor, beatProcessor];
+    const { transport } = makeTransport(fake.context, async () => processors.shift()!.node);
+    const beatBuffer = makeBuffer(1, 48_000);
+
+    await transport.play({
+      fixture,
+      referenceBpm: 85,
+      beatReferenceBpm: 120,
+      bpm: 100,
+      pitchSemitones: 0,
+      beatBuffer,
+    });
+
+    const beatSource = fake.sources.find(({ node }) => node.loop);
+    const sampleSource = fake.sources.find(({ node }) => !node.loop);
+    expect(sampleProcessor.playbackRate.value).toBeCloseTo(100 / 85);
+    expect(sampleSource?.node.playbackRate.value).toBeCloseTo(100 / 85);
+    expect(beatProcessor.playbackRate.value).toBeCloseTo(100 / 120);
+    expect(beatSource?.node.playbackRate.value).toBeCloseTo(100 / 120);
+    expect(sampleProcessor.pitchSemitones.value).toBe(0);
+    expect(beatProcessor.pitchSemitones.value).toBe(0);
+    expect(fake.gains[0]?.connect).toHaveBeenCalledWith(sampleProcessor.node);
+    expect(fake.gains[1]?.connect).toHaveBeenCalledWith(beatProcessor.node);
+    expect(fake.keepAliveSources).toHaveLength(2);
+
+    transport.setTempo(105);
+    transport.setPitchSemitones(3);
+
+    expect(sampleProcessor.playbackRate.value).toBeCloseTo(105 / 85);
+    expect(fake.sources.filter(({ node }) => !node.loop).at(-1)?.node.playbackRate.value).toBeCloseTo(105 / 85);
+    expect(beatProcessor.playbackRate.value).toBeCloseTo(105 / 120);
+    expect(beatSource?.node.playbackRate.value).toBeCloseTo(105 / 120);
+    expect(sampleProcessor.pitchSemitones.value).toBe(3);
+    expect(beatProcessor.pitchSemitones.value).toBe(3);
+    expect(fake.keepAliveSources.map(({ stopTimes }) => stopTimes.at(-1))).toEqual([
+      fake.keepAliveSources[0]?.stopTimes.at(-1),
+      fake.keepAliveSources[0]?.stopTimes.at(-1),
+    ]);
+
     transport.dispose();
   });
 

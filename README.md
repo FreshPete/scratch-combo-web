@@ -29,6 +29,12 @@ The timeline defaults to **Waveform** and draws envelopes from decoded, locally 
 
 While audio is loading or playing (including sample audition), controls that change the preset, sample eligibility, combo length, mode, or generation cadence are locked. Stop unlocks them. Live tempo, pitch, gains, Reset controls, and the visual timeline-view switch remain available. Pause and native timer behavior are not implemented.
 
+## Your own beat
+
+In Session controls, choose a WAV or MP3 beat without replacing the selected scratch-sample preset. The file stays in browser memory for the current session. Local BPM analysis offers an estimate; check it by listening and correct the recorded BPM when needed. Half-time and double-time readings are possible, and tracks with weak or changing rhythm may require a manual value.
+
+The beat and scratch library retain separate recorded tempos and follow the same practice BPM. Tempo, pitch, and the separate beat/sample levels remain live controls. Beat replacement is locked during playback; Stop before choosing another file or returning to a built-in beat. Custom beats are not included in saved legacy INI files.
+
 ## Deployment
 
 The project is configured for GitHub Pages at [freshpete.github.io/scratch-combo-web](https://freshpete.github.io/scratch-combo-web/). The Pages workflow builds and publishes the static app when changes are pushed to `main`. See [hosting and preset setup](docs/hosting.md) for deployment details and local preset setup.

@@ -88,11 +88,16 @@ const presetHarness = vi.hoisted(() => ({
   loaded: undefined as unknown,
 }))
 
+const bpmHarness = vi.hoisted(() => ({
+  analyzeLocalAudioFile: vi.fn(),
+}))
+
 const waveformHarness = vi.hoisted(() => ({
   loadWaveform: vi.fn(async (_file: File): Promise<unknown> => null),
 }))
 
 vi.mock('./audio', () => ({
+  analyzeLocalAudioFile: bpmHarness.analyzeLocalAudioFile,
   AudioTransport: class {
     subscribe = audioHarness.subscribe
     getSnapshot = audioHarness.getSnapshot
@@ -176,6 +181,7 @@ function selectDemoPreset() {
 
 beforeEach(() => {
   audioHarness.reset()
+  bpmHarness.analyzeLocalAudioFile.mockReset()
   vi.mocked(domain.generateLegacyCombo).mockReset()
   if (defaultLegacyGenerator) vi.mocked(domain.generateLegacyCombo).mockImplementation(defaultLegacyGenerator)
   presetHarness.fetchBuiltInPresetCatalog.mockReset()
@@ -210,10 +216,16 @@ beforeEach(() => {
     ...(presetHarness.loaded as object),
     iniFile: new File([builtinIni], entry.iniFile, { type: 'text/plain' }),
   }))
+  class TestAudioContext {
+    state: AudioContextState = 'running'
+    close = vi.fn(async () => { this.state = 'closed' as AudioContextState })
+  }
+  vi.stubGlobal('AudioContext', TestAudioContext)
 })
 afterEach(async () => {
   cleanup()
   vi.unstubAllEnvs()
+  vi.unstubAllGlobals()
   await Promise.resolve()
 })
 
@@ -1264,5 +1276,147 @@ describe('workspace import and transport lifecycle', () => {
     expect(playOptions.assets.get('Sample02')).toBe(positiveWav)
     expect(playOptions.assets.has('Sample01')).toBe(false)
     expect(playOptions.unitsPerBeat).toBe(16)
+  })
+
+  it('reviews a locally analyzed custom beat, keeps it separate from scratch BPM, and never autoplays', async () => {
+    const beatBuffer = { duration: 6 } as AudioBuffer
+    bpmHarness.analyzeLocalAudioFile.mockResolvedValue({
+      buffer: beatBuffer,
+      detection: { status: 'detected', bpm: 110, confidence: 0.78, alternatives: [55] },
+      durationSeconds: 6,
+      sampleRate: 44100,
+      channelCount: 2,
+    })
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    const beat = new File(['local beat'], 'club-loop.mp3', { type: 'audio/mpeg' })
+    chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [beat])
+
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    expect(await screen.findByText(/club-loop\.mp3: estimated 110 BPM/)).toBeInTheDocument()
+    expect(screen.getByLabelText('BPM')).toHaveValue(85)
+    expect(audioHarness.play).not.toHaveBeenCalled()
+    expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    expect(screen.getByLabelText('BPM')).toHaveValue(110)
+    expect(screen.getByLabelText('Recorded BPM for custom beat')).toHaveValue(110)
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+    expect(audioHarness.play).not.toHaveBeenCalled()
+    expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Preview Bundled kick' }))
+    await waitFor(() => expect(audioHarness.play).toHaveBeenCalledTimes(1))
+    const samplePreviewOptions = audioHarness.play.mock.calls[0]?.[0] as Record<string, unknown>
+    expect(samplePreviewOptions).toHaveProperty('referenceBpm', 85)
+    expect(samplePreviewOptions).not.toHaveProperty('beatReferenceBpm')
+    expect(samplePreviewOptions).not.toHaveProperty('beatBuffer')
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+    const options = audioHarness.playCyclePlan.mock.calls[0]?.[0] as {
+      referenceBpm: number
+      beatReferenceBpm: number
+      beatBuffer: AudioBuffer
+      assets: ReadonlyMap<string, File>
+    }
+    expect(options.referenceBpm).toBe(85)
+    expect(options.beatReferenceBpm).toBe(110)
+    expect(options.beatBuffer).toBe(beatBuffer)
+    expect(options.assets.has('Sample01')).toBe(true)
+    expect(screen.getByLabelText('Upload custom beat')).toBeDisabled()
+    expect(screen.getByLabelText('Recorded BPM for custom beat')).toBeDisabled()
+    expect(screen.getByLabelText('BPM')).toBeEnabled()
+  })
+
+  it('keeps an accepted custom beat selected across a built-in sample preset change', async () => {
+    const beatBuffer = { duration: 6 } as AudioBuffer
+    bpmHarness.analyzeLocalAudioFile.mockResolvedValue({
+      buffer: beatBuffer,
+      detection: { status: 'detected', bpm: 120, confidence: 0.7, alternatives: [] },
+      durationSeconds: 6,
+      sampleRate: 44100,
+      channelCount: 2,
+    })
+    const original = presetHarness.loaded as { preset: domain.Preset; audioFiles: File[]; iniText: string }
+    const preset96 = domain.parseLegacyIni(samplePreset('96 BPM replacement', 'Replacement kick', 'kick.wav')
+      .replace('BPM01=100', 'BPM01=96')
+      .replace('SampleRepeatMax=2', 'SampleRepeatMax=512'))
+    presetHarness.loadBuiltInPreset.mockImplementation(async (entry: { iniFile: string }) => ({
+      ...original,
+      preset: entry.iniFile.includes('096BPM2') ? preset96 : original.preset,
+      iniFile: new File([original.iniText], entry.iniFile, { type: 'text/plain' }),
+    }))
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['beat'], '120-loop.wav', { type: 'audio/wav' })])
+    await screen.findByText(/estimated 120 BPM/)
+    fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
+
+    fireEvent.change(screen.getByLabelText('Quick preset'), { target: { value: 'SSC-096BPM2-01' } })
+    await screen.findByText(/96 BPM Set 2 ready/, { selector: 'p' })
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    expect(screen.getByLabelText('Recorded BPM for custom beat')).toHaveValue(120)
+    expect(screen.getByLabelText('BPM')).toHaveValue(120)
+    expect(screen.getByText(/scratch source 96 · beat source 120/)).toBeInTheDocument()
+    expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+    const options = audioHarness.playCyclePlan.mock.calls[0]?.[0] as {
+      referenceBpm: number
+      beatReferenceBpm: number
+      beatBuffer: AudioBuffer
+      assets: ReadonlyMap<string, File>
+    }
+    expect(options.referenceBpm).toBe(96)
+    expect(options.beatReferenceBpm).toBe(120)
+    expect(options.beatBuffer).toBe(beatBuffer)
+    expect(options.assets.has('Sample01')).toBe(true)
+    expect(within(screen.getByRole('table')).getByText('Replacement kick')).toBeInTheDocument()
+  })
+
+  it('keeps the current beat after an invalid custom beat and asks for a BPM when detection is ambiguous', async () => {
+    const beatBuffer = { duration: 6 } as AudioBuffer
+    bpmHarness.analyzeLocalAudioFile
+      .mockResolvedValueOnce({
+        buffer: beatBuffer,
+        detection: { status: 'detected', bpm: 100, confidence: 0.72, alternatives: [] },
+        durationSeconds: 6,
+        sampleRate: 44100,
+        channelCount: 2,
+      })
+      .mockRejectedValueOnce(new Error('Unsupported audio encoding.'))
+      .mockResolvedValueOnce({
+        buffer: { duration: 4 } as AudioBuffer,
+        detection: { status: 'ambiguous', candidates: [80, 160], confidence: 0.41 },
+        durationSeconds: 4,
+        sampleRate: 44100,
+        channelCount: 2,
+      })
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['beat'], 'good.wav', { type: 'audio/wav' })])
+    await screen.findByText(/estimated 100 BPM/)
+    fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
+
+    chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['broken'], 'broken.mp3', { type: 'audio/mpeg' })])
+    expect(await screen.findByText(/Could not analyze broken\.mp3/)).toBeInTheDocument()
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    expect(screen.getByLabelText('Recorded BPM for custom beat')).toHaveValue(100)
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+
+    chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['ambiguous'], 'ambiguous.wav', { type: 'audio/wav' })])
+    expect(await screen.findByText(/pulse is ambiguous/)).toHaveTextContent('80, 160 BPM')
+    expect(screen.getByRole('button', { name: 'Use custom beat' })).toBeDisabled()
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Custom beat BPM' }), { target: { value: '160' } })
+    expect(screen.getByRole('button', { name: 'Use custom beat' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    expect(screen.getByLabelText('Recorded BPM for custom beat')).toHaveValue(160)
+    expect(screen.getByLabelText('BPM')).toHaveValue(160)
   })
 })

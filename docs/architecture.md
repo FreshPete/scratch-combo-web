@@ -32,5 +32,13 @@ Session controls keep BPM, semitone pitch, sample gain, and beat gain independen
 
 For imported INIs, the UI exposes the native seven editable sample fields and, in local development only, a separate session-only TTM guide selector in the selected sample editor. A row save validates through the domain writer and updates only in-memory sample data, clearing the generated combo so it must be regenerated. Save Sample Data patches the original INI text, preserving unchanged comments, order, unknown keys, stable row IDs, recorded BPM01, beat references, and source paths while including current sample and beat levels; guide selections remain outside that patch. The output is a user-selected Save As target or a `*-edited.ini` download fallback. The source file is never implicitly opened for writing.
 
+## Custom beat boundary
+
+Custom WAV and MP3 beats are independent of the scratch-sample preset and its asset-resolution index. A file is analyzed locally as a candidate; the user reviews or corrects its recorded BPM and explicitly applies it. The current beat remains selected until application succeeds. Files and decoded buffers are session-only, are not uploaded, and are excluded from legacy INI exports. Replacement and recorded-BPM editing are locked during playback; target tempo, pitch, gains, and Reset remain live.
+
+Analysis uses at most the first 120 seconds and can report an estimate, an ambiguous rhythm, or insufficient rhythmic evidence. Manual BPM is available for all outcomes. Input is bounded to 64 MiB, ten minutes, and 60 million decoded channel samples, with container preflight and decoded-buffer checks. These limits bound supported input and do not guarantee a browser's internal decoder allocation.
+
+The transport accepts a separate beat reference BPM. Scratch events use the preset's recorded BPM; a custom beat uses its confirmed recorded BPM. When those references differ, separate SoundTouch paths apply matching source/processor rates to keep each layer's tempo and pitch controls independent. The target practice tempo stays within the intersection of each source's supported 0.5–2× range. Presentation timing retains the measured processor-delay estimate rather than claiming exact physical onset alignment.
+
 Pause and physical onset accuracy remain unverified. The source preset and audio assets are not modified.
 

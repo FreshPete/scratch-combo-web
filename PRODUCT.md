@@ -29,6 +29,7 @@ The current workspace targets Chrome and Edge on Windows 11. A user selects an I
 ## Capabilities and Constraints
 
 - INI and WAV files are read through the browser File API and remain in session memory; the application makes no upload request.
+- A custom WAV or MP3 beat can be selected independently of the active sample preset. The browser estimates its BPM locally and asks the user to review or enter the recorded BPM before applying it; ambiguous estimates are not presented as certain. The beat and scratch source BPM values remain separate, and the session tempo keeps both layers synchronized within their supported playback ranges. Custom beat files and decoded audio remain in the open session only and are never uploaded.
 - Imported combos use recovered weighted, direction, and repeat selection rules; lengths use 16 legacy ticks per quarter-note beat, and each generated fixture retains the requested raw tick window.
 - Browser random draws are quantized to 24 bits and do not recreate the original VB6 time-seeded stream. Web Audio follows an exact BPM clock rather than Windows timer intervals and jitter.
 - The built-in demo uses a deterministic finite fixture. Imported combos default to Q&A practice: one combo cycle with sample audio, then one silent answer cycle. Large pause changes that to three silent answer cycles. Loop plays the same combo every cycle. Cycle playback continues until Stop, keeps any beat bed continuous, and advances the visible timeline through silent cycles.

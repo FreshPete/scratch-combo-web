@@ -9,6 +9,7 @@ import {
   type FixtureTimeline,
 } from "./timeline";
 import { createTempoPitchProcessor, type TempoPitchProcessorFactory, type TempoPitchProcessorNode } from "./TempoPitchProcessor";
+import { decodeLocalAudioFile, validateLocalAudioBuffer } from "./beatAnalysis";
 
 export type TransportStatus = "idle" | "loading" | "playing" | "completed" | "error" | "disposed";
 
@@ -50,6 +51,8 @@ export interface PlayOptions {
   readonly fixture: Fixture;
   /** Imported preset's original BPM. Live tempo scales from this reference. */
   readonly referenceBpm?: number;
+  /** Selected beat track's original BPM. Defaults to the scratch reference BPM. */
+  readonly beatReferenceBpm?: number;
   readonly bpm: number;
   /** Independent pitch shift in semitones. Defaults to zero. */
   readonly pitchSemitones?: number;
@@ -59,6 +62,8 @@ export interface PlayOptions {
   readonly assets?: ReadonlyMap<string, File>;
   /** Optional local beat WAV. It loops gaplessly through the run. */
   readonly beatFile?: File;
+  /** Optional beat buffer already decoded and validated by `analyzeLocalAudioFile`. */
+  readonly beatBuffer?: AudioBuffer;
   /** Optional 0–100 percent volume from the normalized preset model. */
   readonly beatVolume?: number;
   /** Optional 0–100 percent volume from the normalized preset model. */
@@ -129,16 +134,22 @@ interface ActivePlayback {
   readonly sampleGain: GainNode;
   readonly beatGain?: GainNode;
   readonly beatSource?: AudioBufferSourceNode;
-  readonly keepAliveSource?: ConstantSourceNode;
+  readonly keepAliveSources: readonly ConstantSourceNode[];
   drainEndAt?: number;
+  /** Processor for combo samples; also processes the beat when both tempo ratios match. */
   readonly processor?: TempoPitchProcessorNode;
+  /** Dedicated beat processor used only when beat and scratch reference tempi differ. */
+  readonly beatProcessor?: TempoPitchProcessorNode;
   readonly presentationDelaySeconds: number;
   presentationEpochs: PresentationEpoch[];
   pendingPresentationBoundaries: PendingPresentationBoundary[];
   lastOutputContextTime: number;
   hasPresentedStart: boolean;
   readonly referenceBpm?: number;
+  readonly sampleReferenceBpm: number;
+  readonly beatReferenceBpm: number;
   tempoRatio: number;
+  beatTempoRatio: number;
   pitchSemitones: number;
   cycleIterationBase: number;
   dynamicCycle?: DynamicCyclePlayback;
@@ -218,11 +229,13 @@ export class AudioTransport {
   private generation = 0;
   private disposed = false;
   private fileBufferCache = new WeakMap<File, Promise<AudioBuffer>>();
+  private beatFileBufferCache = new WeakMap<File, Promise<AudioBuffer>>();
   private syntheticBufferCache = new Map<string, AudioBuffer>();
   private selectedSampleVolume = 1;
   private selectedBeatVolume = 1;
   private selectedBpm: number | undefined;
   private selectedReferenceBpm: number | undefined;
+  private selectedBeatReferenceBpm: number | undefined;
   private selectedPitchSemitones = 0;
   private readonly sources = new Set<AudioBufferSourceNode>();
   private readonly keepAliveSources = new Set<ConstantSourceNode>();
@@ -318,22 +331,31 @@ export class AudioTransport {
     const bpm = positiveBpm(value, "BPM");
     const playback = this.activePlayback;
     if (!playback) {
-      if (this.snapshot.status === "loading" && this.selectedReferenceBpm !== undefined) {
-        this.validateTempoRatio(bpm, this.selectedReferenceBpm);
+      if (this.snapshot.status === "loading"
+        && (this.selectedReferenceBpm !== undefined || this.selectedBeatReferenceBpm !== undefined)) {
+        if (this.selectedReferenceBpm !== undefined) this.validateTempoRatio(bpm, this.selectedReferenceBpm);
+        if (this.selectedBeatReferenceBpm !== undefined) this.validateTempoRatio(bpm, this.selectedBeatReferenceBpm);
         this.selectedBpm = bpm;
         return;
       }
-      throw new Error("Live tempo changes are available during playback of an imported preset.");
+      throw new Error("Live tempo changes require playback with a BPM reference.");
     }
-    if (!playback.processor || playback.referenceBpm === undefined) {
-      throw new Error("Live tempo changes require playback started with an imported preset BPM.");
+    if (!playback.processor && !playback.beatProcessor) {
+      throw new Error("Live tempo changes require playback started with a BPM reference.");
     }
 
-    const tempoRatio = this.validateTempoRatio(bpm, playback.referenceBpm);
+    const tempoRatio = this.validateTempoRatio(bpm, playback.sampleReferenceBpm);
+    const beatTempoRatio = this.validateTempoRatio(bpm, playback.beatReferenceBpm);
     this.selectedBpm = bpm;
     if (!playback.cyclePlan && playback.context.currentTime >= playback.finishAt) {
       playback.tempoRatio = tempoRatio;
-      setAudioParamValue(playback.processor.playbackRate, tempoRatio, playback.context.currentTime);
+      playback.beatTempoRatio = beatTempoRatio;
+      if (playback.processor) setAudioParamValue(playback.processor.playbackRate, tempoRatio, playback.context.currentTime);
+      if (playback.beatProcessor) setAudioParamValue(playback.beatProcessor.playbackRate, beatTempoRatio, playback.context.currentTime);
+      for (const source of this.sources) {
+        if (source === playback.beatSource) setAudioParamValue(source.playbackRate, beatTempoRatio, playback.context.currentTime);
+        else if (this.sampleSources.has(source)) setAudioParamValue(source.playbackRate, tempoRatio, playback.context.currentTime);
+      }
       return;
     }
     try {
@@ -350,21 +372,22 @@ export class AudioTransport {
   setPitchSemitones = (value: number): void => {
     const pitchSemitones = pitchValue(value);
     const playback = this.activePlayback;
-    if (playback?.processor) {
+    if (playback?.processor || playback?.beatProcessor) {
       this.selectedPitchSemitones = pitchSemitones;
       playback.pitchSemitones = pitchSemitones;
-      setAudioParamValue(playback.processor.pitchSemitones, pitchSemitones, playback.context.currentTime);
+      if (playback.processor) setAudioParamValue(playback.processor.pitchSemitones, pitchSemitones, playback.context.currentTime);
+      if (playback.beatProcessor) setAudioParamValue(playback.beatProcessor.pitchSemitones, pitchSemitones, playback.context.currentTime);
       return;
     }
     if (this.snapshot.status === "loading") {
-      if (pitchSemitones !== 0 && this.selectedReferenceBpm === undefined) {
-        throw new Error("Live pitch changes require playback started with an imported preset BPM.");
+      if (pitchSemitones !== 0 && this.selectedReferenceBpm === undefined && this.selectedBeatReferenceBpm === undefined) {
+        throw new Error("Live pitch changes require playback started with a BPM reference.");
       }
       this.selectedPitchSemitones = pitchSemitones;
       return;
     }
     if (this.snapshot.status === "playing" && pitchSemitones !== 0) {
-      throw new Error("Live pitch changes require playback started with an imported preset BPM.");
+      throw new Error("Live pitch changes require playback started with a BPM reference.");
     }
     this.selectedPitchSemitones = pitchSemitones;
   };
@@ -378,7 +401,7 @@ export class AudioTransport {
     this.cancelRun();
     const generation = this.generation;
     this.publish({ status: "loading", progress: 0 });
-    let pendingProcessor: TempoPitchProcessorNode | undefined;
+    const pendingProcessors: TempoPitchProcessorNode[] = [];
 
     try {
       let { timeline, cyclePlan } = createSchedule();
@@ -386,15 +409,25 @@ export class AudioTransport {
       const referenceBpm = options.referenceBpm === undefined
         ? undefined
         : positiveBpm(options.referenceBpm, "Reference BPM");
-      const playbackReferenceBpm = referenceBpm ?? bpm;
-      this.validateTempoRatio(bpm, playbackReferenceBpm);
+      const sampleReferenceBpm = referenceBpm ?? bpm;
+      const beatReferenceBpm = options.beatReferenceBpm === undefined
+        ? sampleReferenceBpm
+        : positiveBpm(options.beatReferenceBpm, "Beat reference BPM");
+      const initialTempoRatio = this.validateTempoRatio(bpm, sampleReferenceBpm);
+      const initialBeatTempoRatio = this.validateTempoRatio(bpm, beatReferenceBpm);
       const initialPitch = pitchValue(options.pitchSemitones ?? this.selectedPitchSemitones);
+      const hasBeat = Boolean(options.beatFile || options.beatBuffer);
+      if (options.beatFile && options.beatBuffer) {
+        throw new Error("Pass either a beat file or its decoded beat buffer, not both.");
+      }
+      if (options.beatBuffer) validateLocalAudioBuffer(options.beatBuffer);
       const dynamicCycleConfig = createDynamicCycleConfig(options);
       if (dynamicCycleConfig && !cyclePlan) {
         throw new Error("Auto-generate requires a cycle plan.");
       }
       this.selectedBpm = bpm;
       this.selectedReferenceBpm = referenceBpm;
+      this.selectedBeatReferenceBpm = options.beatReferenceBpm;
       this.selectedPitchSemitones = initialPitch;
       this.selectedSampleVolume = volumeValue(options.sampleVolume, "Sample volume");
       this.selectedBeatVolume = volumeValue(options.beatVolume, "Beat volume");
@@ -420,21 +453,29 @@ export class AudioTransport {
 
       // Call resume synchronously from Play, before awaiting any file reads or decodes.
       const resumePromise = context.state === "running" ? Promise.resolve() : context.resume();
-      const processorPromise = referenceBpm !== undefined || initialPitch !== 0
-        ? this.tempoPitchProcessorFactory(context).then((processor) => {
-          pendingProcessor = processor;
-          if (!this.isCurrent(generation)) disconnectNode(processor);
-          return processor;
-        })
-        : Promise.resolve(undefined);
+      const needsSampleProcessor = referenceBpm !== undefined
+        || initialPitch !== 0
+        || options.beatReferenceBpm !== undefined;
+      const needsSeparateBeatProcessor = hasBeat
+        && options.beatReferenceBpm !== undefined
+        && Math.abs(initialTempoRatio - initialBeatTempoRatio) > 1e-9;
+      const loadProcessor = (): Promise<TempoPitchProcessorNode> => this.tempoPitchProcessorFactory(context).then((processor) => {
+        pendingProcessors.push(processor);
+        if (!this.isCurrent(generation)) disconnectNode(processor);
+        return processor;
+      });
+      const processorPromise = Promise.all([
+        needsSampleProcessor ? loadProcessor() : Promise.resolve(undefined),
+        needsSeparateBeatProcessor ? loadProcessor() : Promise.resolve(undefined),
+      ]);
       const decodeJobs: AudioDecodeJob[] = [
         ...[...sampleIds].map((sampleId) => ({ kind: "sample" as const, sampleId })),
-        ...(options.beatFile ? [{ kind: "beat" as const, file: options.beatFile }] : []),
+        ...(options.beatFile && !options.beatBuffer ? [{ kind: "beat" as const, file: options.beatFile }] : []),
       ];
       const audioDecodePromise = mapWithConcurrency(decodeJobs, MAX_PARALLEL_AUDIO_DECODES, async (job): Promise<AudioDecodeResult> => {
         if (!this.isCurrent(generation)) throw new StalePlaybackError();
         if (job.kind === "beat") {
-          return { kind: "beat", buffer: await this.decodeFile(context, job.file) };
+          return { kind: "beat", buffer: await this.decodeBeatFile(context, job.file) };
         }
         const file = assets.get(job.sampleId);
         const buffer = file
@@ -443,24 +484,26 @@ export class AudioTransport {
         return { kind: "sample", sampleId: job.sampleId, buffer };
       }, () => this.isCurrent(generation));
 
-      const [decodedItems, processor] = await Promise.all([
+      const [decodedItems, processors] = await Promise.all([
         audioDecodePromise,
         resumePromise,
         processorPromise,
-      ]).then(([items, , worklet]) => [items, worklet] as const);
+      ]).then(([items, , worklets]) => [items, worklets] as const);
+      const [processor, dedicatedBeatProcessor] = processors;
 
       if (!this.isCurrent(generation)) {
-        if (processor) disconnectNode(processor);
+        for (const node of [processor, dedicatedBeatProcessor]) if (node) disconnectNode(node);
         return;
       }
 
       const sampleEntries = decodedItems.flatMap((item) => item.kind === "sample"
         ? [[item.sampleId, item.buffer] as const]
         : []);
-      const beatBuffer = decodedItems.find((item) => item.kind === "beat")?.buffer;
+      const beatBuffer = options.beatBuffer ?? decodedItems.find((item) => item.kind === "beat")?.buffer;
 
       const currentBpm = this.selectedBpm ?? bpm;
-      const tempoRatio = this.validateTempoRatio(currentBpm, playbackReferenceBpm);
+      const tempoRatio = this.validateTempoRatio(currentBpm, sampleReferenceBpm);
+      const beatTempoRatio = this.validateTempoRatio(currentBpm, beatReferenceBpm);
       const currentPitch = this.selectedPitchSemitones;
       if (currentBpm !== timeline.bpm) {
         timeline = cyclePlan
@@ -470,22 +513,33 @@ export class AudioTransport {
       }
 
       const buffers = new Map<string, AudioBuffer>(sampleEntries);
+      const processorsToConnect = new Set([processor, dedicatedBeatProcessor].filter(
+        (node): node is TempoPitchProcessorNode => node !== undefined,
+      ));
       if (processor) {
         setAudioParamValue(processor.playbackRate, tempoRatio, context.currentTime);
         setAudioParamValue(processor.pitchSemitones, currentPitch, context.currentTime);
-        processor.connect(context.destination);
-        this.outputNodes.add(processor);
       }
-      const output = processor ?? context.destination;
+      if (dedicatedBeatProcessor) {
+        setAudioParamValue(dedicatedBeatProcessor.playbackRate, beatTempoRatio, context.currentTime);
+        setAudioParamValue(dedicatedBeatProcessor.pitchSemitones, currentPitch, context.currentTime);
+      }
+      for (const node of processorsToConnect) {
+        node.connect(context.destination);
+        this.outputNodes.add(node);
+      }
+
+      const sampleOutput = processor ?? context.destination;
       const sampleGain = context.createGain();
       sampleGain.gain.value = this.selectedSampleVolume;
-      sampleGain.connect(output);
+      sampleGain.connect(sampleOutput);
       this.outputNodes.add(sampleGain);
 
       const startAt = context.currentTime + this.startDelaySeconds;
       const fixtureEndAt = startAt + timeline.totalSeconds;
+      const beatOutput = dedicatedBeatProcessor ?? processor ?? context.destination;
       const beat = beatBuffer
-        ? this.scheduleBeat(context, beatBuffer, startAt, cyclePlan ? undefined : fixtureEndAt, this.selectedBeatVolume, output, tempoRatio)
+        ? this.scheduleBeat(context, beatBuffer, startAt, cyclePlan ? undefined : fixtureEndAt, this.selectedBeatVolume, beatOutput, beatTempoRatio)
         : undefined;
       let finishAt = fixtureEndAt;
       let maxSampleDuration = 0;
@@ -496,12 +550,11 @@ export class AudioTransport {
         finishAt = Math.max(finishAt, startAt + event.offsetSeconds + buffer.duration / tempoRatio);
         maxSampleDuration = Math.max(maxSampleDuration, buffer.duration / tempoRatio);
       }
-      const drainEndAt = processor && !cyclePlan
+      const drainEndAt = processorsToConnect.size > 0 && !cyclePlan
         ? finishAt + SOUNDTOUCH_FINITE_DRAIN_SECONDS
         : undefined;
-      const keepAliveSource = processor
-        ? this.scheduleProcessorKeepAlive(context, processor, startAt, drainEndAt)
-        : undefined;
+      const keepAliveSources = [...processorsToConnect].map((node) =>
+        this.scheduleProcessorKeepAlive(context, node, startAt, drainEndAt));
 
       const playback: ActivePlayback = {
         generation,
@@ -515,9 +568,10 @@ export class AudioTransport {
         buffers,
         sampleGain,
         ...(beat ? { beatGain: beat.gain, beatSource: beat.source } : {}),
-        ...(keepAliveSource ? { keepAliveSource } : {}),
+        keepAliveSources,
         ...(processor ? { processor } : {}),
-        presentationDelaySeconds: processor ? SOUNDTOUCH_ESTIMATED_PRESENTATION_DELAY_SECONDS : 0,
+        ...(dedicatedBeatProcessor ? { beatProcessor: dedicatedBeatProcessor } : {}),
+        presentationDelaySeconds: processorsToConnect.size > 0 ? SOUNDTOUCH_ESTIMATED_PRESENTATION_DELAY_SECONDS : 0,
         presentationEpochs: [{
           effectiveAt: startAt,
           startAt,
@@ -529,7 +583,10 @@ export class AudioTransport {
         lastOutputContextTime: 0,
         hasPresentedStart: false,
         ...(referenceBpm === undefined ? {} : { referenceBpm }),
+        sampleReferenceBpm,
+        beatReferenceBpm,
         tempoRatio,
+        beatTempoRatio,
         pitchSemitones: currentPitch,
         cycleIterationBase: 0,
         ...(dynamicCycleConfig ? {
@@ -566,7 +623,7 @@ export class AudioTransport {
       this.intervalHandle = this.scheduleInterval(() => this.tick(generation), this.schedulerIntervalMs);
       this.tick(generation);
     } catch (error) {
-      if (pendingProcessor) disconnectNode(pendingProcessor);
+      for (const processor of pendingProcessors) disconnectNode(processor);
       if (!this.isCurrent(generation)) return;
       this.cancelRun();
       this.publish({ status: "error", progress: 0, error: describeError(error) });
@@ -584,6 +641,7 @@ export class AudioTransport {
     if (this.disposed) return;
     this.cancelRun();
     this.fileBufferCache = new WeakMap<File, Promise<AudioBuffer>>();
+    this.beatFileBufferCache = new WeakMap<File, Promise<AudioBuffer>>();
     this.syntheticBufferCache.clear();
     this.publish({ status: "idle", progress: 0 });
   };
@@ -593,6 +651,7 @@ export class AudioTransport {
     this.cancelRun();
     this.disposed = true;
     this.fileBufferCache = new WeakMap<File, Promise<AudioBuffer>>();
+    this.beatFileBufferCache = new WeakMap<File, Promise<AudioBuffer>>();
     this.syntheticBufferCache.clear();
     this.publish({ status: "disposed", progress: 0 });
     this.listeners.clear();
@@ -1176,6 +1235,16 @@ export class AudioTransport {
     return decoding;
   }
 
+  private decodeBeatFile(context: AudioContext, file: File): Promise<AudioBuffer> {
+    const cached = this.beatFileBufferCache.get(file);
+    if (cached) return cached;
+
+    const decoding = decodeLocalAudioFile(context, file);
+    this.beatFileBufferCache.set(file, decoding);
+    void decoding.catch(() => this.beatFileBufferCache.delete(file));
+    return decoding;
+  }
+
   private getSyntheticBuffer(context: AudioContext, sampleId: string): AudioBuffer {
     const cached = this.syntheticBufferCache.get(sampleId);
     if (cached) return cached;
@@ -1267,7 +1336,7 @@ export class AudioTransport {
   private validateTempoRatio(bpm: number, referenceBpm: number): number {
     const ratio = bpm / referenceBpm;
     if (!Number.isFinite(ratio) || ratio < 0.5 || ratio > 2) {
-      throw new Error(`BPM must stay between ${formatBpm(referenceBpm * 0.5)} and ${formatBpm(referenceBpm * 2)} for this preset.`);
+      throw new Error(`BPM must stay between ${formatBpm(referenceBpm * 0.5)} and ${formatBpm(referenceBpm * 2)} for this audio layer.`);
     }
     return ratio;
   }
@@ -1317,6 +1386,7 @@ export class AudioTransport {
       : rescaleFixtureTimeline(playback.timeline, bpm);
     if (playback.cyclePlan) playback.cyclePlan = playback.timeline as CyclePlanTimeline;
     playback.tempoRatio = tempoRatio;
+    playback.beatTempoRatio = this.validateTempoRatio(bpm, playback.beatReferenceBpm);
     playback.startAt = hadStarted
       ? now - positionUnits * playback.timeline.secondsPerUnit
       : playback.startAt;
@@ -1355,15 +1425,17 @@ export class AudioTransport {
       playback.maxSampleDuration = Math.max(playback.maxSampleDuration, scaledDuration);
     }
     playback.finishAt = finishAt;
-    if (playback.keepAliveSource) {
+    if (playback.keepAliveSources.length > 0) {
       if (playback.cyclePlan) {
         delete playback.drainEndAt;
       } else {
         playback.drainEndAt = finishAt + SOUNDTOUCH_FINITE_DRAIN_SECONDS;
-        try {
-          playback.keepAliveSource.stop(playback.drainEndAt);
-        } catch {
-          // The zero-input keep-alive may have ended during context shutdown.
+        for (const source of playback.keepAliveSources) {
+          try {
+            source.stop(playback.drainEndAt);
+          } catch {
+            // The zero-input keep-alive may have ended during context shutdown.
+          }
         }
       }
     }
@@ -1374,10 +1446,11 @@ export class AudioTransport {
       playback.dynamicCycle?.planIndex,
     );
 
-    setAudioParamValue(playback.processor!.playbackRate, tempoRatio, now);
+    if (playback.processor) setAudioParamValue(playback.processor.playbackRate, tempoRatio, now);
+    if (playback.beatProcessor) setAudioParamValue(playback.beatProcessor.playbackRate, playback.beatTempoRatio, now);
     for (const source of this.sources) {
       if (source === playback.beatSource) {
-        setAudioParamValue(source.playbackRate, tempoRatio, now);
+        setAudioParamValue(source.playbackRate, playback.beatTempoRatio, now);
       } else if (this.sampleSources.has(source)) {
         setAudioParamValue(source.playbackRate, tempoRatio, now);
       }
