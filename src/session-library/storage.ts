@@ -38,6 +38,9 @@ export interface SavedSessionData {
   largePause: boolean
   autoGenerate: boolean
   autoGenerateRounds: number
+  countInBars: 0 | 1 | 2
+  metronomeEnabled: boolean
+  metronomeVolume: number
   omittedZeroDurationCount: number
   presetFileName: string | null
   sourceIniText: string | null
@@ -302,6 +305,9 @@ export function validateSavedSessionData(value: unknown): SavedSessionData {
     || typeof candidate.largePause !== 'boolean'
     || typeof candidate.autoGenerate !== 'boolean'
     || !oneOf(candidate.autoGenerateRounds, [1, 2, 4, 8])
+    || !(candidate.countInBars === undefined || oneOf(candidate.countInBars, [0, 1, 2]))
+    || !(candidate.metronomeEnabled === undefined || typeof candidate.metronomeEnabled === 'boolean')
+    || !(candidate.metronomeVolume === undefined || integer(candidate.metronomeVolume, 0, 100))
     || !integer(candidate.omittedZeroDurationCount, 0, 8192)
     || !(candidate.presetFileName === null || string(candidate.presetFileName, 512))
     || !(candidate.sourceIniText === null || string(candidate.sourceIniText, MAX_INI_BYTES))
@@ -334,6 +340,9 @@ export function validateSavedSessionData(value: unknown): SavedSessionData {
   ]))
   const data = {
     ...candidate,
+    countInBars: candidate.countInBars === undefined ? 0 : candidate.countInBars,
+    metronomeEnabled: candidate.metronomeEnabled === undefined ? false : candidate.metronomeEnabled,
+    metronomeVolume: candidate.metronomeVolume === undefined ? 60 : candidate.metronomeVolume,
     presetBeatTrimId: candidate.presetBeatTrimId === undefined ? legacyPresetBeatTrimId : candidate.presetBeatTrimId,
     customBeatTrimId: candidate.customBeatTrimId === undefined ? legacyCustomBeatTrimId : candidate.customBeatTrimId,
     beatTrims: candidate.beatTrims === undefined ? {} : candidate.beatTrims,

@@ -216,6 +216,8 @@ export type SessionControlsProps = {
   beatTrimSourceBuffer: AudioBuffer | null
   beatTrim: SavedBeatTrimRegion | null
   disabled: boolean
+  tempoLocked?: boolean
+  resetDisabled?: boolean
   beatSelectionDisabled?: boolean
   onBpmChange: (value: string) => void
   onPitchChange: (value: number) => void
@@ -256,6 +258,8 @@ export function SessionControls({
   beatTrimSourceBuffer,
   beatTrim,
   disabled,
+  tempoLocked = false,
+  resetDisabled = false,
   beatSelectionDisabled = false,
   onBpmChange,
   onPitchChange,
@@ -297,6 +301,7 @@ export function SessionControls({
   const candidateHasTempoRange = candidateRange !== null
   const activeReferenceInput = Number(customBeatReferenceBpmInput)
   const activeReferenceInputValid = Number.isFinite(activeReferenceInput) && activeReferenceInput >= 1
+  const tempoDisabled = disabled || tempoLocked || !hasTempoRange
 
   return (
     <section id="session-section" className="workspace-section session-controls" aria-labelledby="settings-heading">
@@ -305,7 +310,7 @@ export function SessionControls({
           <h2 id="settings-heading">Session controls</h2>
           <p>Adjustments apply to this preview only.</p>
         </div>
-        <button className="button session-controls__reset" type="button" disabled={disabled} onClick={onReset}>
+        <button className="button session-controls__reset" type="button" disabled={disabled || resetDisabled} onClick={onReset}>
           Reset controls
         </button>
       </div>
@@ -323,7 +328,7 @@ export function SessionControls({
               max={maxBpm}
               step="0.5"
               value={bpm}
-              disabled={disabled || !hasTempoRange}
+              disabled={tempoDisabled}
               onChange={(event) => onBpmChange(event.currentTarget.value)}
             />
             <span aria-hidden="true">BPM</span>
@@ -337,12 +342,14 @@ export function SessionControls({
               max={maxBpm}
               step="0.5"
               value={sliderBpm}
-              disabled={disabled || !hasTempoRange}
+              disabled={tempoDisabled}
               onChange={(event) => onBpmChange(event.currentTarget.value)}
             />
           </label>
           <small className="session-controls__hint">
-            {hasTempoRange
+            {tempoLocked
+              ? 'Tempo stays fixed through the count-in and becomes live when the sequence starts.'
+              : hasTempoRange
               ? minBpm + '–' + maxBpm + ' BPM · scratch source ' + referenceBpm + (beatReferenceBpm ? ' · beat source ' + beatReferenceBpm : '')
               : 'No shared tempo range · scratch source ' + referenceBpm + ' · beat source ' + beatReferenceBpm}
           </small>

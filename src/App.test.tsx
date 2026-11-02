@@ -7,8 +7,9 @@ import App from './App'
 
 const audioHarness = vi.hoisted(() => {
   type Snapshot = {
-    status: 'idle' | 'loading' | 'playing' | 'completed' | 'error' | 'disposed'
+    status: 'idle' | 'loading' | 'counting-in' | 'playing' | 'completed' | 'error' | 'disposed'
     progress: number
+    countIn?: { beat: number; beats: number }
     error?: string
     cycleSlotIndex?: number
     cycleIteration?: number
@@ -39,25 +40,36 @@ const audioHarness = vi.hoisted(() => {
   const getProgress = () => snapshot.progress
   const hasTempoReference = (options: unknown) => typeof options === 'object' && options !== null
     && typeof (options as { referenceBpm?: unknown }).referenceBpm === 'number'
+  const countInBarsFor = (options: unknown) => typeof options === 'object' && options !== null
+    && typeof (options as { countInBars?: unknown }).countInBars === 'number'
+    ? (options as { countInBars: number }).countInBars
+    : 0
   const play = vi.fn(async (options: unknown) => {
     tempoAvailable = hasTempoReference(options)
-    emit({ status: 'playing', progress: 0 })
+    const countInBars = countInBarsFor(options)
+    emit(countInBars > 0
+      ? { status: 'counting-in', progress: 0, countIn: { beat: 1, beats: countInBars * 4 } }
+      : { status: 'playing', progress: 0 })
   })
   const playCyclePlan = vi.fn(async (options: unknown) => {
     tempoAvailable = hasTempoReference(options)
+    const countInBars = countInBarsFor(options)
     emit({
-      status: 'playing', progress: 0, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture',
+      status: countInBars > 0 ? 'counting-in' : 'playing', progress: 0,
+      ...(countInBars > 0 ? { countIn: { beat: 1, beats: countInBars * 4 } } : {}),
+      cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture',
       presentation: { started: false, progress: 0, positionUnits: 0, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture' },
     })
   })
   const setTempo = vi.fn((_bpm: number) => {
-    if (!tempoAvailable || (snapshot.status !== 'playing' && snapshot.status !== 'loading')) {
+    if (!tempoAvailable || snapshot.status === 'counting-in' || (snapshot.status !== 'playing' && snapshot.status !== 'loading')) {
       throw new Error('Live tempo changes require active playback with an imported preset reference.')
     }
   })
   const setPitchSemitones = vi.fn()
   const setSampleVolume = vi.fn()
   const setBeatVolume = vi.fn()
+  const setMetronomeVolume = vi.fn()
   const stop = vi.fn(() => { tempoAvailable = false; emit({ status: 'idle', progress: 0 }) })
   const resetAssets = vi.fn(() => { tempoAvailable = false; emit({ status: 'idle', progress: 0 }) })
   const dispose = vi.fn(() => { tempoAvailable = false; emit({ status: 'disposed', progress: 0 }) })
@@ -92,6 +104,7 @@ const audioHarness = vi.hoisted(() => {
     setPitchSemitones.mockClear()
     setSampleVolume.mockClear()
     setBeatVolume.mockClear()
+    setMetronomeVolume.mockClear()
     stop.mockClear()
     resetAssets.mockClear()
     dispose.mockClear()
@@ -117,7 +130,7 @@ const audioHarness = vi.hoisted(() => {
   }
   return {
     listeners, subscribe, getSnapshot, getProgress, play, playCyclePlan,
-    setTempo, setPitchSemitones, setSampleVolume, setBeatVolume,
+    setTempo, setPitchSemitones, setSampleVolume, setBeatVolume, setMetronomeVolume,
     stop, resetAssets, dispose, snapshotReferencedWavFiles, emit, reset,
   }
 })
@@ -149,6 +162,7 @@ vi.mock('./audio', () => ({
     setPitchSemitones = audioHarness.setPitchSemitones
     setSampleVolume = audioHarness.setSampleVolume
     setBeatVolume = audioHarness.setBeatVolume
+    setMetronomeVolume = audioHarness.setMetronomeVolume
     stop = audioHarness.stop
     resetAssets = audioHarness.resetAssets
     dispose = audioHarness.dispose
@@ -394,6 +408,48 @@ describe('workspace import and transport lifecycle', () => {
     expect(document.querySelector('.transport-status')?.textContent).toBe(statusBeforeDisabledShortcut)
     fireEvent.click(helpButton)
     expect(screen.getByRole('checkbox', { name: 'Enable single-character shortcuts' })).not.toBeChecked()
+  })
+
+  it('starts a sequence after the selected count-in, keeps progress still, and lets P stop the countdown', async () => {
+    window.localStorage.setItem('scratch-combo-shortcuts', 'on')
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+
+    const countIn = screen.getByRole('combobox', { name: 'Count-in' })
+    const metronome = screen.getByRole('checkbox', { name: 'Metronome' })
+    const clickLevel = screen.getByRole('slider', { name: 'Click level' })
+    fireEvent.change(countIn, { target: { value: '1' } })
+    fireEvent.click(metronome)
+    fireEvent.change(clickLevel, { target: { value: '68' } })
+    expect(audioHarness.setMetronomeVolume).toHaveBeenLastCalledWith(68)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await screen.findByText('Count-in · beat 1 of 4.')
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
+    expect(screen.getByRole('progressbar', { name: 'Preview progress' })).toHaveValue(0)
+    expect(document.querySelector('.timeline-playhead')).not.toBeInTheDocument()
+    expect(countIn).toBeDisabled()
+    expect(metronome).toBeDisabled()
+    expect(clickLevel).toBeEnabled()
+
+    const options = audioHarness.playCyclePlan.mock.calls[0]?.[0] as CyclePlanOptions
+    expect(options).toEqual(expect.objectContaining({ countInBars: 1, metronomeEnabled: true, metronomeVolume: 68 }))
+
+    selectWorkspaceTab('Session')
+    expect(screen.getByRole('spinbutton', { name: 'BPM' })).toBeDisabled()
+    expect(screen.getByRole('slider', { name: 'BPM range' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Reset controls' })).toBeDisabled()
+    fireEvent.keyDown(document.body, { key: 'p' })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled())
+    expect(audioHarness.stop).toHaveBeenCalled()
+
+    selectWorkspaceTab('Samples')
+    fireEvent.click(screen.getAllByRole('button', { name: /^Preview / })[0]!)
+    await waitFor(() => expect(audioHarness.play).toHaveBeenCalledTimes(1))
+    const sampleOptions = audioHarness.play.mock.calls[0]?.[0] as Record<string, unknown>
+    expect(sampleOptions).not.toHaveProperty('countInBars')
+    expect(sampleOptions).not.toHaveProperty('metronomeEnabled')
+    expect(sampleOptions).not.toHaveProperty('metronomeVolume')
   })
 
   it('switches Grid and Inline without changing event timing or restarting playback', async () => {

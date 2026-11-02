@@ -17,12 +17,12 @@
 
 - [x] Save and reload named practice sessions and favourite the exact generated combo from Practice. IndexedDB stores preset/settings/fixture data and referenced local audio bytes; restore validates audio, stays stopped, and never autoplays.
 - [x] Add manual, source-specific beat downbeat and loop-end trim controls to Session. Cue and exclusive end are bounded by decoded duration, Apply affects the next Play, source mode switches retain per-beat settings, and older saved sessions default to full-clip playback.
+- [x] Add an optional one- or two-bar count-in and ongoing metronome to Practice, with four beats per bar, independent click level, Stop/P cancellation, live level and backward-compatible saved settings.
 
-The beat trim feature is local-ready on `codex/beat-alignment`; Edge and Chrome browser journeys and the Pages build pass. The hosted app still serves merged revision `4a15973` until a reviewed release is published.
+Beat trim is hosted as merged revision `f5b1960`. Count-in/metronome is local-ready on `codex/count-in-metronome`: the Pages build, 230 unit tests, responsive Pages checks at 390/844/1280px, and both integrated Edge and Chrome journeys pass. See the [count-in/metronome QA evidence](qa/count-in-metronome-evidence.md) for browser audio timing results and screenshots. The hosted app still serves `f5b1960`; count-in/metronome is local-only and is not live.
 
 ## Queued — ordered follow-ups
 
-- [ ] Count-in and metronome.
 - [ ] Tempo-ramp trainer.
 - [ ] Real pause and resume.
 - [ ] Physical output synchronization checks and real mobile-device evidence.
