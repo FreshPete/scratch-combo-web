@@ -1,5 +1,7 @@
 # Browser validation: waveforms, local TTM guides, and Auto-generate
 
+> Historical results retained for reference. These counts and the production TTM-disabled claim predate the November 2026 workspace and Pages update. See the [current TTM and workspace validation](qa-ttm-beats-browser-validation.md) for the final results.
+
 ## Results
 
 - Final unit suite: **149/149 passed** across 13 files.

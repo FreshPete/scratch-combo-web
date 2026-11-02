@@ -16,7 +16,7 @@ function props(overrides: Partial<SessionControlsProps> = {}): SessionControlsPr
       file: new File([], 'Practice beat.wav'),
       candidates: [],
     }],
-    selectedBeatIndex: 'none',
+    selectedBeatIndex: '0',
     customBeatFileName: null,
     customBeatSelected: false,
     customBeatReferenceBpm: null,
@@ -77,7 +77,7 @@ describe('SessionControls', () => {
     expect(controlProps.onReset).toHaveBeenCalledOnce()
   })
 
-  it('disables reset and hides the beat selector when the parent gates controls or no beat is loaded', () => {
+  it('disables reset when gated and keeps an explicit no-beat choice when no preset beat is loaded', () => {
     const reset = vi.fn()
     const { rerender } = render(<SessionControls {...props({ disabled: true, onReset: reset })} />)
     expect(screen.getByRole('button', { name: 'Reset controls' })).toBeDisabled()
@@ -85,13 +85,15 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Reset controls' }))
     expect(reset).not.toHaveBeenCalled()
 
-    rerender(<SessionControls {...props({ beatFiles: [], beatResolutions: undefined })} />)
-    expect(screen.queryByRole('combobox', { name: 'Beat bed' })).not.toBeInTheDocument()
+    rerender(<SessionControls {...props({ beatFiles: [], beatResolutions: undefined, selectedBeatIndex: 'none' })} />)
+    expect(screen.getByRole('combobox', { name: 'Beat bed' })).toHaveValue('none')
+    expect(screen.getByRole('option', { name: 'No beat bed' })).toBeInTheDocument()
     expect(screen.getByRole('slider', { name: 'Beat level' })).toBeDisabled()
   })
 
   it('shows estimate review and applies a custom beat only after explicit confirmation', () => {
     const controlProps = props({
+      customBeatSelected: true,
       customBeatAnalysisStatus: 'detected',
       customBeatCandidateFileName: 'practice-loop.mp3',
       customBeatCandidateBpm: '120',
@@ -111,7 +113,7 @@ describe('SessionControls', () => {
     expect(controlProps.onUseCustomBeat).toHaveBeenCalledOnce()
   })
 
-  it('keeps built-in beats available while the custom beat is selected and shows both BPM references', () => {
+  it('keeps the preset choice cached but disabled while the custom source is active', () => {
     const controlProps = props({
       bpm: '110',
       customBeatFileName: 'practice-loop.mp3',
@@ -122,12 +124,35 @@ describe('SessionControls', () => {
     })
     render(<SessionControls {...controlProps} />)
 
-    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    expect(screen.getByRole('radio', { name: 'Custom' })).toBeChecked()
+    expect(screen.getByRole('radio', { name: 'Preset' })).toBeEnabled()
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('0')
+    expect(screen.getByLabelText('Beat bed')).toBeDisabled()
     expect(screen.getByRole('option', { name: 'Beat 01 · Practice beat.wav' })).toBeInTheDocument()
     expect(screen.getByRole('spinbutton', { name: 'Recorded BPM for custom beat' })).toHaveValue(120)
     expect(screen.getByText(/scratch source 85 · beat source 120/)).toBeInTheDocument()
-    fireEvent.change(screen.getByLabelText('Beat bed'), { target: { value: '0' } })
+    fireEvent.click(screen.getByRole('radio', { name: 'Preset' }))
     expect(controlProps.onBeatSelectionChange).toHaveBeenCalledWith('0')
+  })
+
+  it('lets the user choose Custom before upload and visibly mutes Custom controls in Preset mode', () => {
+    const controlProps = props({ selectedBeatIndex: '0' })
+    const { rerender } = render(<SessionControls {...controlProps} />)
+
+    expect(screen.getByRole('radio', { name: 'Preset' })).toBeChecked()
+    expect(screen.getByRole('radio', { name: 'Custom' })).toBeEnabled()
+    expect(screen.getByLabelText('Upload custom beat')).toBeDisabled()
+    expect(document.querySelector('.session-controls__custom-beat-upload--inactive')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('radio', { name: 'Custom' }))
+    expect(controlProps.onBeatSelectionChange).toHaveBeenCalledWith('custom')
+
+    rerender(<SessionControls {...props({ customBeatSelected: true, selectedBeatIndex: '0' })} />)
+    expect(screen.getByRole('radio', { name: 'Custom' })).toBeChecked()
+    expect(screen.getByLabelText('Beat bed')).toBeDisabled()
+    expect(screen.getByLabelText('Upload custom beat')).toBeEnabled()
+    expect(screen.getByText(/No custom beat is applied/)).toBeInTheDocument()
+    expect(screen.getByText(/Sample playback remains available without a beat bed/i)).toBeInTheDocument()
+    expect(screen.getByRole('slider', { name: 'Beat level' })).toBeDisabled()
   })
 
   it('locks tempo when scratch and beat references have no shared playback range', () => {

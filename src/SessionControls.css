@@ -130,6 +130,23 @@
   cursor: pointer;
 }
 
+.session-controls__range input:disabled,
+.session-controls__slider:disabled {
+  accent-color: #66716d;
+  cursor: not-allowed;
+  opacity: .48;
+}
+
+.session-controls__field--inactive {
+  color: var(--text-muted);
+}
+
+.session-controls__field--inactive .session-controls__label,
+.session-controls__field--inactive .session-controls__readout,
+.session-controls__field--inactive .session-controls__hint {
+  color: var(--text-muted);
+}
+
 .session-controls__range--tempo input { accent-color: #17d9ff; }
 .session-controls__slider--pitch { accent-color: #b176ff; }
 .session-controls__slider--sample { accent-color: #ff4fa3; }
@@ -141,17 +158,95 @@
   line-height: 1.35;
 }
 
-.session-controls__beat-bed {
+.session-controls__beat-source {
   display: grid;
-  grid-template-columns: minmax(0, 220px) minmax(0, 420px);
-  align-items: center;
-  gap: 8px 14px;
+  grid-template-columns: 1fr;
+  gap: 10px 14px;
   margin-top: 14px;
-  padding-top: 14px;
+  padding: 14px 0 0;
+  border: 0;
   border-top: 1px solid var(--line);
 }
 
-.session-controls__beat-bed select {
+.session-controls__beat-source legend {
+  float: left;
+  width: 100%;
+  padding: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.session-controls__source-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.session-controls__source-option {
+  display: inline-flex;
+  min-width: 116px;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-inset);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.session-controls__source-option input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.session-controls__source-option--selected {
+  border-color: #7d9630;
+  background: #222a1b;
+  color: var(--text);
+}
+
+.session-controls__source-option:has(input:disabled) {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.session-controls__source-option input:disabled {
+  accent-color: #66716d;
+}
+
+.session-controls__beat-source > .session-controls__hint {
+  margin-top: -5px;
+}
+
+.session-controls__source-panel {
+  display: grid;
+  grid-template-columns: minmax(160px, 220px) minmax(0, 420px);
+  align-items: center;
+  gap: 8px 14px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.session-controls__source-panel--inactive {
+  color: var(--text-muted);
+}
+
+.session-controls__source-panel--inactive > .session-controls__label,
+.session-controls__source-panel--inactive > .session-controls__beat-sync {
+  color: var(--text-muted);
+}
+
+.session-controls__custom-source-panel .session-controls__beat-sync {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.session-controls__source-panel select {
   width: 100%;
   min-width: 0;
   height: 40px;
@@ -163,7 +258,6 @@
   cursor: pointer;
 }
 
-.session-controls__custom-beat-active,
 .session-controls__custom-beat-upload {
   display: grid;
   grid-template-columns: minmax(0, 220px) minmax(0, 420px);
@@ -174,12 +268,13 @@
   border-top: 1px solid var(--line);
 }
 
-.session-controls__custom-beat-active {
-  align-items: center;
+.session-controls__custom-beat-upload--inactive {
+  opacity: .52;
 }
 
-.session-controls__custom-beat-active > .session-controls__label {
-  grid-column: 1;
+.session-controls__custom-beat-upload--inactive .session-controls__label,
+.session-controls__custom-beat-upload--inactive .session-controls__hint {
+  color: var(--text-muted);
 }
 
 .session-controls__custom-beat-upload > div:first-child {
@@ -290,20 +385,15 @@
     gap: 14px;
   }
 
-  .session-controls__beat-bed {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 7px;
-  }
-
-  .session-controls__custom-beat-active,
+  .session-controls__source-panel,
   .session-controls__custom-beat-upload {
     grid-template-columns: minmax(0, 1fr);
     gap: 8px;
   }
 
-  .session-controls__custom-beat-active > .session-controls__label,
   .session-controls__candidate,
-  .session-controls__beat-sync {
+  .session-controls__beat-sync,
+  .session-controls__custom-source-panel .session-controls__beat-sync {
     grid-column: 1;
   }
 }

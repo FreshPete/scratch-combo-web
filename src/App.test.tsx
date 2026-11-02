@@ -175,7 +175,12 @@ function fileWithPath(fileName: string, relativePath: string) {
   return file
 }
 
+function selectWorkspaceTab(name: 'Practice' | 'Session' | 'Samples' | 'Files') {
+  fireEvent.click(screen.getByRole('tab', { name }))
+}
+
 function selectDemoPreset() {
+  selectWorkspaceTab('Practice')
   fireEvent.change(screen.getByLabelText('Quick preset'), { target: { value: 'demo' } })
 }
 
@@ -224,6 +229,7 @@ beforeEach(() => {
 })
 afterEach(async () => {
   cleanup()
+  window.history.replaceState(null, '', window.location.pathname + window.location.search)
   vi.unstubAllEnvs()
   vi.unstubAllGlobals()
   await Promise.resolve()
@@ -234,12 +240,94 @@ describe('workspace import and transport lifecycle', () => {
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
     const timeline = await screen.findByRole('img', { name: /Sequence timeline/ }) as HTMLElement
-    const transportRow = document.querySelector<HTMLElement>('.transport-row')
+    const transportRow = document.querySelector<HTMLElement>('.transport-dock')
 
     expect(transportRow).toBeInTheDocument()
     expect(transportRow!.compareDocumentPosition(timeline) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(within(transportRow!).getByRole('button', { name: 'Play sequence' })).toBeEnabled()
     expect(within(transportRow!).getByRole('button', { name: 'Stop' })).toBeDisabled()
+  })
+
+  it('uses four keyboard-operable tabs and activates direct hash targets', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+
+    const practiceTab = screen.getByRole('tab', { name: 'Practice' })
+    const sessionTab = screen.getByRole('tab', { name: 'Session' })
+    const tabs = screen.getByRole('tablist', { name: 'Workspace sections' })
+    expect(tabs).toHaveAttribute('aria-orientation', 'vertical')
+    expect(practiceTab).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tabpanel', { name: 'Practice' })).not.toHaveAttribute('hidden')
+    expect(document.getElementById('panel-session')).toHaveAttribute('hidden')
+    expect(document.getElementById('panel-samples')).toHaveAttribute('hidden')
+    expect(document.getElementById('panel-files')).toHaveAttribute('hidden')
+
+    fireEvent.keyDown(practiceTab, { key: 'ArrowDown' })
+    await waitFor(() => expect(sessionTab).toHaveAttribute('aria-selected', 'true'))
+    expect(sessionTab).toHaveFocus()
+
+    window.location.hash = '#import-heading'
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Files' })).toHaveAttribute('aria-selected', 'true'))
+    const filesPanel = screen.getByRole('tabpanel', { name: 'Files' })
+    expect(filesPanel).not.toHaveAttribute('hidden')
+    await waitFor(() => expect(filesPanel).toHaveFocus())
+
+    window.location.hash = '#workspace'
+    await waitFor(() => expect(practiceTab).toHaveAttribute('aria-selected', 'true'))
+    window.history.replaceState(null, '', window.location.pathname + window.location.search)
+    fireEvent.click(sessionTab)
+    await waitFor(() => expect(sessionTab).toHaveAttribute('aria-selected', 'true'))
+    window.history.back()
+    await waitFor(() => expect(practiceTab).toHaveAttribute('aria-selected', 'true'))
+  })
+
+  it('keeps global transport available on every tab and provides safe, toggleable shortcuts', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    selectDemoPreset()
+    selectWorkspaceTab('Practice')
+
+    const play = screen.getByRole('button', { name: 'Play sequence' })
+    const stop = screen.getByRole('button', { name: 'Stop' })
+    fireEvent.keyDown(document.body, { key: 'g' })
+    await screen.findByText('Fixed demo preview built. Ready to play.')
+    fireEvent.keyDown(document.body, { key: 'p' })
+    await waitFor(() => expect(audioHarness.play).toHaveBeenCalledTimes(1))
+    fireEvent.keyDown(document.body, { key: 'p' })
+    expect(stop).toBeDisabled()
+    expect(audioHarness.stop).toHaveBeenCalled()
+
+    selectWorkspaceTab('Session')
+    const bpmField = screen.getByRole('spinbutton', { name: 'BPM' })
+    fireEvent.change(bpmField, { target: { value: '94' } })
+    fireEvent.keyDown(bpmField, { key: 'p' })
+    expect(audioHarness.play).toHaveBeenCalledTimes(1)
+    expect(play).toBeEnabled()
+    fireEvent.keyDown(document.body, { key: 'r' })
+    expect(bpmField).toHaveValue(100)
+
+    selectWorkspaceTab('Practice')
+    fireEvent.keyDown(document.body, { key: 'p', ctrlKey: true })
+    fireEvent.keyDown(document.body, { key: 'p', repeat: true })
+    expect(audioHarness.play).toHaveBeenCalledTimes(1)
+
+    const helpButton = screen.getByRole('button', { name: 'Keyboard shortcuts' })
+    fireEvent.click(helpButton)
+    const dialog = await screen.findByRole('dialog', { name: 'Keyboard shortcuts' })
+    expect(screen.getByRole('button', { name: 'Close shortcuts' })).toHaveFocus()
+    expect(screen.getByRole('checkbox', { name: 'Enable single-character shortcuts' })).toBeChecked()
+    expect(within(dialog).getByText('P', { exact: true })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable single-character shortcuts' }))
+    expect(screen.getByRole('checkbox', { name: 'Enable single-character shortcuts' })).not.toBeChecked()
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Keyboard shortcuts' })).not.toBeInTheDocument())
+    expect(helpButton).toHaveFocus()
+
+    const statusBeforeDisabledShortcut = document.querySelector('.transport-status')?.textContent
+    fireEvent.keyDown(document.body, { key: 'g' })
+    expect(document.querySelector('.transport-status')?.textContent).toBe(statusBeforeDisabledShortcut)
+    fireEvent.click(helpButton)
+    expect(screen.getByRole('checkbox', { name: 'Enable single-character shortcuts' })).not.toBeChecked()
   })
 
   it('switches Grid and Inline without changing event timing or restarting playback', async () => {
@@ -399,24 +487,27 @@ describe('workspace import and transport lifecycle', () => {
     try {
       render(<App />)
       await screen.findByRole('heading', { name: 'Generated combo' })
+      selectWorkspaceTab('Samples')
       fireEvent.click(screen.getByRole('button', { name: 'Edit Bundled kick' }))
 
       const guideSelect = screen.getByRole('combobox', { name: 'TTM guide for Bundled kick' })
       expect(guideSelect).toHaveValue('untranscribed')
       fireEvent.change(guideSelect, { target: { value: 'forward-cut' } })
       await waitFor(() => expect(screen.getByRole('combobox', { name: 'TTM guide for Bundled kick' })).toHaveValue('forward-cut'))
+      selectWorkspaceTab('Practice')
       fireEvent.click(screen.getByRole('radio', { name: 'TTM practice guides' }))
 
       const guidePath = document.querySelector('.sequence-ttm-motion path')
-      expect(guidePath).toHaveAttribute('d', 'M0 100 L50 0 L100 100')
+      expect(guidePath).toHaveAttribute('d', 'M6 92 L50 8 L94 92')
       const guideEvent = document.querySelector('.sequence-event--ttm-guide')
       expect(guideEvent?.querySelectorAll('.sequence-ttm-fader__interval--open')).toHaveLength(1)
       expect(guideEvent?.querySelectorAll('.sequence-ttm-fader__interval--closed')).toHaveLength(1)
-      expect(screen.getByText(/not WAV transcriptions/i)).toBeInTheDocument()
+      expect(screen.getAllByText(/not WAV transcriptions/i).length).toBeGreaterThan(0)
       expect(screen.getByRole('img', { name: /Sequence timeline/ })).toBeInTheDocument()
       expect(audioHarness.play).not.toHaveBeenCalled()
       expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
 
+      selectWorkspaceTab('Samples')
       fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
       fireEvent.click(screen.getByRole('button', { name: 'Save Sample Data' }))
       await waitFor(() => expect(write).toHaveBeenCalledTimes(1))
@@ -439,18 +530,22 @@ describe('workspace import and transport lifecycle', () => {
 
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Samples')
     fireEvent.click(screen.getByRole('button', { name: 'Edit Baby(F)' }))
     const guideSelect = screen.getByRole('combobox', { name: 'TTM guide for Baby(F)' })
     expect(guideSelect).toHaveValue('forward-movement')
     expect(guideSelect.querySelector('option:checked')).toHaveTextContent('Suggested: Forward movement')
     expect(screen.getByText(/suggested from the exact sample label only/i)).toBeInTheDocument()
 
+    selectWorkspaceTab('Practice')
     fireEvent.click(screen.getByRole('radio', { name: 'TTM practice guides' }))
-    expect(document.querySelector('.sequence-ttm-motion path')).toHaveAttribute('d', 'M0 100 L100 0')
+    expect(document.querySelector('.sequence-ttm-motion path')).toHaveAttribute('d', 'M6 92 L94 8')
     expect(document.querySelector('.timeline-lane-label--ttm small')).toHaveTextContent('Suggested: Forward movement')
 
+    selectWorkspaceTab('Samples')
     fireEvent.change(guideSelect, { target: { value: 'untranscribed' } })
     await waitFor(() => expect(screen.getByRole('combobox', { name: 'TTM guide for Baby(F)' })).toHaveValue('untranscribed'))
+    selectWorkspaceTab('Practice')
     expect(document.querySelector('.sequence-ttm-motion path')).not.toBeInTheDocument()
     expect(document.querySelector('.sequence-event--ttm-untranscribed')).toBeInTheDocument()
     expect(document.querySelector('.timeline-lane-label--ttm small')).toHaveTextContent('Untranscribed')
@@ -474,7 +569,9 @@ describe('workspace import and transport lifecycle', () => {
 
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Files')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'unknown-ttm.ini', { type: 'text/plain' })])
+    selectWorkspaceTab('Practice')
     await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
     await screen.findByRole('img', { name: 'Sequence timeline: 128 legacy ticks, 2 events' })
@@ -484,6 +581,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(document.querySelector('.sequence-ttm-motion path')).not.toBeInTheDocument()
     expect(document.querySelector('.timeline-lane-label--ttm small')).toHaveTextContent('Unassigned')
     expect(screen.getByRole('link', { name: 'Edit a sample' })).toHaveAttribute('href', '#sample-section')
+    selectWorkspaceTab('Samples')
     fireEvent.click(screen.getByRole('button', { name: 'Edit Mystery scratch' }))
     const guideSelect = screen.getByRole('combobox', { name: 'TTM guide for Mystery scratch' })
     expect(guideSelect).toHaveValue('untranscribed')
@@ -491,22 +589,23 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByText(/No guide is assigned/i)).toBeInTheDocument()
   })
 
-  it('keeps TTM available only as a disabled local-debug view outside development', async () => {
+  it('keeps TTM guides and assignment controls available in production', async () => {
     vi.stubEnv('DEV', false)
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
 
     const ttmView = screen.getByRole('radio', { name: 'TTM practice guides' })
-    expect(ttmView).toBeDisabled()
-    expect(ttmView).toHaveAttribute('aria-describedby', 'ttm-local-debug-note')
-    expect(screen.getByText('Local debug only')).toBeInTheDocument()
+    expect(ttmView).toBeEnabled()
     expect(screen.getByRole('radio', { name: 'Waveform' })).toBeChecked()
 
     fireEvent.click(ttmView)
-    expect(screen.getByRole('radio', { name: 'Waveform' })).toBeChecked()
-    expect(document.querySelector('.sequence-ttm-motion')).not.toBeInTheDocument()
-
+    expect(screen.getByRole('radio', { name: 'TTM practice guides' })).toBeChecked()
+    expect(document.querySelector('.ttm-guide-legend')).toBeInTheDocument()
+    expect(screen.queryByText('Local debug only')).not.toBeInTheDocument()
+    selectWorkspaceTab('Samples')
     fireEvent.click(screen.getByRole('button', { name: 'Edit Bundled kick' }))
+    expect(screen.getByRole('combobox', { name: 'TTM guide for Bundled kick' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(screen.queryByRole('combobox', { name: /TTM guide for/ })).not.toBeInTheDocument()
   })
 
@@ -589,14 +688,19 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByRole('combobox', { name: 'New combo every' })).toHaveValue('2')
     expect(screen.getByRole('checkbox', { name: /Large pause/ })).toBeDisabled()
     expect(screen.getByLabelText('Quick preset')).toBeDisabled()
+    selectWorkspaceTab('Files')
     expect(screen.getByLabelText('Choose INI preset')).toBeDisabled()
     expect(screen.getByLabelText('Choose audio folder')).toBeDisabled()
     expect(screen.getByLabelText('Choose WAV files')).toBeDisabled()
+    selectWorkspaceTab('Samples')
     expect(screen.getByLabelText('Enable Bundled kick for next combo')).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Preview Bundled kick' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Edit Bundled kick' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Save Sample Data' })).toBeDisabled()
+    selectWorkspaceTab('Session')
     expect(screen.getByLabelText('Beat bed')).toBeDisabled()
+    expect(screen.getByRole('radio', { name: 'Preset' })).toBeDisabled()
+    expect(screen.getByRole('radio', { name: 'Custom' })).toBeDisabled()
 
     expect(screen.getByRole('spinbutton', { name: 'BPM' })).toBeEnabled()
     expect(screen.getByRole('slider', { name: 'Pitch shift in semitones' })).toBeEnabled()
@@ -604,6 +708,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByRole('slider', { name: 'Beat level' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Reset controls' })).toBeEnabled()
 
+    selectWorkspaceTab('Practice')
     fireEvent.change(screen.getByLabelText('Combo length'), { target: { value: '16' } })
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
     fireEvent.click(screen.getByRole('checkbox', { name: /Auto-generate/ }))
@@ -618,15 +723,20 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByRole('checkbox', { name: /Auto-generate/ })).not.toBeChecked()
 
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    selectWorkspaceTab('Practice')
     expect(screen.getByLabelText('Quick preset')).toBeEnabled()
+    selectWorkspaceTab('Practice')
     expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled()
 
+    selectWorkspaceTab('Samples')
     fireEvent.click(screen.getByRole('button', { name: 'Edit Bundled kick' }))
     fireEvent.click(screen.getByRole('button', { name: 'Preview Bundled kick' }))
     await waitFor(() => expect(audioHarness.play).toHaveBeenCalledTimes(1))
+    selectWorkspaceTab('Practice')
     expect(screen.getByRole('button', { name: 'Generate combo' })).toBeDisabled()
     expect(screen.getByRole('checkbox', { name: /Auto-generate/ })).toBeDisabled()
     expect(screen.getByRole('combobox', { name: 'New combo every' })).toBeDisabled()
+    selectWorkspaceTab('Samples')
     expect(screen.getByRole('combobox', { name: 'TTM guide for Bundled kick' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Save sample changes' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
@@ -783,6 +893,7 @@ describe('workspace import and transport lifecycle', () => {
 
   it('resolves against WAV files selected while an INI read is pending', async () => {
     render(<App />)
+    selectWorkspaceTab('Practice')
     const ini = delayedIniFile('local.ini')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [ini.file])
     const wav = new File(['local audio'], 'kick.wav', { type: 'audio/wav' })
@@ -793,6 +904,7 @@ describe('workspace import and transport lifecycle', () => {
       await Promise.resolve()
     })
 
+    selectWorkspaceTab('Samples')
     const preview = await screen.findByRole('button', { name: 'Preview Local kick' })
     fireEvent.click(preview)
     await waitFor(() => expect(audioHarness.play).toHaveBeenCalledTimes(1))
@@ -837,12 +949,16 @@ describe('workspace import and transport lifecycle', () => {
     render(<App />)
 
     await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Practice')
     expect(screen.getByLabelText('Quick preset')).toHaveValue('SSC-085BPM-01')
     expect(screen.getByRole('option', { name: '85 BPM - Beginner · 85 BPM' })).toBeInTheDocument()
+    selectWorkspaceTab('Session')
     expect(screen.getByRole('spinbutton', { name: 'BPM' })).toHaveValue(85)
     expect(screen.getByLabelText('Beat bed')).toHaveValue('0')
+    expect(screen.getByRole('radio', { name: 'Preset' })).toBeChecked()
     expect(screen.getByRole('option', { name: 'Beat 01 · beat.wav' })).toBeInTheDocument()
     expect(screen.getByRole('option', { name: 'Beat 02 · beat-two.wav' })).toBeInTheDocument()
+    selectWorkspaceTab('Practice')
     expect(screen.getByRole('radio', { name: 'Q&A' })).toBeChecked()
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
     expect(audioHarness.play).not.toHaveBeenCalled()
@@ -856,6 +972,7 @@ describe('workspace import and transport lifecycle', () => {
     await waitFor(() => expect(presetHarness.loadBuiltInPreset).toHaveBeenCalledTimes(1))
 
     const custom = new File([samplePreset('Custom choice', 'Custom row', 'custom.wav')], 'custom.ini', { type: 'text/plain' })
+    selectWorkspaceTab('Files')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [custom])
     await screen.findByText('Custom row')
 
@@ -866,6 +983,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByText(/Custom choice/)).toBeInTheDocument()
     expect(screen.getByText('Custom row')).toBeInTheDocument()
     expect(screen.queryByText('Bundled kick')).not.toBeInTheDocument()
+    selectWorkspaceTab('Practice')
     expect(screen.getByLabelText('Quick preset')).toHaveValue('custom')
   })
 
@@ -873,6 +991,7 @@ describe('workspace import and transport lifecycle', () => {
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
     selectDemoPreset()
+    selectWorkspaceTab('Session')
     audioHarness.stop.mockClear()
     fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
     await waitFor(() => expect(audioHarness.play).toHaveBeenCalledTimes(1))
@@ -893,6 +1012,7 @@ describe('workspace import and transport lifecycle', () => {
   it('lets Your files cancel a pending built-in selection and focuses the INI picker', async () => {
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Practice')
     let resolveBuiltIn: (value: unknown) => void = () => undefined
     presetHarness.loadBuiltInPreset.mockImplementationOnce(() => new Promise((resolve) => { resolveBuiltIn = resolve }))
     fireEvent.change(screen.getByLabelText('Quick preset'), { target: { value: 'SSC-085BPM-02' } })
@@ -917,6 +1037,7 @@ describe('workspace import and transport lifecycle', () => {
   it('keeps playback unavailable after a bundled file error and retries the selected preset', async () => {
     presetHarness.loadBuiltInPreset.mockRejectedValueOnce(new Error('Beat02 could not be fetched.'))
     render(<App />)
+    selectWorkspaceTab('Files')
 
     const retry = await screen.findByRole('button', { name: 'Retry built-in preset' })
     expect(screen.getByRole('alert')).toHaveTextContent('Beat02 could not be fetched.')
@@ -924,6 +1045,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.queryByText('Bundled kick')).not.toBeInTheDocument()
     fireEvent.click(retry)
 
+    selectWorkspaceTab('Practice')
     await screen.findByRole('heading', { name: 'Generated combo' })
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
   })
@@ -944,6 +1066,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(options).toEqual(expect.objectContaining({ bpm: 85, referenceBpm: 85, pitchSemitones: 0 }))
     expect(options.beatFile?.name).toBe('beat.wav')
 
+    selectWorkspaceTab('Session')
     audioHarness.setTempo.mockClear()
     audioHarness.setPitchSemitones.mockClear()
     audioHarness.setSampleVolume.mockClear()
@@ -963,7 +1086,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(audioHarness.setBeatVolume).toHaveBeenCalledWith(40)
     expect(audioHarness.stop).not.toHaveBeenCalled()
     expect(screen.getByLabelText('Beat bed')).toHaveValue('0')
-    expect(screen.getByText('Stop playback to change combo options or sample settings.')).toBeInTheDocument()
+    expect(screen.getByText('Stop playback to change combo options, beat source, or sample settings.')).toBeInTheDocument()
   })
 
   it('resets live tempo, pitch, and levels to the selected preset without stopping playback', async () => {
@@ -972,6 +1095,7 @@ describe('workspace import and transport lifecycle', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
     await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
 
+    selectWorkspaceTab('Session')
     audioHarness.stop.mockClear()
     audioHarness.setTempo.mockClear()
     audioHarness.setPitchSemitones.mockClear()
@@ -1006,6 +1130,7 @@ describe('workspace import and transport lifecycle', () => {
     try {
       render(<App />)
       await screen.findByRole('heading', { name: 'Generated combo' })
+      selectWorkspaceTab('Samples')
       fireEvent.click(screen.getByRole('button', { name: 'Edit Bundled kick' }))
       const duration = screen.getByRole('spinbutton', { name: 'Duration ticks' })
       await waitFor(() => expect(duration).toHaveFocus())
@@ -1014,9 +1139,11 @@ describe('workspace import and transport lifecycle', () => {
       expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
       expect(screen.getByRole('button', { name: 'Save Sample Data' })).toBeEnabled()
 
+      selectWorkspaceTab('Session')
       fireEvent.change(screen.getByRole('spinbutton', { name: 'BPM' }), { target: { value: '100' } })
       fireEvent.change(screen.getByLabelText('Sample level'), { target: { value: '55' } })
       fireEvent.change(screen.getByLabelText('Beat level'), { target: { value: '40' } })
+      selectWorkspaceTab('Samples')
       fireEvent.click(screen.getByRole('button', { name: 'Save Sample Data' }))
       await waitFor(() => expect(close).toHaveBeenCalledTimes(1))
       expect(picker).toHaveBeenCalledWith(expect.objectContaining({ suggestedName: 'SSC-085BPM-01-edited.ini' }))
@@ -1027,6 +1154,7 @@ describe('workspace import and transport lifecycle', () => {
       expect(savedText).toContain('VOL_B=40')
       expect(savedText).not.toContain('BPM01=100')
       await waitFor(() => expect(within(document.querySelector('.import-status') as HTMLElement).getByText(/Working preset copy saved as SSC-085BPM-01-edited\.ini/)).toBeInTheDocument())
+      selectWorkspaceTab('Session')
       fireEvent.click(screen.getByRole('button', { name: 'Reset controls' }))
       expect(screen.getByLabelText('Sample level')).toHaveValue('80')
       expect(screen.getByLabelText('Beat level')).toHaveValue('60')
@@ -1047,11 +1175,14 @@ describe('workspace import and transport lifecycle', () => {
     try {
       render(<App />)
       await screen.findByRole('heading', { name: 'Generated combo' })
+      selectWorkspaceTab('Samples')
       fireEvent.click(screen.getByRole('button', { name: 'Save Sample Data' }))
       await waitFor(() => expect(close).toHaveBeenCalledOnce())
 
+      selectWorkspaceTab('Practice')
       fireEvent.change(screen.getByLabelText('Quick preset'), { target: { value: 'SSC-085BPM-02' } })
       await waitFor(() => expect(screen.getByLabelText('Quick preset')).toHaveValue('SSC-085BPM-02'))
+      selectWorkspaceTab('Samples')
       await waitFor(() => expect(screen.getByRole('button', { name: 'Save Sample Data' })).toBeEnabled())
       await act(async () => { finishClose(); await closePromise })
 
@@ -1067,8 +1198,10 @@ describe('workspace import and transport lifecycle', () => {
 
   it('allows unchanged legacy values above the web edit cap but rejects changed out-of-range values', async () => {
     render(<App />)
+    selectWorkspaceTab('Files')
     const ini = samplePreset('Long legacy field', 'Long kick', 'kick.wav').replace('Sample16ths=8', 'Sample16ths=513')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'long.ini', { type: 'text/plain' })])
+    selectWorkspaceTab('Samples')
     await screen.findByRole('button', { name: 'Edit Long kick' })
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit Long kick' }))
@@ -1181,13 +1314,14 @@ describe('workspace import and transport lifecycle', () => {
 
   it('keeps silent rows included and non-editable', async () => {
     render(<App />)
+    selectWorkspaceTab('Files')
     const ini = samplePreset('Silent tick fixture', 'Silent pad', 'silent.wav')
       .replace('SampleIsSilent=False', 'SampleIsSilent=True')
       .replace('UseSample=True', 'UseSample=False')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'silent.ini', { type: 'text/plain' })])
-    await screen.findByRole('button', { name: 'Generate combo' })
+    selectWorkspaceTab('Samples')
 
-    const silentToggle = screen.getByRole('checkbox', { name: 'Enable Silent pad for next combo' })
+    const silentToggle = await screen.findByRole('checkbox', { name: 'Enable Silent pad for next combo' })
     expect(silentToggle).toBeChecked()
     expect(silentToggle).toBeDisabled()
     expect(screen.getByText('Always included')).toBeInTheDocument()
@@ -1213,17 +1347,21 @@ describe('workspace import and transport lifecycle', () => {
 
   it('clears generated selection when an eligible sample is toggled', async () => {
     render(<App />)
+    selectWorkspaceTab('Files')
     const ini = samplePreset('Toggle tick fixture', 'Kick', 'kick.wav')
       .replace('SampleRepeatMax=2', 'SampleRepeatMax=512')
       .replace('Sample16ths=8', 'Sample16ths=16')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'toggle.ini', { type: 'text/plain' })])
+    selectWorkspaceTab('Practice')
     await screen.findByRole('button', { name: 'Generate combo' })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
     await screen.findByRole('img', { name: 'Sequence timeline: 128 legacy ticks, 8 events' })
 
+    selectWorkspaceTab('Samples')
     fireEvent.click(screen.getByRole('checkbox', { name: 'Enable Kick for next combo' }))
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    selectWorkspaceTab('Practice')
     expect(screen.getByText('Generate a combo to preview the sequence')).toBeInTheDocument()
     expect(audioHarness.stop).toHaveBeenCalled()
   })
@@ -1289,23 +1427,30 @@ describe('workspace import and transport lifecycle', () => {
     })
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Session')
+    fireEvent.click(screen.getByRole('radio', { name: 'Custom' }))
     const beat = new File(['local beat'], 'club-loop.mp3', { type: 'audio/mpeg' })
     chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [beat])
 
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
     expect(await screen.findByText(/club-loop\.mp3: estimated 110 BPM/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
     expect(screen.getByLabelText('BPM')).toHaveValue(85)
+    expect(screen.getByRole('radio', { name: 'Preset' })).not.toBeChecked()
+    expect(screen.getByText(/No custom beat is applied/i)).toBeInTheDocument()
     expect(audioHarness.play).not.toHaveBeenCalled()
     expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
-    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    expect(screen.getByRole('radio', { name: 'Custom' })).toBeChecked()
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('0')
     expect(screen.getByLabelText('BPM')).toHaveValue(110)
     expect(screen.getByLabelText('Recorded BPM for custom beat')).toHaveValue(110)
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
     expect(audioHarness.play).not.toHaveBeenCalled()
     expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
 
+    selectWorkspaceTab('Samples')
     fireEvent.click(screen.getByRole('button', { name: 'Preview Bundled kick' }))
     await waitFor(() => expect(audioHarness.play).toHaveBeenCalledTimes(1))
     const samplePreviewOptions = audioHarness.play.mock.calls[0]?.[0] as Record<string, unknown>
@@ -1314,6 +1459,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(samplePreviewOptions).not.toHaveProperty('beatBuffer')
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
 
+    selectWorkspaceTab('Session')
     fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
     await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
     const options = audioHarness.playCyclePlan.mock.calls[0]?.[0] as {
@@ -1351,13 +1497,18 @@ describe('workspace import and transport lifecycle', () => {
     }))
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Session')
+    fireEvent.click(screen.getByRole('radio', { name: 'Custom' }))
     chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['beat'], '120-loop.wav', { type: 'audio/wav' })])
     await screen.findByText(/estimated 120 BPM/)
     fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
 
+    selectWorkspaceTab('Practice')
     fireEvent.change(screen.getByLabelText('Quick preset'), { target: { value: 'SSC-096BPM2-01' } })
     await screen.findByText(/96 BPM Set 2 ready/, { selector: 'p' })
-    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    selectWorkspaceTab('Session')
+    expect(screen.getByRole('radio', { name: 'Custom' })).toBeChecked()
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('0')
     expect(screen.getByLabelText('Recorded BPM for custom beat')).toHaveValue(120)
     expect(screen.getByLabelText('BPM')).toHaveValue(120)
     expect(screen.getByText(/scratch source 96 · beat source 120/)).toBeInTheDocument()
@@ -1375,6 +1526,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(options.beatReferenceBpm).toBe(120)
     expect(options.beatBuffer).toBe(beatBuffer)
     expect(options.assets.has('Sample01')).toBe(true)
+    selectWorkspaceTab('Samples')
     expect(within(screen.getByRole('table')).getByText('Replacement kick')).toBeInTheDocument()
   })
 
@@ -1398,24 +1550,29 @@ describe('workspace import and transport lifecycle', () => {
       })
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Session')
+    fireEvent.click(screen.getByRole('radio', { name: 'Custom' }))
     chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['beat'], 'good.wav', { type: 'audio/wav' })])
     await screen.findByText(/estimated 100 BPM/)
     fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
 
     chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['broken'], 'broken.mp3', { type: 'audio/mpeg' })])
     expect(await screen.findByText(/Could not analyze broken\.mp3/)).toBeInTheDocument()
-    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    expect(screen.getByRole('radio', { name: 'Custom' })).toBeChecked()
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('0')
     expect(screen.getByLabelText('Recorded BPM for custom beat')).toHaveValue(100)
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
 
     chooseFiles(screen.getByLabelText('Upload custom beat') as HTMLInputElement, [new File(['ambiguous'], 'ambiguous.wav', { type: 'audio/wav' })])
     expect(await screen.findByText(/pulse is ambiguous/)).toHaveTextContent('80, 160 BPM')
     expect(screen.getByRole('button', { name: 'Use custom beat' })).toBeDisabled()
-    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    expect(screen.getByRole('radio', { name: 'Custom' })).toBeChecked()
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('0')
     fireEvent.change(screen.getByRole('spinbutton', { name: 'Custom beat BPM' }), { target: { value: '160' } })
     expect(screen.getByRole('button', { name: 'Use custom beat' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Use custom beat' }))
-    expect(screen.getByLabelText('Beat bed')).toHaveValue('custom')
+    expect(screen.getByRole('radio', { name: 'Custom' })).toBeChecked()
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('0')
     expect(screen.getByLabelText('Recorded BPM for custom beat')).toHaveValue(160)
     expect(screen.getByLabelText('BPM')).toHaveValue(160)
   })

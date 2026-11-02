@@ -20,6 +20,7 @@ describe('illustrative TTM guide catalogue', () => {
       'forward-movement',
       'backward-movement',
       'forward-cut',
+      'chirp',
     ])
     expect(Object.isFrozen(TTM_GUIDES)).toBe(true)
     expect(Object.isFrozen(TTM_GUIDES['baby-rub'])).toBe(true)
@@ -32,9 +33,13 @@ describe('illustrative TTM guide catalogue', () => {
   })
 
   it('uses rising and falling movement paths and the fader gates in the teaching examples', () => {
-    expect(ttmMotionSvgPath(TTM_GUIDES['baby-rub'].motion)).toBe('M0 100 L50 0 L100 100')
-    expect(ttmMotionSvgPath(TTM_GUIDES['forward-movement'].motion)).toBe('M0 100 L100 0')
-    expect(ttmMotionSvgPath(TTM_GUIDES['backward-movement'].motion)).toBe('M0 0 L100 100')
+    expect(ttmMotionSvgPath(TTM_GUIDES['baby-rub'].motion)).toBe('M6 92 L50 8 L94 92')
+    expect(ttmMotionSvgPath(TTM_GUIDES['forward-movement'].motion)).toBe('M6 92 L94 8')
+    expect(ttmMotionSvgPath(TTM_GUIDES['backward-movement'].motion)).toBe('M6 8 L94 92')
+    expect(ttmMotionSvgPath([
+      { time: 0, samplePosition: 0.5 },
+      { time: 1, samplePosition: 0.5 },
+    ])).toBe('M6 50 L94 50')
     expect(TTM_GUIDES['baby-rub'].faderIntervals).toEqual([
       { start: 0, end: 1, state: 'open' },
     ])
@@ -42,13 +47,32 @@ describe('illustrative TTM guide catalogue', () => {
       { start: 0, end: 0.5, state: 'open' },
       { start: 0.5, end: 1, state: 'closed' },
     ])
+    expect(TTM_GUIDES['forward-movement'].explanation).toMatch(/not the forward scratch\/cut pattern/i)
+    expect(TTM_GUIDES['forward-cut'].explanation).toMatch(/return.*closed.*muted/i)
+    expect(TTM_GUIDES.chirp.faderIntervals).toEqual([
+      { start: 0, end: 0.48, state: 'open' },
+      { start: 0.48, end: 0.52, state: 'closed' },
+      { start: 0.52, end: 1, state: 'open' },
+    ])
+    expect(TTM_GUIDES.chirp.explanation).toMatch(/width is not a timing transcription/i)
   })
 
   it('returns only finite exact-name suggestions and does not assign them', () => {
     expect(suggestedGuideForSampleName('Baby')).toBe('baby-rub')
-    expect(suggestedGuideForSampleName(' Baby(F) ')).toBe('forward-movement')
+    expect(suggestedGuideForSampleName('  Baby  (F)  ')).toBe('forward-movement')
+    expect(suggestedGuideForSampleName('baby f')).toBe('forward-movement')
+    expect(suggestedGuideForSampleName('baby(F)')).toBe('forward-movement')
+    expect(suggestedGuideForSampleName('Baby (R)')).toBe('backward-movement')
+    expect(suggestedGuideForSampleName('baby rev')).toBe('backward-movement')
     expect(suggestedGuideForSampleName('baby(r)')).toBe('backward-movement')
+    expect(suggestedGuideForSampleName('Chirp')).toBe('chirp')
     expect(suggestedGuideForSampleName('Baby forward')).toBeNull()
+    expect(suggestedGuideForSampleName('Baby Fade')).toBeNull()
+    expect(suggestedGuideForSampleName('Chirp (Triplets 1)')).toBeNull()
+    expect(suggestedGuideForSampleName('Chirp (Transform Chirp)')).toBeNull()
+    expect(suggestedGuideForSampleName('Drag (F)')).toBeNull()
+    expect(suggestedGuideForSampleName('Stab')).toBeNull()
+    expect(suggestedGuideForSampleName('Flare (2Click Orbit)')).toBeNull()
     expect(suggestedGuideForSampleName('Fresh')).toBeNull()
     expect(suggestedGuideForSampleName('toString')).toBeNull()
     expect(getTtmGuide('invented-pattern')).toBeNull()
@@ -60,6 +84,24 @@ describe('illustrative TTM guide catalogue', () => {
     for (const guide of Object.values(TTM_GUIDES)) {
       expect(validateTtmAnnotation(guide)).toEqual({ valid: true, issues: [] })
     }
+  })
+
+  it('rejects invalid paths before turning coordinates into an SVG path', () => {
+    expect(() => ttmMotionSvgPath([
+      { time: 0, samplePosition: 0 },
+      { time: 0.5, samplePosition: 1.2 },
+      { time: 1, samplePosition: 0 },
+    ])).toThrow(RangeError)
+    expect(() => ttmMotionSvgPath([
+      { time: 0, samplePosition: 0 },
+      { time: 0.5, samplePosition: 1 },
+      { time: 0.5, samplePosition: 0 },
+      { time: 1, samplePosition: 0 },
+    ])).toThrow(RangeError)
+    expect(() => ttmMotionSvgPath([
+      { time: 0.1, samplePosition: 0 },
+      { time: 1, samplePosition: 1 },
+    ])).toThrow(RangeError)
   })
 })
 
@@ -131,5 +173,17 @@ describe('TTM annotation validation', () => {
 
     expect(badProvenance.issues).toContainEqual(expect.objectContaining({ code: 'invalid-provenance' }))
     expect(falseRest.issues).toContainEqual(expect.objectContaining({ code: 'unknown-kind' }))
+  })
+
+  it('rejects provenance that points at another source or describes a transcription', () => {
+    const wrongTitle = validateTtmAnnotation(guideInput({
+      provenance: { ...TTM_GUIDES['baby-rub'].provenance, sourceTitle: 'An audio transcription' },
+    }))
+    const falseClaim = validateTtmAnnotation(guideInput({
+      provenance: { ...TTM_GUIDES['baby-rub'].provenance, note: 'Transcribed from the bundled audio.' },
+    }))
+
+    expect(wrongTitle.issues).toContainEqual(expect.objectContaining({ code: 'invalid-provenance' }))
+    expect(falseClaim.issues).toContainEqual(expect.objectContaining({ code: 'invalid-provenance' }))
   })
 })

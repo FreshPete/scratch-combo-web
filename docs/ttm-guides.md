@@ -1,32 +1,41 @@
-# TTM guide annotations (local debug only)
+# TTM movement and fader guides
 
-This is a local-development debug feature. Production builds keep the TTM practice-guides choice visible but disabled with the label “Local debug only”; they always show the Waveform view and omit TTM assignment controls. Vite gates the feature with `import.meta.env.DEV` and exposes no production configuration switch.
+The TTM view uses a small set of **illustrative practice guides**. They show record direction and whether the fader is open or closed; they are not transcriptions of the bundled WAVs and are not a complete TTM score editor.
 
-The optional TTM view provides four small, source-attributed teaching guides for record movement and fader gating. The official [TTM basics](https://www.ttm-dj.com/ttm-01-01-basics/) describes time on the horizontal axis and record rotation on the vertical axis; forward movement rises, backward movement falls, and the baby/rub scratch moves in both directions without mixer cuts. Its forward-scratch description uses the fader to mute the return movement. The examples here are simplified shapes based on those textual descriptions.
+The official [TTM basics](https://www.ttm-dj.com/ttm-01-01-basics/) describes a staff with time on the horizontal axis and record rotation on the vertical axis. Forward movement slopes upward, backward movement slopes downward, and a horizontal line means the record is stopped. A vertical line would represent movement in zero time, so this guide format rejects repeated time coordinates. The source defines a baby/rub as forward and backward record movement with no mixer cut, a forward scratch as similar movement with the return muted by a mixer control, and a chirp as forward/backward strokes cut at the direction change. The charts below are simplified examples based on those descriptions, with arbitrary normalized proportions rather than TTM beat subdivisions.
 
-These are **illustrative technique guides**, not transcriptions of the preset WAVs. The app does not infer record movement or crossfader position from PCM, waveform shape, file names beyond a few advisory aliases, or silence. It does not copy the original TTM charts. A per-sample `TtmSampleGuideSelection` is only a guide ID or the `UNTRANSCRIBED` sentinel. The UI keeps selections in the current browser session and resets them when the preset changes; they are not saved to the legacy INI or used by audio playback.
+## Guide catalogue
 
-## Guide data
+`src/notation/ttm-guides.ts` exports the immutable `TTM_GUIDES` catalogue, `getTtmGuide(id)`, and `UNTRANSCRIBED`. Every guide carries illustrative provenance. Motion points use normalized `time` and `samplePosition` values in `[0, 1]`: time increases from `0` to `1`, and a higher sample position is drawn higher on the staff. Each path needs at least two finite points, strictly increasing time, in-range coordinates, and full endpoints. The SVG helper rejects invalid paths before creating a path string.
 
-`src/notation/ttm-guides.ts` exports the immutable `TTM_GUIDES` catalogue and `getTtmGuide(id)`. Motion uses normalized `time` and `samplePosition` values in `[0, 1]`. The first and last points span time `0` through `1`, and each later point has strictly greater time, so a vertical instantaneous jump cannot be represented. In the SVG path helper, a greater sample position is drawn higher on the staff.
+Fader intervals partition the same normalized time range in order, with no gaps or overlaps. `open` means the fader passes the sound; `closed` means the sound is muted. Adjacent intervals share the instant where the fader changes state.
 
-Fader intervals use normalized `start`, `end`, and `state` (`open` or `closed`). They partition the whole time range, in order, with no gaps or overlaps. Intervals use a shared boundary for an instantaneous fader change. The examples are:
+| Guide | Record motion | Fader | Meaning |
+|---|---|---|---|
+| Baby scratch / rub | Forward, then backward | Open throughout | Both record strokes remain audible. |
+| Forward movement | One forward stroke | Open throughout | Direction only; this is not a forward scratch/cut. |
+| Backward movement | One backward stroke | Open throughout | Reverse direction, drawn downward from the segment end. |
+| Forward scratch / cut | Forward, then backward | Open forward; closed on return | The return stroke is muted. |
+| Chirp | Forward, then backward | Open on each stroke; a narrow closed notch at the turnaround | Shows a cut separating the two audible strokes. The notch width is illustrative, not a timing transcription. |
 
-| Guide | Record path | Fader gate |
-|---|---|---|
-| Baby / rub | Forward then backward triangle | Open throughout |
-| Forward movement | One upward stroke | Open throughout |
-| Backward movement | One downward stroke | Open throughout |
-| Forward cut | Forward then backward triangle | Open on the forward half, closed on the return |
+The forward-movement and forward-scratch guides are separate on purpose: an open forward stroke does not describe the muted return that defines the basic forward scratch. The official [simple scratches descriptions](https://www.ttm-dj.com/ttm-01-02-scratches/) cover other techniques too. This compact guide model does not encode exact click timing or the faster repeated fader events used by techniques such as transformers, so their names do not receive invented patterns.
 
-`validateTtmAnnotation` checks normalized ranges, increasing motion time, complete endpoints, fader interval coverage, and illustrative provenance. The explicit `UNTRANSCRIBED` marker means the user chose to show no guide for this sample in the current session. A silent sample is not a stationary-record or closed-fader rest; silence alone cannot distinguish those actions.
+## Sample-name suggestions
 
-## Advisory name suggestions
+`suggestedGuideForSampleName` matches only a finite alias list after trimming edges, collapsing repeated whitespace, and ignoring case:
 
-`suggestedGuideForSampleName` returns a guide ID only for the finite display-name aliases `Baby`, `Baby(F)`, and `Baby(R)`. In TTM view, those aliases immediately display clearly labeled illustrative patterns: Baby/rub, forward movement, and backward movement. This is a suggestion based only on the exact sample label, not an audio transcription or recognition result. Other sample names display an explicit Unassigned marker and an Untranscribed label.
+| Display-name spellings | Suggested guide |
+|---|---|
+| `Baby` | Baby scratch / rub |
+| `Baby (F)`, `Baby F` | Forward movement |
+| `Baby (R)`, `Baby Rev` | Backward movement |
+| `Baby(F)`, `Baby(R)` | Compatibility spellings for the same forward/backward guides |
+| `Chirp` | Chirp |
 
-The sample editor shows an alias-derived suggestion without storing it as a session assignment. Choosing another guide stores that guide ID in the current session; choosing Untranscribed stores the explicit `UNTRANSCRIBED` marker and takes precedence over the alias. Assignments clear when the preset source changes and are never added to the INI or playback data.
+The six display-name spellings `Baby`, `Baby (F)`, `Baby F`, `Baby (R)`, `Baby Rev`, and `Chirp` appear in the built-in preset definitions. The compact parenthesis spellings are retained for compatibility with existing sample labels. A suggestion only comes from the display name and never assigns a guide by itself. Other names, including `Baby Fade`, `Chirp (Triplets 1)`, `Chirp (Transform Chirp)`, `Drag`, `Stab`, and `Flare`, stay unassigned because their name alone does not establish a specific record path and fader sequence. The app does not analyze PCM, waveform shape, or silence to infer a TTM notation.
 
-## Source and limits
+The sample editor can store a guide ID or the explicit `UNTRANSCRIBED` marker for the current session. `UNTRANSCRIBED` carries no movement or fader data. Unknown names remain unassigned until the user chooses a guide. These selections are not saved to the legacy INI and do not affect audio playback.
 
-The movement directions, baby/rub definition, and forward-scratch fader behavior are based on the official [TTM basics and scratch descriptions](https://www.ttm-dj.com/ttm-01-01-basics/). These examples do not encode the full TTM score system, timing subdivisions, clicks, sample-bank changes, or every scratch technique. They are compact display aids only, with no claim about the sound or performance represented by any particular WAV.
+## Provenance and limits
+
+The guide provenance points to the official TTM basics page and states that each pattern is an illustrative teaching shape, not an official chart and not a transcription verified against sample audio. The examples do not encode measures, counts, note subdivisions, sample-bank changes, exact click timing, or the full fader notation. A sample name can suggest a useful basic movement example, but it is not evidence of how that sample was performed.

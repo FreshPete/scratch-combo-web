@@ -3,6 +3,7 @@ dist/
 coverage/
 playwright-report/
 test-results/
+.vitest/
 *.log
 .DS_Store
 desktop.ini

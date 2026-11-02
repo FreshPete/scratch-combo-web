@@ -12,6 +12,7 @@ declare global {
         duration: number | undefined
         playbackRate: number
       }>
+      sourceStops: AudioBufferSourceNode[]
       connections: Array<{ source: AudioNode; destination: AudioNode }>
       worklets: Array<{ node: AudioWorkletNode; analyser: AnalyserNode }>
     }
@@ -74,6 +75,7 @@ async function instrumentWebAudio(page: Page): Promise<void> {
         duration: number | undefined
         playbackRate: number
       }>,
+      sourceStops: [] as AudioBufferSourceNode[],
       connections: [] as Array<{ source: AudioNode; destination: AudioNode }>,
       worklets: [] as Array<{ node: AudioWorkletNode; analyser: AnalyserNode }>,
     }
@@ -120,6 +122,20 @@ async function instrumentWebAudio(page: Page): Promise<void> {
       })
       return originalStart.call(this, when, offset, duration)
     }
+
+    const originalStop = AudioBufferSourceNode.prototype.stop
+    AudioBufferSourceNode.prototype.stop = function (when?: number) {
+      if (this.loop) qa.sourceStops.push(this)
+      return originalStop.call(this, when)
+    }
+  })
+}
+
+async function activeBeatLoopCount(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const qa = window.__customBeatQa
+    if (!qa) return 0
+    return qa.sourceStarts.filter(({ node, loop }) => loop && !qa.sourceStops.includes(node)).length
   })
 }
 
@@ -137,29 +153,56 @@ type ScratchLibraryBaseline = {
 async function loadScratchLibrary(page: Page): Promise<ScratchLibraryBaseline> {
   await page.goto('/')
   await expect(page.getByLabel('Quick preset')).toHaveValue('SSC-085BPM-01')
+  const presetId = await page.getByLabel('Quick preset').inputValue()
+  await page.getByRole('tab', { name: 'Session', exact: true }).click()
   await expect(page.getByRole('spinbutton', { name: 'BPM', exact: true })).toHaveValue('85')
   await expect(page.getByLabel('Beat bed')).toHaveValue('0')
+  const beatOptionText = (await page.getByLabel('Beat bed').locator('option').nth(1).textContent())?.trim() ?? ''
+  const sampleVolume = await page.getByLabel('Sample level').inputValue()
+  const beatVolume = await page.getByLabel('Beat level').inputValue()
+  await page.getByRole('tab', { name: 'Samples', exact: true }).click()
   await expect(page.locator('.sample-table tbody tr').first()).toBeVisible()
+  const sampleName = (await page.locator('.sample-name').first().textContent())?.trim() ?? ''
+  const sampleCount = await page.locator('.sample-table tbody tr').count()
+  const sampleCountText = (await page.locator('.sample-count').textContent())?.trim() ?? ''
+  await page.getByRole('tab', { name: 'Practice', exact: true }).click()
   const baseline: ScratchLibraryBaseline = {
-    presetId: await page.getByLabel('Quick preset').inputValue(),
+    presetId,
     heading: (await page.locator('.sequence-heading').textContent()) ?? '',
-    sampleName: (await page.locator('.sample-name').first().textContent())?.trim() ?? '',
-    sampleCount: await page.locator('.sample-table tbody tr').count(),
-    sampleCountText: (await page.locator('.sample-count').textContent())?.trim() ?? '',
-    beatOptionText: (await page.getByLabel('Beat bed').locator('option').nth(1).textContent())?.trim() ?? '',
-    sampleVolume: await page.getByLabel('Sample level').inputValue(),
-    beatVolume: await page.getByLabel('Beat level').inputValue(),
+    sampleName,
+    sampleCount,
+    sampleCountText,
+    beatOptionText,
+    sampleVolume,
+    beatVolume,
   }
   expect(baseline.sampleName).not.toBe('')
   expect(baseline.sampleCount).toBeGreaterThan(0)
   expect(baseline.beatOptionText).toMatch(/^Beat 01 · /)
 
   await expect(page.locator('[aria-label^="Sequence timeline: "]')).toBeVisible()
-  await expect(page.getByLabel('Beat bed')).toHaveValue('0')
+  await page.getByRole('tab', { name: 'Session', exact: true }).click()
+  await expect(page.getByRole('radio', { name: 'Preset', exact: true })).toBeChecked()
+  await expect(page.getByRole('radio', { name: 'Custom', exact: true })).toBeEnabled()
+  await expect(page.getByLabel('Beat bed')).toBeEnabled()
+  await expect.poll(() => page.evaluate(() => window.__customBeatQa?.sourceStarts.length ?? 0)).toBe(0)
   return baseline
 }
 
 async function uploadAndApplyCustomBeat(page: Page, file: { name: string; mimeType: string; buffer: Buffer }, baseline: ScratchLibraryBaseline): Promise<void> {
+  await expect(page.getByLabel('Upload custom beat')).toBeDisabled()
+  await expect(page.locator('.session-controls__custom-beat-upload')).toHaveClass(/session-controls__custom-beat-upload--inactive/)
+  const inactiveCustomPanel = page.locator('.session-controls__custom-source-panel')
+  const activePresetPanel = page.locator('.session-controls__source-panel').first()
+  await expect(inactiveCustomPanel).toHaveClass(/session-controls__source-panel--inactive/)
+  const [inactiveColor, activeColor] = await Promise.all([
+    inactiveCustomPanel.evaluate((element) => getComputedStyle(element).color),
+    activePresetPanel.evaluate((element) => getComputedStyle(element).color),
+  ])
+  expect(inactiveColor).not.toBe(activeColor)
+  await page.getByRole('radio', { name: 'Custom', exact: true }).check()
+  await expect(page.getByLabel('Beat bed')).toBeDisabled()
+  await expect(page.getByLabel('Upload custom beat')).toBeEnabled()
   await page.getByLabel('Upload custom beat').setInputFiles(file)
   const analysis = page.locator('.session-controls__analysis')
   await expect(analysis).toContainText(/estimated|ambiguous|periodic tempo|pulse/i, { timeout: 20_000 })
@@ -181,7 +224,10 @@ async function uploadAndApplyCustomBeat(page: Page, file: { name: string; mimeTy
   await expect(correction).toBeVisible()
   await correction.fill(String(customBeatBpm))
   await page.getByRole('button', { name: 'Use custom beat' }).click()
-  await expect(page.getByLabel('Beat bed')).toHaveValue('custom')
+  await expect(page.getByRole('radio', { name: 'Custom', exact: true })).toBeChecked()
+  await expect(page.getByRole('radio', { name: 'Preset', exact: true })).toBeEnabled()
+  await expect(page.getByLabel('Beat bed')).toBeDisabled()
+  await expect(page.locator('.session-controls__custom-beat-upload')).not.toHaveClass(/session-controls__custom-beat-upload--inactive/)
   await expect(page.getByRole('spinbutton', { name: 'Recorded BPM for custom beat' })).toHaveValue(String(customBeatBpm))
   await expect(page.getByRole('spinbutton', { name: 'BPM', exact: true })).toHaveValue(String(customBeatBpm))
   await expect(page.locator('.session-controls__hint').filter({ hasText: `scratch source ${scratchBpm}` })).toContainText(`beat source ${customBeatBpm}`)
@@ -191,7 +237,10 @@ async function uploadAndApplyCustomBeat(page: Page, file: { name: string; mimeTy
   await expect(page.locator('.sample-table tbody tr')).toHaveCount(baseline.sampleCount)
   await expect(page.locator('.sample-count')).toHaveText(baseline.sampleCountText)
   await expect(page.getByLabel('Beat bed').locator('option', { hasText: baseline.beatOptionText })).toHaveCount(1)
-  await expect(page.getByLabel('Beat bed').locator('option', { hasText: `Your beat · ${file.name}` })).toHaveCount(1)
+  await expect(page.getByLabel('Beat bed').locator('option', { hasText: `Your beat · ${file.name}` })).toHaveCount(0)
+  await expect.poll(() => page.evaluate(() => window.__customBeatQa?.sourceStarts.filter((source) => source.loop).length ?? 0))
+    .toBe(0)
+  await expect.poll(() => page.evaluate(() => window.__customBeatQa?.sourceStarts.length ?? 0)).toBe(0)
 }
 
 async function readAudioGraph(page: Page): Promise<{
@@ -280,6 +329,11 @@ function proofImagePath(): string {
   return path.resolve(process.cwd(), 'docs/images', `custom-beat-live-playback-${browser}.png`)
 }
 
+function customFirstProofImagePath(): string {
+  const browser = (process.env.PLAYWRIGHT_CHANNEL ?? 'msedge').toLowerCase().replace(/[^a-z0-9-]+/g, '-')
+  return path.resolve(process.cwd(), 'docs/images', `beat-source-custom-first-${browser}.png`)
+}
+
 test('WAV custom beat keeps the scratch library, follows tempo at neutral pitch, and leaves live controls available', async ({ page }) => {
   const requests: Array<{ url: string; method: string }> = []
   page.on('request', (request) => requests.push({ url: request.url(), method: request.method() }))
@@ -301,6 +355,7 @@ test('WAV custom beat keeps the scratch library, follows tempo at neutral pitch,
   await expect(page.getByRole('button', { name: 'Stop' })).toBeEnabled()
   await expect.poll(() => page.evaluate(() => window.__customBeatQa?.contexts.map((context) => context.state) ?? []))
     .toContain('running')
+  await expect.poll(() => activeBeatLoopCount(page)).toBe(1)
 
   const structuralControls = [
     page.getByLabel('Quick preset'),
@@ -309,8 +364,10 @@ test('WAV custom beat keeps the scratch library, follows tempo at neutral pitch,
     page.getByLabel('Choose WAV files'),
     page.getByLabel('Choose audio folder'),
     page.getByLabel('Beat bed'),
+    page.getByRole('radio', { name: 'Preset', exact: true }),
+    page.getByRole('radio', { name: 'Custom', exact: true }),
     page.getByLabel('Upload custom beat'),
-    page.getByRole('button', { name: 'Generate combo' }),
+    page.locator('.sequence-actions .button--primary'),
   ]
   for (const control of structuralControls) await expect(control).toBeDisabled()
 
@@ -361,7 +418,10 @@ test('WAV custom beat keeps the scratch library, follows tempo at neutral pitch,
   await expect(page.getByRole('slider', { name: 'Pitch shift in semitones' })).toHaveValue('0')
   await expect(page.getByLabel('Sample level')).toHaveValue(scratchDefaults.sample)
   await expect(page.getByLabel('Beat level')).toHaveValue(scratchDefaults.beat)
-  await expect(page.locator('.transport-status')).toContainText('Playback continues.')
+  await expect(page.getByRole('button', { name: 'Stop' })).toBeEnabled()
+  await expect(page.locator('.transport-status')).not.toHaveText('Playback stopped.')
+  expect(await page.evaluate(() => window.__customBeatQa?.sourceStarts.filter((source) => source.loop).length ?? 0)).toBe(1)
+  expect(await page.evaluate(() => window.__customBeatQa?.sourceStops.length ?? 0)).toBe(0)
   await expect.poll(async () => (await readAudioGraph(page)).sampleProcessorRate).toBeCloseTo(customBeatBpm / scratchBpm, 4)
   await expect.poll(async () => (await readAudioGraph(page)).beatProcessorRate).toBeCloseTo(1, 4)
   await expect.poll(async () => {
@@ -379,18 +439,28 @@ test('WAV custom beat keeps the scratch library, follows tempo at neutral pitch,
   const invalidStatus = page.locator('.session-controls__analysis')
   await page.getByLabel('Upload custom beat').setInputFiles(payload('broken.wav', Buffer.from('not a RIFF/WAVE file'), 'audio/wav'))
   await expect(invalidStatus).toContainText(/could not analyze.*current beat remains selected/i)
-  await expect(page.getByLabel('Beat bed')).toHaveValue('custom')
+  await expect(page.getByRole('radio', { name: 'Custom', exact: true })).toBeChecked()
   await expect(page.getByRole('spinbutton', { name: 'Recorded BPM for custom beat' })).toHaveValue(String(customBeatBpm))
   await expect(page.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
-  await page.getByLabel('Beat bed').selectOption('0')
+  await page.getByRole('radio', { name: 'Preset', exact: true }).check()
+  await expect(page.getByLabel('Beat bed')).toBeEnabled()
+  await expect(page.getByLabel('Upload custom beat')).toBeDisabled()
+  await expect(page.locator('.session-controls__custom-beat-upload')).toHaveClass(/session-controls__custom-beat-upload--inactive/)
+  const invalidCandidateApply = page.getByRole('button', { name: 'Use custom beat' })
+  if (await invalidCandidateApply.count()) await expect(invalidCandidateApply).toBeDisabled()
   await expect(page.getByLabel('Beat bed')).toHaveValue('0')
-  await page.getByLabel('Beat bed').selectOption('custom')
-  await expect(page.getByLabel('Beat bed')).toHaveValue('custom')
+  await expect.poll(() => activeBeatLoopCount(page)).toBe(0)
+  await page.getByRole('radio', { name: 'Custom', exact: true }).check()
+  await expect(page.getByRole('radio', { name: 'Custom', exact: true })).toBeChecked()
+  await expect(page.getByLabel('Beat bed')).toBeDisabled()
+  await expect(page.getByLabel('Upload custom beat')).toBeEnabled()
+  await expect(page.locator('.session-controls__custom-beat-upload')).not.toHaveClass(/session-controls__custom-beat-upload--inactive/)
   await expect(page.getByRole('spinbutton', { name: 'BPM', exact: true })).toHaveValue(String(customBeatBpm))
+  await expect(page.getByRole('spinbutton', { name: 'Recorded BPM for custom beat' })).toHaveValue(String(customBeatBpm))
+  await expect.poll(() => activeBeatLoopCount(page)).toBe(0)
   await page.getByRole('button', { name: 'Play sequence' }).click()
   await expect(page.getByRole('button', { name: 'Stop' })).toBeEnabled()
-  await expect.poll(() => page.evaluate(() => window.__customBeatQa?.sourceStarts.filter((source) => source.loop).length ?? 0))
-    .toBeGreaterThan(1)
+  await expect.poll(() => activeBeatLoopCount(page)).toBe(1)
   await page.getByRole('button', { name: 'Stop' }).click()
   await expect(page.locator('.transport-status')).toHaveText('Playback stopped.')
 
@@ -410,10 +480,24 @@ test('MP3 custom beat decodes in the browser, can be corrected, and reaches the 
     buffer: readFileSync(mp3FixturePath),
   }, baseline)
 
+  await page.getByRole('tab', { name: 'Practice', exact: true }).click()
+  await expect(page.locator('.timeline-scroll')).toBeVisible()
+  await page.getByRole('radio', { name: 'TTM practice guides' }).check()
+  await expect(page.locator('.sequence-ttm-motion path').first()).toBeVisible()
+  await page.getByRole('tab', { name: 'Samples', exact: true }).click()
+  await expect(page.locator('.sample-table tbody tr')).toHaveCount(baseline.sampleCount)
+  await page.getByRole('tab', { name: 'Files', exact: true }).click()
+  await expect(page.getByLabel('Choose INI preset')).toBeEnabled()
+  await page.getByRole('tab', { name: 'Session', exact: true }).click()
+  await expect(page.getByRole('radio', { name: 'Custom', exact: true })).toBeChecked()
+  await expect(page.getByRole('spinbutton', { name: 'Recorded BPM for custom beat' })).toHaveValue(String(customBeatBpm))
+  await expect.poll(() => page.evaluate(() => window.__customBeatQa?.sourceStarts.length ?? 0)).toBe(0)
+
   await page.getByRole('button', { name: 'Play sequence' }).click()
   await expect(page.getByRole('button', { name: 'Stop' })).toBeEnabled()
   await expect.poll(() => page.evaluate(() => window.__customBeatQa?.contexts.map((context) => context.state) ?? []))
     .toContain('running')
+  await expect.poll(() => activeBeatLoopCount(page)).toBe(1)
   const graph = await readAudioGraph(page)
   expect(graph.beatSourceLoop).toBe(true)
   expect(graph.beatSourceDuration).toBeGreaterThan(10)
@@ -424,4 +508,93 @@ test('MP3 custom beat decodes in the browser, can be corrected, and reaches the 
   await waitForBeatOutputTone(page, customBeatToneHz)
   await page.getByRole('button', { name: 'Stop' }).click()
   await expect(page.locator('.transport-status')).toHaveText('Playback stopped.')
+})
+
+test('Custom source can be selected first and reviewed audio stays inactive until applied', async ({ page }) => {
+  await instrumentWebAudio(page)
+  const baseline = await loadScratchLibrary(page)
+
+  await page.getByRole('radio', { name: 'Custom', exact: true }).check()
+  await expect(page.getByRole('radio', { name: 'Custom', exact: true })).toBeChecked()
+  await expect(page.getByRole('radio', { name: 'Preset', exact: true })).toBeEnabled()
+  await expect(page.getByLabel('Beat bed')).toBeDisabled()
+  const inactivePresetPanel = page.locator('.session-controls__source-panel').first()
+  const activeCustomPanel = page.locator('.session-controls__custom-source-panel')
+  await expect(inactivePresetPanel).toHaveClass(/session-controls__source-panel--inactive/)
+  await expect(activeCustomPanel).not.toHaveClass(/session-controls__source-panel--inactive/)
+  const [inactiveSourceColor, activeSourceColor] = await Promise.all([
+    inactivePresetPanel.evaluate((element) => getComputedStyle(element).color),
+    activeCustomPanel.evaluate((element) => getComputedStyle(element).color),
+  ])
+  expect(inactiveSourceColor).not.toBe(activeSourceColor)
+  await expect(page.locator('.session-controls__beat-sync')).toContainText(/No custom beat is applied/i)
+  await expect(page.getByLabel('Upload custom beat')).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+  await page.locator('#session-section').evaluate((section) => section.scrollIntoView({ block: 'start' }))
+  await page.screenshot({ path: customFirstProofImagePath(), fullPage: false })
+
+  await page.getByLabel('Upload custom beat').setInputFiles({
+    name: 'CustomBeat-128.wav',
+    mimeType: 'audio/wav',
+    buffer: makeClickTrackWav(customBeatBpm, fixtureBeatCount, customBeatToneHz),
+  })
+  const analysis = page.locator('.session-controls__analysis')
+  await expect(analysis).toContainText(/estimated|ambiguous|periodic tempo|pulse/i, { timeout: 20_000 })
+  await expect(page.getByRole('radio', { name: 'Custom', exact: true })).toBeChecked()
+  await expect(page.getByRole('spinbutton', { name: 'Recorded BPM for custom beat' })).toHaveCount(0)
+  await expect(page.getByRole('spinbutton', { name: 'Custom beat BPM' })).toBeVisible()
+  await expect(page.locator('.session-controls__beat-sync')).toContainText(/No custom beat is applied/i)
+  await expect.poll(() => page.evaluate(() => window.__customBeatQa?.sourceStarts.filter((source) => source.loop).length ?? 0))
+    .toBe(0)
+
+  await page.getByRole('button', { name: 'Play sequence' }).click()
+  await expect(page.getByRole('button', { name: 'Stop' })).toBeEnabled()
+  await expect.poll(() => activeBeatLoopCount(page)).toBe(0)
+  await page.getByRole('button', { name: 'Stop' }).click()
+  await expect(page.locator('.transport-status')).toHaveText('Playback stopped.')
+
+  await page.getByRole('spinbutton', { name: 'Custom beat BPM' }).fill(String(customBeatBpm))
+  await page.getByRole('button', { name: 'Use custom beat' }).click()
+  await expect(page.getByRole('radio', { name: 'Custom', exact: true })).toBeChecked()
+  await expect(page.getByRole('spinbutton', { name: 'Recorded BPM for custom beat' })).toHaveValue(String(customBeatBpm))
+  await expect(page.getByLabel('Beat bed')).toBeDisabled()
+  await expect.poll(() => page.evaluate(() => window.__customBeatQa?.sourceStarts.filter((source) => source.loop).length ?? 0))
+    .toBe(0)
+
+  await page.getByRole('button', { name: 'Play sequence' }).click()
+  await expect(page.getByRole('button', { name: 'Stop' })).toBeEnabled()
+  await expect.poll(() => activeBeatLoopCount(page)).toBe(1)
+  const appliedCustomLoop = await page.evaluate(() => {
+    const qa = window.__customBeatQa
+    return qa?.sourceStarts.filter(({ node, loop }) => loop && !qa.sourceStops.includes(node)).at(-1)?.duration ?? 0
+  })
+  expect(appliedCustomLoop).toBeGreaterThan(10)
+  await page.getByRole('button', { name: 'Stop' }).click()
+  await expect(page.locator('.transport-status')).toHaveText('Playback stopped.')
+
+  await page.getByRole('radio', { name: 'Preset', exact: true }).check()
+  await expect(page.getByLabel('Beat bed')).toBeEnabled()
+  await expect(page.getByLabel('Beat bed')).toHaveValue('0')
+  await expect(page.getByLabel('Upload custom beat')).toBeDisabled()
+  await expect(page.locator('.session-controls__custom-beat-upload')).toHaveClass(/session-controls__custom-beat-upload--inactive/)
+  const cachedCandidateBpm = page.getByRole('spinbutton', { name: 'Custom beat BPM' })
+  if (await cachedCandidateBpm.count()) await expect(cachedCandidateBpm).toBeDisabled()
+  const cachedCandidateApply = page.getByRole('button', { name: 'Use custom beat' })
+  if (await cachedCandidateApply.count()) await expect(cachedCandidateApply).toBeDisabled()
+  await expect(activeCustomPanel).toHaveClass(/session-controls__source-panel--inactive/)
+  await expect(page.getByRole('spinbutton', { name: 'Recorded BPM for custom beat' })).toBeDisabled()
+  await page.getByRole('button', { name: 'Play sequence' }).click()
+  await expect(page.getByRole('button', { name: 'Stop' })).toBeEnabled()
+  await expect.poll(() => activeBeatLoopCount(page)).toBe(1)
+  await page.getByRole('button', { name: 'Stop' }).click()
+  await expect(page.locator('.transport-status')).toHaveText('Playback stopped.')
+
+  await page.getByRole('radio', { name: 'Custom', exact: true }).check()
+  await expect(page.getByRole('radio', { name: 'Custom', exact: true })).toBeChecked()
+  await expect(page.getByLabel('Beat bed')).toBeDisabled()
+  await expect(activeCustomPanel).not.toHaveClass(/session-controls__source-panel--inactive/)
+  await expect(page.getByRole('spinbutton', { name: 'Recorded BPM for custom beat' })).toBeEnabled()
+  await expect(page.getByRole('spinbutton', { name: 'Recorded BPM for custom beat' })).toHaveValue(String(customBeatBpm))
+  await expect(page.getByLabel('Upload custom beat')).toHaveAttribute('accept', /audio\/mpeg/)
+  await expect(page.getByLabel('Quick preset')).toHaveValue(baseline.presetId)
 })

@@ -1,6 +1,6 @@
 import {
   useEffect, useMemo, useRef, useState, useSyncExternalStore,
-  type ChangeEvent, type CSSProperties, type InputHTMLAttributes,
+  type ChangeEvent, type CSSProperties, type InputHTMLAttributes, type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
 import { analyzeLocalAudioFile, AudioTransport, type CyclePlanOptions, type CycleSlot, type PlayOptions } from './audio'
 import { getTempoRange, SessionControls, type CustomBeatAnalysisStatus } from './SessionControls'
@@ -65,6 +65,151 @@ type TimelineLayout = 'grid' | 'inline'
 type WorkspaceSection = 'sequence' | 'files' | 'session' | 'samples'
 type PresetSource = 'loading' | 'builtin' | 'custom' | 'demo'
 type CustomBeatCandidate = { file: File; buffer: AudioBuffer | null }
+
+const WORKSPACE_TABS: ReadonlyArray<{ section: WorkspaceSection; label: string; href: string; id: string }> = [
+  { section: 'sequence', label: 'Practice', href: '#sequence-section', id: 'tab-practice' },
+  { section: 'session', label: 'Session', href: '#session-section', id: 'tab-session' },
+  { section: 'samples', label: 'Samples', href: '#sample-section', id: 'tab-samples' },
+  { section: 'files', label: 'Files', href: '#files-section', id: 'tab-files' },
+]
+
+function WorkspaceSectionIcon({ section }: { section: WorkspaceSection }) {
+  return (
+    <svg className="rail__icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      {section === 'sequence' && <>
+        <path d="M3 5h14M3 10h14M3 15h14" />
+        <path d="M6.5 3.5v3M11.5 8.5v3M15.5 13.5v3" />
+      </>}
+      {section === 'session' && <>
+        <path d="M5 3v14M10 3v14M15 3v14" />
+        <circle cx="5" cy="7" r="1.8" />
+        <circle cx="10" cy="12" r="1.8" />
+        <circle cx="15" cy="6" r="1.8" />
+      </>}
+      {section === 'samples' && <path d="M2.5 10h2l1.6-4.5 2.2 9 2.3-10 2.1 9 1.8-4.5 1.5 1h1.5" />}
+      {section === 'files' && <path d="M2.5 6V4.3h5l1.7 1.8h8.3v9.6H2.5z" />}
+    </svg>
+  )
+}
+
+function workspaceSectionForHash(hash: string): WorkspaceSection | null {
+  const target = hash.replace(/^#/, '')
+  if (!target || target === 'workspace' || target === 'sequence-section' || target === 'sequence-heading' || target === 'timeline-caption') return 'sequence'
+  if (target === 'session-section' || target === 'settings-heading') return 'session'
+  if (target === 'sample-section' || target === 'samples-heading') return 'samples'
+  if (target === 'files-section' || target === 'import-heading' || target === 'preset-file') return 'files'
+  return null
+}
+
+function isSingleKeyShortcutTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  return target.isContentEditable || Boolean(target.closest(
+    'input, textarea, select, button, a[href], summary, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="tab"], [role="checkbox"], [role="radio"], [role="slider"], [role="combobox"], [role="switch"], [role="dialog"]',
+  ))
+}
+
+function KeyboardShortcutsDialog({
+  open,
+  shortcutsEnabled,
+  onToggleShortcuts,
+  onClose,
+  returnFocus,
+}: {
+  open: boolean
+  shortcutsEnabled: boolean
+  onToggleShortcuts: (enabled: boolean) => void
+  onClose: () => void
+  returnFocus: () => void
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const closeRef = useRef(onClose)
+  const returnFocusRef = useRef(returnFocus)
+  closeRef.current = onClose
+  returnFocusRef.current = returnFocus
+
+  useEffect(() => {
+    const dialog = dialogRef.current
+    if (!dialog || !open) return
+    const hasNativeModal = typeof dialog.showModal === 'function'
+    if (hasNativeModal) {
+      if (!dialog.open) dialog.showModal()
+    } else {
+      dialog.setAttribute('open', '')
+    }
+    closeButtonRef.current?.focus()
+
+    const keepFocusInsideFallback = (event: KeyboardEvent) => {
+      if (hasNativeModal || event.key !== 'Tab') return
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+      ))
+      if (focusable.length === 0) {
+        event.preventDefault()
+        dialog.focus()
+        return
+      }
+      const first = focusable[0]!
+      const last = focusable.at(-1)!
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    const handleEscapeFallback = (event: KeyboardEvent) => {
+      if (!hasNativeModal && event.key === 'Escape') {
+        event.preventDefault()
+        closeRef.current()
+      }
+    }
+    dialog.addEventListener('keydown', keepFocusInsideFallback)
+    dialog.addEventListener('keydown', handleEscapeFallback)
+    return () => {
+      dialog.removeEventListener('keydown', keepFocusInsideFallback)
+      dialog.removeEventListener('keydown', handleEscapeFallback)
+      if (dialog.open) {
+        if (typeof dialog.close === 'function') dialog.close()
+        else dialog.removeAttribute('open')
+      }
+      returnFocusRef.current()
+    }
+  }, [open])
+
+  if (!open) return null
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="shortcut-dialog"
+      aria-labelledby="shortcut-dialog-title"
+      onCancel={(event) => { event.preventDefault(); onClose() }}
+      onClick={(event) => { if (event.target === event.currentTarget) onClose() }}
+    >
+      <div className="shortcut-dialog__heading">
+        <h2 id="shortcut-dialog-title">Keyboard shortcuts</h2>
+        <button ref={closeButtonRef} className="button button--small" type="button" onClick={onClose}>Close shortcuts</button>
+      </div>
+      <label className="shortcut-dialog__toggle">
+        <input
+          type="checkbox"
+          checked={shortcutsEnabled}
+          onChange={(event) => onToggleShortcuts(event.currentTarget.checked)}
+        />
+        <span>Enable single-character shortcuts</span>
+      </label>
+      <p className="shortcut-dialog__note">Shortcuts work outside text fields, buttons, links, and other controls. Press Escape or Close shortcuts to leave this help.</p>
+      <dl className="shortcut-dialog__list">
+        <div><dt><kbd>P</kbd></dt><dd>Play the sequence, or stop playback</dd></div>
+        <div><dt><kbd>G</kbd></dt><dd>Generate a combo or build the demo preview</dd></div>
+        <div><dt><kbd>R</kbd></dt><dd>Reset session controls</dd></div>
+      </dl>
+      {!shortcutsEnabled && <p className="shortcut-dialog__off-note" role="status">Single-character shortcuts are off. This help button remains available.</p>}
+    </dialog>
+  )
+}
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -146,6 +291,20 @@ function timelineGuideForSample(
   return suggestion
     ? { guide: getTtmGuide(suggestion), state: 'suggested' }
     : { guide: null, state: 'unassigned' }
+}
+
+function handleWorkspaceTabKeyDown(event: ReactKeyboardEvent<HTMLAnchorElement>, section: WorkspaceSection) {
+  const currentIndex = WORKSPACE_TABS.findIndex((tab) => tab.section === section)
+  let nextIndex: number | null = null
+  if (event.key === 'ArrowDown' || event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % WORKSPACE_TABS.length
+  if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') nextIndex = (currentIndex + WORKSPACE_TABS.length - 1) % WORKSPACE_TABS.length
+  if (event.key === 'Home') nextIndex = 0
+  if (event.key === 'End') nextIndex = WORKSPACE_TABS.length - 1
+  if (nextIndex === null) return
+  event.preventDefault()
+  const nextTab = document.getElementById(WORKSPACE_TABS[nextIndex]!.id)
+  nextTab?.focus()
+  nextTab?.click()
 }
 
 function sampleFileState(
@@ -253,21 +412,18 @@ function LocalFilePicker({
 
 function LocalImportPanel({
   presetFileName, localFileCount, importMessage, presetError, selectionError,
-  builtInCatalog, selectedPresetId, presetSource, isBootstrapLoading, bootstrapError,
-  locked, onBuiltInPresetChange, onRetryBuiltIn, onPresetChange, onFolderChange, onFilesChange,
+  presetSource, isBootstrapLoading, bootstrapError,
+  locked, onRetryBuiltIn, onPresetChange, onFolderChange, onFilesChange,
 }: {
   presetFileName: string | null
   localFileCount: number
   importMessage: string
   presetError: string | null
   selectionError: string | null
-  builtInCatalog: BuiltInPresetCatalog | undefined
-  selectedPresetId: string
   presetSource: PresetSource
   isBootstrapLoading: boolean
   bootstrapError: string | null
   locked: boolean
-  onBuiltInPresetChange: (id: string) => void
   onRetryBuiltIn: () => void
   onPresetChange: (event: ChangeEvent<HTMLInputElement>) => void
   onFolderChange: (event: ChangeEvent<HTMLInputElement>) => void
@@ -281,24 +437,6 @@ function LocalImportPanel({
           <p>Choose a built-in practice set, or load your own INI and WAV files.</p>
         </div>
         <span className="section-index" aria-hidden="true">LOCAL</span>
-      </div>
-      <div className="quick-preset-row">
-        <label htmlFor="quick-preset">Quick preset</label>
-        <select
-          id="quick-preset"
-          value={selectedPresetId}
-          disabled={locked || isBootstrapLoading}
-          onChange={(event) => onBuiltInPresetChange(event.currentTarget.value)}
-          aria-describedby="quick-preset-help"
-        >
-          {!builtInCatalog && <option value={DEFAULT_BUILTIN_PRESET_ID}>{isBootstrapLoading ? 'Loading built-in presets…' : 'Built-in presets unavailable'}</option>}
-          <option value="demo">Synthetic demo</option>
-          <option value="custom">Your files…</option>
-          {builtInCatalog?.presets.map((entry) => (
-            <option key={entry.id} value={entry.id}>{entry.label} · {entry.bpm} BPM</option>
-          ))}
-        </select>
-        <span id="quick-preset-help">Built-ins load their INI and every referenced WAV. Playback stays stopped until loading finishes.</span>
       </div>
       <div className="file-picker-grid">
         <LocalFilePicker inputId="preset-file" label="Choose INI preset" description="One .ini file" accept=".ini,text/plain" disabled={locked} onChange={onPresetChange} />
@@ -318,6 +456,41 @@ function LocalImportPanel({
       {presetError && <p className="inline-error" role="alert">{presetError}</p>}
       {selectionError && <p className="inline-error inline-error--quiet" role="status">{selectionError}</p>}
     </section>
+  )
+}
+
+function QuickPresetControl({
+  builtInCatalog,
+  selectedPresetId,
+  locked,
+  isBootstrapLoading,
+  onChange,
+}: {
+  builtInCatalog: BuiltInPresetCatalog | undefined
+  selectedPresetId: string
+  locked: boolean
+  isBootstrapLoading: boolean
+  onChange: (id: string) => void
+}) {
+  return (
+    <div className="quick-preset-row">
+      <label htmlFor="quick-preset">Quick preset</label>
+      <select
+        id="quick-preset"
+        value={selectedPresetId}
+        disabled={locked || isBootstrapLoading}
+        onChange={(event) => onChange(event.currentTarget.value)}
+        aria-describedby="quick-preset-help"
+      >
+        {!builtInCatalog && <option value={DEFAULT_BUILTIN_PRESET_ID}>{isBootstrapLoading ? 'Loading built-in presets…' : 'Built-in presets unavailable'}</option>}
+        <option value="demo">Synthetic demo</option>
+        <option value="custom">Your files…</option>
+        {builtInCatalog?.presets.map((entry) => (
+          <option key={entry.id} value={entry.id}>{entry.label} · {entry.bpm} BPM</option>
+        ))}
+      </select>
+      <span id="quick-preset-help">Built-ins load their INI and every referenced WAV. Playback stays stopped until loading finishes.</span>
+    </div>
   )
 }
 
@@ -381,7 +554,7 @@ function cycleSlotsFor(fixture: Fixture, mode: PracticeMode, largePause: boolean
 
 function SequenceTimeline({
   fixture, preset, assets, progress, isPlaying, presentationStarted, presentationPositionUnits, presentationCycleSlotKind,
-  presentationCyclePlanIndex, activeSampleId, activeEventId, auditionedSampleId, timebase, view: requestedView, layout, ttmDebugEnabled, ttmAnnotations, onViewChange, onLayoutChange,
+  presentationCyclePlanIndex, activeSampleId, activeEventId, auditionedSampleId, timebase, view: requestedView, layout, ttmAnnotations, onViewChange, onLayoutChange,
 }: {
   fixture: Fixture
   preset: Preset
@@ -398,7 +571,6 @@ function SequenceTimeline({
   timebase: 'demo' | 'legacy'
   view: TimelineView
   layout: TimelineLayout
-  ttmDebugEnabled: boolean
   ttmAnnotations: Readonly<Record<string, TtmSampleGuideSelection>>
   onViewChange: (view: TimelineView) => void
   onLayoutChange: (layout: TimelineLayout) => void
@@ -413,11 +585,7 @@ function SequenceTimeline({
   const unitsPerBeat = timebase === 'legacy' ? LEGACY_TICKS_PER_BEAT : 4
   const unitsPerBar = unitsPerBeat * 4
   const unitDescription = timebase === 'legacy' ? 'legacy ticks' : 'sixteenth units'
-  const view: TimelineView = ttmDebugEnabled ? requestedView : 'waveform'
-  const handleViewChange = (nextView: TimelineView) => {
-    if (!ttmDebugEnabled && nextView === 'ttm') return
-    onViewChange(nextView)
-  }
+  const view = requestedView
 
   useEffect(() => {
     const generation = waveformGeneration.current + 1
@@ -507,7 +675,7 @@ function SequenceTimeline({
       : ''
     return <li key={event.id}>Event {index + 1}: {name}, starts at {startLabel}{event.startUnits + 1}, lasts {event.durationUnits}{durationLabel}{event.silent ? ', silent' : ''}{event.id === activeEventId ? ', now playing' : ''}{guideDescription}</li>
   })
-  const renderSequenceEvent = (event: Fixture['events'][number], inline = false) => {
+  const renderSequenceEvent = (event: Fixture['events'][number], inline = false, eventNumber = 0) => {
     const waveform = event.silent ? undefined : waveforms.get(event.sampleId)
     const sample = preset.samples.find((candidate) => candidate.id === event.sampleId)
     const name = event.sampleId === REST_SAMPLE_ID ? 'Rest' : sample?.name ?? event.sampleId
@@ -544,7 +712,7 @@ function SequenceTimeline({
         style={{ ...(sampleColor ? { '--sample-color': sampleColor } : {}), left: (event.startUnits / totalUnits) * 100 + '%', width: (event.durationUnits / totalUnits) * 100 + '%' } as CSSProperties}
         title={event.silent ? name + ': silent event' : (active ? 'Now playing · ' : '') + name + ': ' + event.durationUnits + ' units' + guideDescription}
       >
-        {inline && <span className="sequence-inline-event-label">{active ? 'Now playing · ' : ''}{name}</span>}
+        {inline && <span className={view === 'ttm' ? 'sequence-inline-event-label sequence-inline-event-label--ttm' : 'sequence-inline-event-label'}>{view === 'ttm' ? eventNumber + ' · ' + name : (active ? 'Now playing · ' : '') + name}</span>}
         {view === 'waveform' && waveform && geometry && (
           <svg
             className="sequence-waveform"
@@ -567,8 +735,8 @@ function SequenceTimeline({
                 <span
                   className={'sequence-ttm-fader__interval sequence-ttm-fader__interval--' + interval.state}
                   key={guide.id + '-fader-' + index}
-                  style={{ left: interval.start * 100 + '%', width: (interval.end - interval.start) * 100 + '%' }}
-                />
+                  style={{ left: (6 + interval.start * 88) + '%', width: ((interval.end - interval.start) * 88) + '%' }}
+                ><span>{interval.state === 'open' ? 'OPEN' : 'CUT'}</span></span>
               ))}
             </span>
           </>
@@ -596,12 +764,20 @@ function SequenceTimeline({
         </fieldset>
         <fieldset className="timeline-view-control" aria-label="Timeline view">
           <legend>View</legend>
-          <label><input type="radio" name="timeline-view" value="waveform" checked={view === 'waveform'} onChange={() => handleViewChange('waveform')} />Waveform</label>
-          <label className={ttmDebugEnabled ? undefined : 'timeline-view-option--disabled'}><input type="radio" name="timeline-view" value="ttm" checked={view === 'ttm'} disabled={!ttmDebugEnabled} aria-describedby={ttmDebugEnabled ? undefined : 'ttm-local-debug-note'} onChange={() => handleViewChange('ttm')} />TTM practice guides</label>
-          {!ttmDebugEnabled && <small className="timeline-debug-note" id="ttm-local-debug-note">Local debug only</small>}
+          <label><input type="radio" name="timeline-view" value="waveform" checked={view === 'waveform'} onChange={() => onViewChange('waveform')} />Waveform</label>
+          <label><input type="radio" name="timeline-view" value="ttm" checked={view === 'ttm'} onChange={() => onViewChange('ttm')} />TTM practice guides</label>
         </fieldset>
         <span className="timing-readout">{fixture.events.length} events</span>
       </figcaption>
+      {view === 'ttm' && <div className="ttm-guide-legend" aria-label="TTM notation key">
+        <span className="ttm-guide-legend__example">
+          <svg viewBox="0 0 100 100" aria-hidden="true"><path d={ttmMotionSvgPath(TTM_GUIDES['baby-rub'].motion)} /></svg>
+          <span>Example · {TTM_GUIDES['baby-rub'].label}</span>
+        </span>
+        <span>Time → · record forward ↑ / backward ↓</span>
+        <span className="ttm-guide-legend__key"><span className="ttm-guide-legend__gate ttm-guide-legend__gate--open">OPEN</span> audible <span className="ttm-guide-legend__gate ttm-guide-legend__gate--closed">CUT</span> closed / muted</span>
+        <span className="ttm-guide-legend__disclaimer">Illustrative guides only · not WAV transcriptions</span>
+      </div>}
       <div
         className="timeline-scroll"
         role="img"
@@ -626,15 +802,15 @@ function SequenceTimeline({
           {layout === 'grid' && lanes.map((lane) => {
             const events = fixture.events.filter((event) => event.sampleId === lane.id)
             return (
-              <div className={'timeline-lane' + (lane.id === auditionedSampleId ? ' timeline-lane--auditioned' : '') + (lane.id === activeSampleId ? ' timeline-lane--active' : '')} key={lane.id} style={lane.color ? { '--sample-color': lane.color } as CSSProperties : undefined}>
+              <div className={'timeline-lane' + (view === 'ttm' ? ' timeline-lane--ttm' : '') + (lane.id === auditionedSampleId ? ' timeline-lane--auditioned' : '') + (lane.id === activeSampleId ? ' timeline-lane--active' : '')} key={lane.id} style={lane.color ? { '--sample-color': lane.color } as CSSProperties : undefined}>
                 <span className={view === 'ttm' ? 'timeline-lane-label timeline-lane-label--ttm' : 'timeline-lane-label'}>
                   <span className="timeline-lane-name"><span className={lane.color ? 'timeline-color-swatch' : 'timeline-color-swatch timeline-color-swatch--silent'} aria-hidden="true" /><span className="timeline-lane-name-text">{lane.name}</span></span>
                   <small>{lane.note}</small>
                   {lane.id === activeSampleId && <span className="timeline-now-playing">Now playing</span>}
                 </span>
-                <span className="timeline-track" aria-hidden="true" style={{ gridTemplateColumns: 'repeat(' + totalUnits + ', minmax(8px, 1fr))' }}>
+                <span className={view === 'ttm' ? 'timeline-track timeline-track--ttm' : 'timeline-track'} aria-hidden="true" style={{ gridTemplateColumns: 'repeat(' + totalUnits + ', minmax(8px, 1fr))' }}>
                   {unitNumbers.map((unit) => <span className={unit % unitsPerBeat === 0 ? 'timeline-tick timeline-tick--beat' : 'timeline-tick'} key={unit} />)}
-                  {events.map((event) => renderSequenceEvent(event))}
+                  {events.map((event) => renderSequenceEvent(event, false, fixture.events.findIndex((candidate) => candidate.id === event.id) + 1))}
                   {isPlaying && <span className="timeline-playhead" style={{ left: Math.min(Math.max(progress, 0), 1) * 100 + '%' }} />}
                 </span>
               </div>
@@ -643,16 +819,16 @@ function SequenceTimeline({
           {layout === 'inline' && (
             <div className="timeline-inline-row">
               <span className="timeline-axis-label">EVENT</span>
-              <span className="timeline-track timeline-track--inline" aria-hidden="true" style={{ gridTemplateColumns: 'repeat(' + totalUnits + ', minmax(8px, 1fr))' }}>
+              <span className={view === 'ttm' ? 'timeline-track timeline-track--inline timeline-track--inline-ttm' : 'timeline-track timeline-track--inline'} aria-hidden="true" style={{ gridTemplateColumns: 'repeat(' + totalUnits + ', minmax(8px, 1fr))' }}>
                 {unitNumbers.map((unit) => <span className={unit % unitsPerBeat === 0 ? 'timeline-tick timeline-tick--beat' : 'timeline-tick'} key={unit} />)}
-                {fixture.events.map((event) => renderSequenceEvent(event, true))}
+                {fixture.events.map((event, index) => renderSequenceEvent(event, true, index + 1))}
                 {isPlaying && <span className="timeline-playhead" style={{ left: Math.min(Math.max(progress, 0), 1) * 100 + '%' }} />}
               </span>
             </div>
           )}
         </div>
       </div>
-      {view === 'ttm' && <p className="timeline-guide-note">TTM practice guides are illustrative examples, not WAV transcriptions. Exact Baby/Baby(F)/Baby(R) labels only suggest a guide; unassigned rows are marked. <a href="#sample-section">Edit a sample</a> to assign another guide or choose Untranscribed. Record motion: forward ↑, backward ↓; the bottom strip shows the fader open or closed.</p>}
+      {view === 'ttm' && <p className="timeline-guide-note">TTM practice guides are finite teaching examples, not WAV transcriptions. Exact labels Baby, Baby (F), Baby F, Baby(F), Baby (R), Baby Rev, Baby(R), and Chirp may suggest an example; other labels stay Unassigned. Baby scratch / rub keeps the fader open, forward movement is one open stroke, forward scratch / cut mutes the return, and Chirp shows a narrow illustrative cut at the turn. <a href="#sample-section">Edit a sample</a> to assign a guide or explicitly choose Untranscribed. <a href="https://www.ttm-dj.com/ttm-01-01-basics/" target="_blank" rel="noreferrer">TTM basics</a>.</p>}
       <ol className="visually-hidden" aria-label="Sequence events">{eventDescription}</ol>
     </figure>
   )
@@ -682,12 +858,11 @@ function DiagnosticList({ diagnostics }: { diagnostics: AssetDiagnostic[] }) {
 }
 
 function SampleEditor({
-  sample, draft, disabled, ttmDebugEnabled, ttmGuide, ttmGuideIsExplicit, onDraftChange, onTtmGuideChange, onSave, onCancel,
+  sample, draft, disabled, ttmGuide, ttmGuideIsExplicit, onDraftChange, onTtmGuideChange, onSave, onCancel,
 }: {
   sample: SampleDefinition
   draft: SampleDefinition
   disabled: boolean
-  ttmDebugEnabled: boolean
   ttmGuide: TtmSampleGuideSelection
   ttmGuideIsExplicit: boolean
   onDraftChange: (next: SampleDefinition) => void
@@ -754,14 +929,14 @@ function SampleEditor({
           <input id="sample-use" type="checkbox" checked={draft.enabled || draft.silent} disabled={disabled || draft.silent} onChange={(event) => onDraftChange({ ...draft, enabled: event.currentTarget.checked })} />
           <span>{draft.silent ? 'Use sample · always included (silent)' : 'Use sample'}</span>
         </label>
-        {ttmDebugEnabled && <label className="sample-editor__field sample-editor__field--guide" htmlFor="sample-ttm-guide">
+        <label className="sample-editor__field sample-editor__field--guide" htmlFor="sample-ttm-guide">
           <span>TTM guide</span>
           <select id="sample-ttm-guide" aria-label={'TTM guide for ' + sample.name} value={selectedGuideId} disabled={disabled} onChange={(event) => onTtmGuideChange(event.currentTarget.value)}>
             <option value={UNTRANSCRIBED.kind}>{!ttmGuideIsExplicit && !suggestedGuide ? 'Unassigned · Untranscribed' : 'Untranscribed'}</option>
             {Object.values(TTM_GUIDES).map((guide) => <option key={guide.id} value={guide.id}>{!ttmGuideIsExplicit && suggestedGuide === guide.id ? 'Suggested: ' : ''}{guide.label}</option>)}
           </select>
           <small>{guideHelperText}</small>
-        </label>}
+        </label>
       </div>
       <div className="sample-editor__actions">
         <button className="button button--small" type="button" disabled={disabled} onClick={onCancel}>Cancel</button>
@@ -772,7 +947,7 @@ function SampleEditor({
 }
 
 function SampleTable({
-  preset, resolution, actionsDisabled, legacyMode, sourceAvailable, editingSample, saveError, isSavingData, ttmDebugEnabled,
+  preset, resolution, actionsDisabled, legacyMode, sourceAvailable, editingSample, saveError, isSavingData,
   ttmAnnotations, onTtmGuideChange, onToggle, onPreview, onEdit, onDraftChange, onSaveEdit, onCancelEdit, onSaveData,
 }: {
   preset: Preset
@@ -783,7 +958,6 @@ function SampleTable({
   editingSample: SampleDefinition | null
   saveError: string | null
   isSavingData: boolean
-  ttmDebugEnabled: boolean
   ttmAnnotations: Readonly<Record<string, TtmSampleGuideSelection>>
   onTtmGuideChange: (sampleId: string, selection: string) => void
   onToggle: (sample: SampleDefinition, enabled: boolean) => void
@@ -810,11 +984,10 @@ function SampleTable({
         sample={preset.samples.find((sample) => sample.id === editingSample.id) ?? editingSample}
         draft={editingSample}
         disabled={actionsDisabled}
-        ttmDebugEnabled={ttmDebugEnabled}
         ttmGuide={ttmAnnotations[editingSample.id] ?? UNTRANSCRIBED}
         ttmGuideIsExplicit={Object.hasOwn(ttmAnnotations, editingSample.id)}
         onDraftChange={onDraftChange}
-        onTtmGuideChange={(selection) => { if (ttmDebugEnabled) onTtmGuideChange(editingSample.id, selection) }}
+        onTtmGuideChange={(selection) => onTtmGuideChange(editingSample.id, selection)}
         onSave={onSaveEdit}
         onCancel={onCancelEdit}
       />}
@@ -873,7 +1046,6 @@ function SampleTable({
 }
 
 export default function App() {
-  const ttmDebugEnabled = import.meta.env.DEV
   const [transport] = useState(() => new AudioTransport())
   const transportSnapshot = useSyncExternalStore(transport.subscribe, transport.getSnapshot, transport.getSnapshot)
   const presentation = transportSnapshot.presentation
@@ -935,7 +1107,21 @@ export default function App() {
   const [customBeatAnalysisMessage, setCustomBeatAnalysisMessage] = useState('')
   const [playbackTarget, setPlaybackTarget] = useState<PlaybackTarget>(null)
   const [transportNote, setTransportNote] = useState('Ready to play.')
-  const [activeSection, setActiveSection] = useState<WorkspaceSection>('sequence')
+  const [activeSection, setActiveSection] = useState<WorkspaceSection>(() => workspaceSectionForHash(window.location.hash) ?? 'sequence')
+  const [shortcutsEnabled, setShortcutsEnabled] = useState(() => {
+    try { return window.localStorage.getItem('scratch-combo-shortcuts') !== 'off' } catch { return true }
+  })
+  const [shortcutsHelpOpen, setShortcutsHelpOpen] = useState(false)
+  const keyboardHelpButtonRef = useRef<HTMLButtonElement>(null)
+  const shortcutActionsRef = useRef<{
+    playDisabled: boolean
+    stopDisabled: boolean
+    resetDisabled: boolean
+    play: () => void
+    stop: () => void
+    generate: () => void
+    reset: () => void
+  } | null>(null)
 
   const assetIndexRef = useRef(assetIndex)
   const presetImportGeneration = useRef(0)
@@ -960,7 +1146,7 @@ export default function App() {
   const selectedTempoRange = getTempoRange(preset.bpm, selectedBeatReferenceBpm)
   const isCustomBeatAnalysisBusy = customBeatAnalysisStatus === 'analyzing'
   const customBeatReferenceInputNumber = Number(customBeatReferenceBpmInput)
-  const customBeatReferenceInputValid = !customBeatSelected
+  const customBeatReferenceInputValid = !customBeatSelected || !customBeatBuffer
     || (Number.isFinite(customBeatReferenceInputNumber) && customBeatReferenceInputNumber >= 1)
   const sessionTempoNumber = Number(bpm)
   const sessionTempoValid = selectedTempoRange !== null
@@ -1177,6 +1363,8 @@ export default function App() {
     setTransportNote('Choose your own preset files to continue.')
     transport.stop()
     transport.resetAssets()
+    setActiveSection('files')
+    if (window.location.hash !== '#files-section') window.history.pushState(null, '', '#files-section')
     requestAnimationFrame(() => {
       const filesSection = document.getElementById('files-section')
       filesSection?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
@@ -1210,48 +1398,24 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    const sections: ReadonlyArray<{ id: string; section: WorkspaceSection }> = [
-      { id: 'sequence-section', section: 'sequence' },
-      { id: 'files-section', section: 'files' },
-      { id: 'session-section', section: 'session' },
-      { id: 'sample-section', section: 'samples' },
-    ]
-    const updateActiveSection = () => {
-      const markerY = Math.min(120, window.innerHeight * 0.22)
-      const visibleSections = sections.flatMap(({ id, section }) => {
-        const element = document.getElementById(id)
-        if (!element) return []
-        const rect = element.getBoundingClientRect()
-        return [{ section, top: rect.top, bottom: rect.bottom }]
-      })
-      const atPageEnd = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2
-      const lastSection = visibleSections.at(-1)
-      if (atPageEnd && lastSection && lastSection.top < window.innerHeight && lastSection.bottom > 0) {
-        setActiveSection(lastSection.section)
-        return
-      }
-      const current = visibleSections.find(({ top, bottom }) => top <= markerY && bottom > markerY)
-        ?? visibleSections.find(({ top }) => top > markerY)
-        ?? visibleSections.at(-1)
-      if (current) setActiveSection(current.section)
-    }
-    let scheduledFrame: number | undefined
-    const scheduleUpdate = () => {
-      if (scheduledFrame !== undefined) cancelAnimationFrame(scheduledFrame)
-      scheduledFrame = requestAnimationFrame(() => {
-        scheduledFrame = undefined
-        updateActiveSection()
+    const selectSectionFromHash = () => {
+      const nextSection = workspaceSectionForHash(window.location.hash)
+      if (!nextSection) return
+      setActiveSection(nextSection)
+      const targetId = window.location.hash.replace(/^#/, '')
+      if (targetId === 'workspace') return
+      window.requestAnimationFrame(() => {
+        const target = targetId ? document.getElementById(targetId) : document.getElementById('panel-practice')
+        target?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
+        target?.closest<HTMLElement>('[role="tabpanel"]')?.focus({ preventScroll: true })
       })
     }
-    updateActiveSection()
-    window.addEventListener('scroll', scheduleUpdate, { passive: true })
-    window.addEventListener('resize', scheduleUpdate)
-    window.addEventListener('hashchange', scheduleUpdate)
+    selectSectionFromHash()
+    window.addEventListener('hashchange', selectSectionFromHash)
+    window.addEventListener('popstate', selectSectionFromHash)
     return () => {
-      window.removeEventListener('scroll', scheduleUpdate)
-      window.removeEventListener('resize', scheduleUpdate)
-      window.removeEventListener('hashchange', scheduleUpdate)
-      if (scheduledFrame !== undefined) cancelAnimationFrame(scheduledFrame)
+      window.removeEventListener('hashchange', selectSectionFromHash)
+      window.removeEventListener('popstate', selectSectionFromHash)
     }
   }, [])
 
@@ -1440,7 +1604,7 @@ export default function App() {
     const input = event.currentTarget
     const file = input.files?.[0]
     input.value = ''
-    if (!file || isPlaybackLockedNow() || isCustomBeatAnalysisBusy) return
+    if (!file || !customBeatSelected || isPlaybackLockedNow() || isCustomBeatAnalysisBusy) return
 
     const generation = ++customBeatAnalysisGeneration.current
     setCustomBeatCandidate({ file, buffer: null })
@@ -1476,7 +1640,7 @@ export default function App() {
   }
 
   const handleUseCustomBeat = () => {
-    if (isPlaybackLockedNow() || isCustomBeatAnalysisBusy || !customBeatCandidate?.buffer) return
+    if (isPlaybackLockedNow() || isCustomBeatAnalysisBusy || !customBeatSelected || !customBeatCandidate?.buffer) return
     const referenceBpm = Number(customBeatCandidateBpm)
     const tempoRange = getTempoRange(preset.bpm, referenceBpm)
     if (!Number.isFinite(referenceBpm) || referenceBpm < 1 || !tempoRange) return
@@ -1571,7 +1735,13 @@ export default function App() {
   const handleBeatSelectionChange = (value: string) => {
     if (isPlaybackLockedNow() || isCustomBeatAnalysisBusy) return
     if (value === 'custom') {
-      if (!customBeatFile || !customBeatBuffer || customBeatReferenceBpm === null) return
+      if (customBeatSelected) return
+      if (!customBeatFile || !customBeatBuffer || customBeatReferenceBpm === null) {
+        setCustomBeatSelected(true)
+        setActionError(null)
+        setTransportNote('Custom beat source selected. No custom beat is applied yet; sample-only playback remains available.')
+        return
+      }
       const range = getTempoRange(preset.bpm, customBeatReferenceBpm)
       if (!range) return
       const target = Math.min(range.max, Math.max(range.min, customBeatReferenceBpm))
@@ -1595,7 +1765,7 @@ export default function App() {
   }
 
   const handleTtmGuideChange = (sampleId: string, selection: string) => {
-    if (!import.meta.env.DEV || isPlaybackLockedNow()) return
+    if (isPlaybackLockedNow()) return
     const nextSelection: TtmSampleGuideSelection = selection === UNTRANSCRIBED.kind
       ? UNTRANSCRIBED
       : getTtmGuide(selection)?.id ?? UNTRANSCRIBED
@@ -1808,7 +1978,7 @@ export default function App() {
     const bpmValue = Number(bpm)
     const beatReferenceBpm = includeBeat && customBeatSelected ? customBeatReferenceBpm : null
     const tempoRange = getTempoRange(preset.bpm, beatReferenceBpm)
-    if (includeBeat && customBeatSelected && (!customBeatReferenceInputValid || !customBeatBuffer)) {
+    if (includeBeat && customBeatSelected && customBeatBuffer && (!customBeatReferenceInputValid || customBeatReferenceBpm === null)) {
       setActionError('Enter a valid recorded BPM for the custom beat before playback.')
       setTransportNote('Playback needs a valid custom beat BPM.')
       return
@@ -1964,17 +2134,80 @@ export default function App() {
   const comboLengthTicks = comboBeats * LEGACY_TICKS_PER_BEAT
   const activeBuiltInEntry = builtInCatalog?.presets.find((entry) => entry.id === selectedPresetId)
   const activeWavCount = presetSource === 'builtin' ? assetIndex.files.length : localWavFiles.length
+  const sessionControlsDisabled = !isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy
+  const resetControlsDisabled = sessionControlsDisabled
+
+  shortcutActionsRef.current = {
+    playDisabled: playDisabled || isReadingPreset,
+    stopDisabled,
+    resetDisabled: resetControlsDisabled,
+    play: handlePlaySequence,
+    stop: handleStop,
+    generate: handleBuildPreview,
+    reset: handleResetSessionControls,
+  }
+
+  useEffect(() => {
+    try { window.localStorage.setItem('scratch-combo-shortcuts', shortcutsEnabled ? 'on' : 'off') } catch { /* Private browsing can disable storage. */ }
+  }, [shortcutsEnabled])
+
+  useEffect(() => {
+    if (!shortcutsEnabled || shortcutsHelpOpen) return
+    const handleShortcut = (event: KeyboardEvent) => {
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.repeat || isSingleKeyShortcutTarget(event.target)) return
+      const actions = shortcutActionsRef.current
+      if (!actions) return
+      const key = event.key.toLowerCase()
+      if (key === 'p') {
+        if (!actions.stopDisabled) {
+          event.preventDefault()
+          actions.stop()
+        } else if (!actions.playDisabled) {
+          event.preventDefault()
+          actions.play()
+        }
+      } else if (key === 'g' && !isPlaybackLocked && isPresetReady && !isReadingPreset && !isGenerating) {
+        event.preventDefault()
+        actions.generate()
+      } else if (key === 'r' && !actions.resetDisabled) {
+        event.preventDefault()
+        actions.reset()
+      }
+    }
+    window.addEventListener('keydown', handleShortcut)
+    return () => window.removeEventListener('keydown', handleShortcut)
+  }, [shortcutsEnabled, shortcutsHelpOpen, isPlaybackLocked, isPresetReady, isReadingPreset, isGenerating])
 
   return (
     <div className="app-shell">
       <a className="skip-link" href="#workspace">Skip to workspace</a>
       <aside className="rail" aria-label="Workspace navigation">
-        <a className="rail__brand" href="#sequence-section" aria-label="Scratch Combo sequence"><span aria-hidden="true">SC</span></a>
-        <nav className="rail__nav" aria-label="Workspace sections">
-          <a href="#sequence-section" aria-current={activeSection === 'sequence' ? 'location' : undefined} onClick={() => setActiveSection('sequence')}><span className="rail__marker" aria-hidden="true" /><span>Sequence</span></a>
-          <a href="#files-section" aria-current={activeSection === 'files' ? 'location' : undefined} onClick={() => setActiveSection('files')}><span className="rail__marker" aria-hidden="true" /><span>Files</span></a>
-          <a href="#session-section" aria-current={activeSection === 'session' ? 'location' : undefined} onClick={() => setActiveSection('session')}><span className="rail__marker" aria-hidden="true" /><span>Session</span></a>
-          <a href="#sample-section" aria-current={activeSection === 'samples' ? 'location' : undefined} onClick={() => setActiveSection('samples')}><span className="rail__marker" aria-hidden="true" /><span>Samples</span></a>
+        <a className="rail__brand" href="#workspace" aria-label="Scratch Combo workspace"><span aria-hidden="true">SC</span></a>
+        <nav className="rail__nav" role="tablist" aria-label="Workspace sections" aria-orientation="vertical">
+          {WORKSPACE_TABS.map((tab) => {
+            const selected = activeSection === tab.section
+            const panelId = tab.section === 'sequence' ? 'panel-practice' : 'panel-' + tab.section
+            return (
+              <a
+                key={tab.section}
+                id={tab.id}
+                role="tab"
+                href={tab.href}
+                aria-selected={selected}
+                aria-controls={panelId}
+                tabIndex={selected ? 0 : -1}
+                onClick={(event) => {
+                  event.preventDefault()
+                  setActiveSection(tab.section)
+                  if (window.location.hash !== tab.href) window.history.pushState(null, '', tab.href)
+                }}
+                onKeyDown={(event) => handleWorkspaceTabKeyDown(event, tab.section)}
+              >
+                <WorkspaceSectionIcon section={tab.section} />
+                <span>{tab.label}</span>
+              </a>
+            )
+          })}
         </nav>
         <span className="rail__foot" title="Local browser session">LOCAL</span>
       </aside>
@@ -1985,6 +2218,41 @@ export default function App() {
           <div className="session-state"><span className="session-state__dot" aria-hidden="true" /><span>Private browser session</span></div>
         </header>
 
+        <section className="transport-dock" aria-label="Playback controls">
+          <div className="transport-dock__actions">
+            <button className="button button--play" type="button" onClick={handlePlaySequence} disabled={playDisabled || isReadingPreset}>
+              <span className="play-glyph" aria-hidden="true" />Play sequence
+            </button>
+            <button className="button button--stop" type="button" onClick={handleStop} disabled={stopDisabled}>
+              <span className="stop-glyph" aria-hidden="true" />Stop
+            </button>
+            <button
+              ref={keyboardHelpButtonRef}
+              className="button transport-dock__help"
+              type="button"
+              aria-haspopup="dialog"
+              aria-expanded={shortcutsHelpOpen}
+              onClick={() => setShortcutsHelpOpen(true)}
+            >Keyboard shortcuts</button>
+          </div>
+          <div className="transport-dock__meter">
+            <progress value={progressPercent} max="1" aria-label="Preview progress" />
+            <span className="transport-status" role="status" aria-live="polite" aria-atomic="true">{transportNote}</span>
+          </div>
+          {isPlaybackLocked && <p className="playback-lock-note" role="status">Stop playback to change combo options, beat source, or sample settings.</p>}
+          {isCustomBeatAnalysisBusy && <p className="playback-lock-note" role="status">Custom beat is loading locally. Playback will stay stopped until analysis finishes.</p>}
+          {actionError && <p className="inline-error" role="alert">{actionError}</p>}
+          {transportSnapshot.status === 'error' && <p className="inline-error" role="alert">{transportSnapshot.error ?? 'Audio could not start.'}</p>}
+        </section>
+        <KeyboardShortcutsDialog
+          open={shortcutsHelpOpen}
+          shortcutsEnabled={shortcutsEnabled}
+          onToggleShortcuts={setShortcutsEnabled}
+          onClose={() => setShortcutsHelpOpen(false)}
+          returnFocus={() => keyboardHelpButtonRef.current?.focus()}
+        />
+
+        <div id="panel-practice" role="tabpanel" aria-labelledby="tab-practice" tabIndex={0} hidden={activeSection !== 'sequence'}>
         <section id="sequence-section" className="workspace-section sequence-section" aria-labelledby="sequence-heading">
           <div className="section-heading sequence-heading">
             <div><h2 id="sequence-heading">{!isPresetReady ? 'Starting workspace' : isImportedPreset ? 'Generated combo' : 'Sequence preview'}</h2><p>{isPresetReady ? preset.name + ' / ' + (isImportedPreset ? (fixture ? fixture.totalUnits : comboLengthTicks) + ' legacy ticks' : 'fixed ' + TARGET_UNITS + '-unit window') : activeBuiltInEntry?.label ?? 'Built-in practice preset'}{fixture && omittedZeroDurationCount > 0 && <small className="sequence-note">{omittedZeroDurationCount} zero-length {omittedZeroDurationCount === 1 ? 'selection was' : 'selections were'} omitted from audio preview.</small>}</p></div>
@@ -2002,6 +2270,19 @@ export default function App() {
               </button>
             </div>
           </div>
+          <QuickPresetControl
+            builtInCatalog={builtInCatalog}
+            selectedPresetId={selectedPresetId}
+            locked={isPlaybackLocked}
+            isBootstrapLoading={isBootstrapLoading}
+            onChange={handleBuiltInPresetChange}
+          />
+          <details className="preview-help">
+            <summary>About this preview</summary>
+            {isImportedPreset
+              ? <p>Selection follows the recovered weighted, direction, and repeat rules. This browser uses quantized 24-bit random draws; the original VB6 time-seeded sequence is not reproduced. Playback follows the exact BPM clock in Web Audio, not Windows timer intervals or their jitter.</p>
+              : <p>Fixed preview; legacy generator not recovered. This ordered fixture fills a 32-unit window for practice and transport review.</p>}
+          </details>
           {isImportedPreset && (
             <PracticeCycleControls
               mode={practiceMode}
@@ -2016,30 +2297,6 @@ export default function App() {
               onAutoGenerateRoundsChange={handleAutoGenerateRoundsChange}
             />
           )}
-          {isPlaybackLocked && <p className="playback-lock-note" role="status">Stop playback to change combo options or sample settings.</p>}
-          {isCustomBeatAnalysisBusy && <p className="playback-lock-note" role="status">Custom beat is loading locally. Playback will stay stopped until analysis finishes.</p>}
-          <div className="transport-row">
-            <div className="transport-actions">
-              <button className="button button--play" type="button" onClick={handlePlaySequence} disabled={playDisabled || isReadingPreset}>
-                <span className="play-glyph" aria-hidden="true" />Play sequence
-              </button>
-              <button className="button button--stop" type="button" onClick={handleStop} disabled={stopDisabled}>
-                <span className="stop-glyph" aria-hidden="true" />Stop
-              </button>
-              <details className="preview-help">
-                <summary>About this preview</summary>
-                {isImportedPreset
-                  ? <p>Selection follows the recovered weighted, direction, and repeat rules. This browser uses quantized 24-bit random draws; the original VB6 time-seeded sequence is not reproduced. Playback follows the exact BPM clock in Web Audio, not Windows timer intervals or their jitter.</p>
-                  : <p>Fixed preview; legacy generator not recovered. This ordered fixture fills a 32-unit window for practice and transport review.</p>}
-              </details>
-            </div>
-            <div className="transport-meter">
-              <progress value={progressPercent} max="1" aria-label="Preview progress" />
-              <span className="transport-status" role="status" aria-live="polite" aria-atomic="true">{transportNote}</span>
-            </div>
-          </div>
-          {actionError && <p className="inline-error" role="alert">{actionError}</p>}
-          {transportSnapshot.status === 'error' && <p className="inline-error" role="alert">{transportSnapshot.error ?? 'Audio could not start.'}</p>}
           {fixture
             ? <SequenceTimeline
                 fixture={fixture}
@@ -2057,7 +2314,6 @@ export default function App() {
                 timebase={timebase}
                 view={timelineView}
                 layout={timelineLayout}
-                ttmDebugEnabled={ttmDebugEnabled}
                 ttmAnnotations={ttmAnnotations}
                 onViewChange={setTimelineView}
                 onLayoutChange={setTimelineLayout}
@@ -2067,7 +2323,9 @@ export default function App() {
                 <span>{isBootstrapLoading ? 'The selected INI and every referenced WAV must load before playback is enabled.' : isReadingPreset ? 'The previous sequence was cleared while the local file is read.' : !isPresetReady ? 'Retry the built-in preset or choose a valid custom INI in Local files.' : isImportedPreset ? comboBeats + ' beats · ' + comboLengthTicks + ' legacy ticks' : 'The fixed demo uses synthetic sounds.'}</span>
               </div>}
         </section>
+        </div>
 
+        <div id="panel-files" role="tabpanel" aria-labelledby="tab-files" tabIndex={0} hidden={activeSection !== 'files'}>
         <LocalImportPanel
           locked={isPlaybackLocked}
           presetFileName={presetFileName}
@@ -2075,19 +2333,18 @@ export default function App() {
           importMessage={importMessage}
           presetError={presetError}
           selectionError={selectionError}
-          builtInCatalog={builtInCatalog}
-          selectedPresetId={selectedPresetId}
           presetSource={presetSource}
           isBootstrapLoading={isBootstrapLoading}
           bootstrapError={bootstrapError}
-          onBuiltInPresetChange={handleBuiltInPresetChange}
           onRetryBuiltIn={handleRetryBuiltIn}
           onPresetChange={handlePresetChange}
           onFolderChange={handleWavChange}
           onFilesChange={handleWavChange}
         />
         {assetResolution && <DiagnosticList diagnostics={diagnostics} />}
+        </div>
 
+        <div id="panel-session" role="tabpanel" aria-labelledby="tab-session" tabIndex={0} hidden={activeSection !== 'session'}>
         <SessionControls
           bpm={bpm}
           referenceBpm={preset.bpm}
@@ -2106,7 +2363,7 @@ export default function App() {
           customBeatCandidateBpm={customBeatCandidateBpm}
           customBeatCandidateMessage={customBeatAnalysisMessage}
           customBeatCandidateReady={Boolean(customBeatCandidate?.buffer)}
-          disabled={!isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy}
+          disabled={sessionControlsDisabled}
           beatSelectionDisabled={isPlaybackLocked || isCustomBeatAnalysisBusy}
           onBpmChange={handleBpmChange}
           onPitchChange={handlePitchChange}
@@ -2119,7 +2376,9 @@ export default function App() {
           onCustomBeatReferenceBpmChange={handleCustomBeatReferenceBpmChange}
           onReset={handleResetSessionControls}
         />
+        </div>
 
+        <div id="panel-samples" role="tabpanel" aria-labelledby="tab-samples" tabIndex={0} hidden={activeSection !== 'samples'}>
         {isPresetReady
           ? <SampleTable
               preset={preset}
@@ -2128,7 +2387,6 @@ export default function App() {
               legacyMode={isImportedPreset}
               sourceAvailable={sourceIniText !== null}
               editingSample={editingSample}
-              ttmDebugEnabled={ttmDebugEnabled}
               ttmAnnotations={ttmAnnotations}
               saveError={saveIniError}
               isSavingData={isSavingIni}
@@ -2142,6 +2400,7 @@ export default function App() {
               onSaveData={() => { void handleSaveSampleData() }}
             />
           : <section id="sample-section" className="workspace-section sample-section" aria-labelledby="samples-heading"><div className="section-heading"><div><h2 id="samples-heading">Sample settings</h2><p>Sample rows appear after the selected preset and its files are ready.</p></div></div></section>}
+        </div>
 
         <footer className="workspace-footer">
           <span>Files remain on this device for the current session.</span>

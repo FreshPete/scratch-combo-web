@@ -84,9 +84,16 @@ export function SessionControls({
   const sliderBpm = Number.isFinite(numericBpm)
     ? Math.min(Math.max(maxBpm, minBpm), Math.max(minBpm, numericBpm))
     : Math.min(Math.max(maxBpm, minBpm), Math.max(minBpm, referenceBpm))
-  const hasBeatSource = beatFiles.length > 0 || Boolean(customBeatFileName)
-  const beatSelectionValue = customBeatSelected ? 'custom' : selectedBeatIndex
-  const uploadDisabled = disabled || beatSelectionDisabled || customBeatAnalysisStatus === 'analyzing'
+  const selectedPresetBeat = selectedBeatIndex === 'none'
+    ? undefined
+    : beatResolutions?.[Number(selectedBeatIndex)]
+  const selectedPresetBeatReady = selectedPresetBeat?.status === 'resolved' && Boolean(selectedPresetBeat.file)
+  const activeBeatReady = customBeatSelected
+    ? Boolean(customBeatFileName && customBeatReferenceBpm !== null)
+    : selectedPresetBeatReady
+  const customSourceControlsDisabled = disabled || beatSelectionDisabled || !customBeatSelected || customBeatAnalysisStatus === 'analyzing'
+  const uploadDisabled = customSourceControlsDisabled
+  const sourceSelectionDisabled = disabled || beatSelectionDisabled
   const candidateBpmValue = Number(customBeatCandidateBpm)
   const hasCandidateBpm = Number.isFinite(candidateBpmValue) && candidateBpmValue >= 1
   const candidateRange = hasCandidateBpm ? getTempoRange(referenceBpm, candidateBpmValue) : null
@@ -181,7 +188,7 @@ export function SessionControls({
           />
         </div>
 
-        <div className="session-controls__field">
+        <div className={activeBeatReady ? 'session-controls__field' : 'session-controls__field session-controls__field--inactive'}>
           <label className="session-controls__label" htmlFor="beat-volume">Beat level</label>
           <output className="session-controls__readout">{beatVolume}%</output>
           <input
@@ -192,23 +199,51 @@ export function SessionControls({
             max="100"
             step="1"
             value={beatVolume}
-            disabled={disabled || !hasBeatSource}
+            disabled={disabled || !activeBeatReady}
             onChange={(event) => onBeatVolumeChange(Number(event.currentTarget.value))}
           />
+          {!activeBeatReady && <small className="session-controls__hint">Select an applied beat to adjust its level.</small>}
         </div>
       </div>
 
-      {hasBeatSource && (
-        <div className="session-controls__beat-bed">
-          <label className="session-controls__label" htmlFor="beat-selection">Beat bed</label>
+      <fieldset className="session-controls__beat-source" aria-describedby="beat-source-help">
+        <legend>Beat source</legend>
+        <div className="session-controls__source-options">
+          <label className={!customBeatSelected ? 'session-controls__source-option session-controls__source-option--selected' : 'session-controls__source-option'}>
+            <input
+              type="radio"
+              name="beat-source"
+              value="preset"
+              checked={!customBeatSelected}
+              disabled={sourceSelectionDisabled}
+              onChange={() => onBeatSelectionChange(selectedBeatIndex)}
+            />
+            <span>Preset</span>
+          </label>
+          <label className={customBeatSelected ? 'session-controls__source-option session-controls__source-option--selected' : 'session-controls__source-option'}>
+            <input
+              type="radio"
+              name="beat-source"
+              value="custom"
+              checked={customBeatSelected}
+              disabled={sourceSelectionDisabled}
+              onChange={() => onBeatSelectionChange('custom')}
+            />
+            <span>Custom</span>
+          </label>
+        </div>
+        <small id="beat-source-help" className="session-controls__hint">Choose one source. The other source stays loaded for this session and does not play.</small>
+
+        <div className={'session-controls__source-panel' + (customBeatSelected ? ' session-controls__source-panel--inactive' : '')}>
+          <label className="session-controls__label" htmlFor="beat-selection">Preset beat</label>
           <select
             id="beat-selection"
-            value={beatSelectionValue}
-            disabled={disabled || beatSelectionDisabled}
+            aria-label="Beat bed"
+            value={selectedBeatIndex}
+            disabled={disabled || beatSelectionDisabled || customBeatSelected}
             onChange={(event) => onBeatSelectionChange(event.currentTarget.value)}
           >
             <option value="none">No beat bed</option>
-            {customBeatFileName && <option value="custom">Your beat · {customBeatFileName}</option>}
             {beatFiles.map((fileName, index) => {
               const resolution = beatResolutions?.[index]
               const ready = resolution?.status === 'resolved' && Boolean(resolution.file)
@@ -217,33 +252,39 @@ export function SessionControls({
             })}
           </select>
         </div>
-      )}
 
-      {customBeatSelected && customBeatFileName && customBeatReferenceBpm !== null && (
-        <div className="session-controls__custom-beat-active">
-          <label className="session-controls__label" htmlFor="custom-beat-reference-bpm">Recorded BPM for {customBeatFileName}</label>
-          <input
-            className="session-controls__bpm-correction"
-            id="custom-beat-reference-bpm"
-            aria-label="Recorded BPM for custom beat"
-            aria-describedby="custom-beat-sync"
-            type="number"
-            inputMode="decimal"
-            min="1"
-            step="0.1"
-            value={customBeatReferenceBpmInput}
-            disabled={uploadDisabled}
-            onChange={(event) => onCustomBeatReferenceBpmChange(event.currentTarget.value)}
-          />
-          <p id="custom-beat-sync" className="session-controls__beat-sync" role="status">
-            Recorded BPM is the beat's source reference. Tempo above is the shared practice target for the beat and scratch samples.
-            {!activeReferenceInputValid && ' Enter a recorded BPM of at least 1 before playback.'}
-            {!hasTempoRange && ' These source BPM values have no shared playback range yet; correct the beat BPM to continue.'}
-          </p>
+        <div className={'session-controls__source-panel session-controls__custom-source-panel' + (!customBeatSelected ? ' session-controls__source-panel--inactive' : '')}>
+          {customBeatFileName && customBeatReferenceBpm !== null ? (
+            <>
+              <label className="session-controls__label" htmlFor="custom-beat-reference-bpm">Recorded BPM for {customBeatFileName}</label>
+              <input
+                className="session-controls__bpm-correction"
+                id="custom-beat-reference-bpm"
+                aria-label="Recorded BPM for custom beat"
+                aria-describedby="custom-beat-sync"
+                type="number"
+                inputMode="decimal"
+                min="1"
+                step="0.1"
+                value={customBeatReferenceBpmInput}
+                disabled={uploadDisabled || !customBeatSelected}
+                onChange={(event) => onCustomBeatReferenceBpmChange(event.currentTarget.value)}
+              />
+              <p id="custom-beat-sync" className="session-controls__beat-sync" role="status">
+                {customBeatSelected
+                  ? 'This applied beat is active. Recorded BPM is its source reference; Tempo sets the shared practice target for the beat and scratch samples.'
+                  : 'Applied for this session. Choose Custom to play it.'}
+                {customBeatSelected && !activeReferenceInputValid && ' Enter a recorded BPM of at least 1 before playback.'}
+                {customBeatSelected && !hasTempoRange && ' These source BPM values have no shared playback range yet; correct the beat BPM to continue.'}
+              </p>
+            </>
+          ) : (
+            <p className="session-controls__beat-sync">No custom beat is applied. Upload a WAV or MP3 below, review its BPM, then choose Use custom beat. Sample playback remains available without a beat bed.</p>
+          )}
         </div>
-      )}
+      </fieldset>
 
-      <div className="session-controls__custom-beat-upload">
+      <div className={'session-controls__custom-beat-upload' + (!customBeatSelected ? ' session-controls__custom-beat-upload--inactive' : '')}>
         <div>
           <label className="session-controls__label" htmlFor="custom-beat-file">Upload custom beat</label>
           <small id="custom-beat-file-help" className="session-controls__hint">WAV or MP3 · analyzed in this browser and held for this session</small>
@@ -254,7 +295,7 @@ export function SessionControls({
           aria-describedby="custom-beat-file-help"
           type="file"
           accept=".wav,.mp3,audio/wav,audio/x-wav,audio/mpeg"
-          disabled={uploadDisabled}
+          disabled={customSourceControlsDisabled}
           onChange={onCustomBeatFileChange}
         />
         {customBeatCandidateFileName && (
@@ -275,7 +316,7 @@ export function SessionControls({
                   min="1"
                   step="0.1"
                   value={customBeatCandidateBpm}
-                  disabled={disabled || beatSelectionDisabled}
+                  disabled={customSourceControlsDisabled}
                   onChange={(event) => onCustomBeatCandidateBpmChange(event.currentTarget.value)}
                 />
                 <p id="custom-beat-candidate-help" className="session-controls__hint">
@@ -286,7 +327,7 @@ export function SessionControls({
                 <button
                   className="button button--small"
                   type="button"
-                  disabled={disabled || beatSelectionDisabled || !hasCandidateBpm || !candidateHasTempoRange}
+                  disabled={customSourceControlsDisabled || !hasCandidateBpm || !candidateHasTempoRange}
                   onClick={onUseCustomBeat}
                 >
                   Use custom beat

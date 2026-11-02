@@ -2,7 +2,7 @@ export const TTM_GUIDE_PROVENANCE = 'illustrative-technique-guide' as const
 
 export const UNTRANSCRIBED = Object.freeze({ kind: 'untranscribed' as const })
 
-export type TtmGuideId = 'baby-rub' | 'forward-movement' | 'backward-movement' | 'forward-cut'
+export type TtmGuideId = 'baby-rub' | 'forward-movement' | 'backward-movement' | 'forward-cut' | 'chirp'
 
 export interface TtmMotionPoint {
   readonly time: number
@@ -69,7 +69,7 @@ export interface TtmValidationResult {
 const GUIDE_SOURCE_URL = 'https://www.ttm-dj.com/ttm-01-01-basics/'
 const GUIDE_SOURCE_TITLE = 'TTM • Turntablist Transcription Method — Basics'
 const GUIDE_PROVENANCE_NOTE =
-  'Illustrative technique guide adapted from the source text; not transcribed from or verified against any sample audio.'
+  'Illustrative teaching shape based on the source description; not an official chart and not transcribed from or verified against any sample audio.'
 
 function freezeGuide(guide: TtmGuide): TtmGuide {
   const motion = Object.freeze(guide.motion.map((point) => Object.freeze({ ...point })))
@@ -108,8 +108,8 @@ const OPEN_FOR_FULL_PATTERN = [{ start: 0, end: 1, state: 'open' }] as const
 export const TTM_GUIDES: Readonly<Record<TtmGuideId, TtmGuide>> = Object.freeze({
   'baby-rub': createGuide(
     'baby-rub',
-    'Baby / rub',
-    'A simplified forward-and-back record motion with the fader open throughout.',
+    'Baby scratch / rub',
+    'A simplified forward stroke followed by a backward stroke. The fader stays open for both directions, so both strokes are audible.',
     [
       { time: 0, samplePosition: 0 },
       { time: 0.5, samplePosition: 1 },
@@ -120,7 +120,7 @@ export const TTM_GUIDES: Readonly<Record<TtmGuideId, TtmGuide>> = Object.freeze(
   'forward-movement': createGuide(
     'forward-movement',
     'Forward movement',
-    'One forward record movement, represented by an upward path with the fader open.',
+    'One forward record stroke, represented by an upward path with the fader open. This shows movement only; it is not the forward scratch/cut pattern.',
     [
       { time: 0, samplePosition: 0 },
       { time: 1, samplePosition: 1 },
@@ -130,7 +130,7 @@ export const TTM_GUIDES: Readonly<Record<TtmGuideId, TtmGuide>> = Object.freeze(
   'backward-movement': createGuide(
     'backward-movement',
     'Backward movement',
-    'One backward record movement, represented by a downward path with the fader open.',
+    'One backward record stroke from the end of the sample segment, represented by a downward path with the fader open.',
     [
       { time: 0, samplePosition: 1 },
       { time: 1, samplePosition: 0 },
@@ -139,8 +139,8 @@ export const TTM_GUIDES: Readonly<Record<TtmGuideId, TtmGuide>> = Object.freeze(
   ),
   'forward-cut': createGuide(
     'forward-cut',
-    'Forward cut',
-    'A simplified forward-and-back path with the fader open on the forward stroke and closed on the return.',
+    'Forward scratch / cut',
+    'A simplified forward scratch: the record moves forward with the fader open, then returns backward with the fader closed so the return is muted.',
     [
       { time: 0, samplePosition: 0 },
       { time: 0.5, samplePosition: 1 },
@@ -149,6 +149,21 @@ export const TTM_GUIDES: Readonly<Record<TtmGuideId, TtmGuide>> = Object.freeze(
     [
       { start: 0, end: 0.5, state: 'open' },
       { start: 0.5, end: 1, state: 'closed' },
+    ],
+  ),
+  chirp: createGuide(
+    'chirp',
+    'Chirp',
+    'A simplified forward-and-back pair with a short illustrative fader cut around the direction change. The narrow closed interval separates the two audible strokes; its width is not a timing transcription.',
+    [
+      { time: 0, samplePosition: 0 },
+      { time: 0.5, samplePosition: 1 },
+      { time: 1, samplePosition: 0 },
+    ],
+    [
+      { start: 0, end: 0.48, state: 'open' },
+      { start: 0.48, end: 0.52, state: 'closed' },
+      { start: 0.52, end: 1, state: 'open' },
     ],
   ),
 })
@@ -162,26 +177,49 @@ export function getTtmGuide(id: string): TtmGuide | null {
 
 const SAMPLE_NAME_SUGGESTIONS: Readonly<Record<string, TtmGuideId>> = Object.freeze({
   baby: 'baby-rub',
+  'baby (f)': 'forward-movement',
+  'baby f': 'forward-movement',
   'baby(f)': 'forward-movement',
+  'baby (r)': 'backward-movement',
+  'baby rev': 'backward-movement',
   'baby(r)': 'backward-movement',
+  chirp: 'chirp',
 })
+
+const SVG_PATH_HORIZONTAL_INSET = 6
+const SVG_PATH_VERTICAL_INSET = 8
+const SVG_PATH_WIDTH = 88
+const SVG_PATH_HEIGHT = 84
 
 /**
  * Returns a suggestion for a small, explicit set of legacy display names.
- * The caller must ask the user to select it; this function does not annotate a sample.
+ * The caller may display it as an illustrative suggestion; this function does not assign a guide.
  */
 export function suggestedGuideForSampleName(name: string): TtmGuideId | null {
-  const exactAlias = name.trim().toLocaleLowerCase('en-GB')
+  const exactAlias = name.trim().replace(/\s+/gu, ' ').toLowerCase()
   return Object.hasOwn(SAMPLE_NAME_SUGGESTIONS, exactAlias)
     ? SAMPLE_NAME_SUGGESTIONS[exactAlias]!
     : null
 }
 
-/** Maps normalized sample position to an SVG staff coordinate (forward goes upward). */
+/** Maps a validated normalized record path into a padded 100x100 SVG staff (forward goes upward). */
 export function ttmMotionSvgPath(motion: readonly TtmMotionPoint[]): string {
+  if (motion.length < 2
+    || motion[0]?.time !== 0
+    || motion.at(-1)?.time !== 1
+    || motion.some((point, index) => !Number.isFinite(point.time)
+      || !Number.isFinite(point.samplePosition)
+      || point.time < 0
+      || point.time > 1
+      || point.samplePosition < 0
+      || point.samplePosition > 1
+      || (index > 0 && point.time <= motion[index - 1]!.time))) {
+    throw new RangeError('TTM motion paths must contain finite, increasing points spanning normalized time and sample position [0, 1].')
+  }
+
   return motion.map((point, index) => {
-    const x = point.time * 100
-    const y = (1 - point.samplePosition) * 100
+    const x = SVG_PATH_HORIZONTAL_INSET + point.time * SVG_PATH_WIDTH
+    const y = SVG_PATH_VERTICAL_INSET + (1 - point.samplePosition) * SVG_PATH_HEIGHT
     return `${index === 0 ? 'M' : 'L'}${x} ${y}`
   }).join(' ')
 }
@@ -232,11 +270,11 @@ export function validateTtmAnnotation(value: unknown): TtmValidationResult {
     issues.push(issue('invalid-guide-explanation', '$.explanation', 'Guide annotations need a short explanation.'))
   }
   if (!isObject(value.provenance) || value.provenance.kind !== TTM_GUIDE_PROVENANCE
-    || typeof value.provenance.sourceTitle !== 'string'
+    || value.provenance.sourceTitle !== GUIDE_SOURCE_TITLE
     || typeof value.provenance.sourceUrl !== 'string'
     || value.provenance.sourceUrl !== GUIDE_SOURCE_URL
     || typeof value.provenance.note !== 'string'
-    || value.provenance.note.length === 0) {
+    || !/not an official chart and not transcribed from or verified against any sample audio/i.test(value.provenance.note)) {
     issues.push(issue('invalid-provenance', '$.provenance.kind', 'Guide annotations must be labeled as illustrative technique guides.'))
   }
 

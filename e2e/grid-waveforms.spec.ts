@@ -115,6 +115,7 @@ async function importCustomFixture(
     await page.goto('/')
     await expect(page.getByRole('heading', { name: 'Generated combo' })).toBeVisible({ timeout: 30_000 })
   }
+  await page.getByRole('tab', { name: 'Files', exact: true }).click()
   const files = []
   if (options.wav) files.push({ name: options.fileName ?? 'waveform-sample.wav', buffer: options.wav, mimeType: 'audio/wav' })
   if (options.includeBeat !== false) files.push({ name: 'waveform-beat.wav', buffer: makeWav('sine', 0.3), mimeType: 'audio/wav' })
@@ -125,6 +126,7 @@ async function importCustomFixture(
     mimeType: 'text/plain',
   })
   await expect(page.locator('.import-status__copy p')).toContainText('sample references parsed')
+  await page.getByRole('tab', { name: 'Practice', exact: true }).click()
   await page.getByLabel('Combo length').selectOption('4')
 }
 
@@ -288,14 +290,16 @@ test('TTM guide selection is advisory session state and switching views keeps pl
     }
   })
   await loadCustomFixture(page, { name: 'Baby(F)', fileName: 'baby-forward.wav', wav: makeWav() })
+  await page.getByRole('tab', { name: 'Samples', exact: true }).click()
   await page.getByRole('button', { name: 'Edit Baby(F)' }).click()
   const guideSelect = page.getByLabel('TTM guide for Baby(F)')
   await expect(guideSelect).toHaveValue('forward-movement')
   await expect(guideSelect.locator('option:checked')).toHaveText('Suggested: Forward movement')
   await expect(guideSelect.locator('option')).toHaveText([
-    'Untranscribed', 'Baby / rub', 'Suggested: Forward movement', 'Backward movement', 'Forward cut',
+    'Untranscribed', 'Baby scratch / rub', 'Suggested: Forward movement', 'Backward movement', 'Forward scratch / cut', 'Chirp',
   ])
   await expect(page.getByText(/suggested from the exact sample label only.*no audio is analyzed/i)).toBeVisible()
+  await page.getByRole('tab', { name: 'Practice', exact: true }).click()
   await page.getByRole('radio', { name: 'TTM practice guides' }).check()
   await expect(page.getByRole('radio', { name: 'TTM practice guides' })).toBeChecked()
   const timeline = page.locator('.timeline-scroll')
@@ -304,10 +308,7 @@ test('TTM guide selection is advisory session state and switching views keeps pl
   await expect(ttmVisual).toBeVisible()
   await expect(page.locator('.sequence-event').first()).toHaveAttribute('title', /Suggested illustrative TTM guide: Forward movement.*not an audio transcription/i)
   const babyForwardLane = page.locator('.timeline-lane').filter({ has: page.locator('.timeline-lane-name-text', { hasText: 'Baby(F)' }) }).first()
-  const ttmLaneColor = await babyForwardLane.locator('.timeline-lane-label').evaluate((label) => label.style.getPropertyValue('--sample-color').trim())
-  const ttmEventColor = await babyForwardLane.locator('.sequence-event--colored').first().evaluate((event) => event.style.getPropertyValue('--sample-color').trim())
-  expect(ttmLaneColor).not.toBe('')
-  expect(ttmEventColor).toBe(ttmLaneColor)
+  await expect(babyForwardLane.locator('.sequence-event--ttm-guide')).toHaveCount(8)
 
   await page.getByRole('button', { name: 'Play sequence' }).click()
   await expect(page.locator('.transport-status')).toContainText('Q&A · question playback · cycle 1.')
@@ -333,19 +334,23 @@ test('TTM guide selection is advisory session state and switching views keeps pl
   const playheadAfter = await page.locator('.timeline-playhead').getAttribute('style')
   expect(playheadAfter).toMatch(/left:\s*(?!0(?:\.0+)?%)/)
 
-  const proofDirectory = path.resolve(process.cwd(), 'test-results')
+  const proofDirectory = path.resolve(process.cwd(), 'test-results/ttm-beats-qa')
   mkdirSync(proofDirectory, { recursive: true })
   await page.setViewportSize({ width: 1280, height: 900 })
   await page.locator('#sequence-section').evaluate((section) => section.scrollIntoView({ block: 'start' }))
+  await page.evaluate(() => { if (document.activeElement instanceof HTMLElement) document.activeElement.blur() })
   await page.screenshot({ path: path.join(proofDirectory, 'integrated-ttm-guides.png'), fullPage: true })
   await page.getByRole('button', { name: 'Stop' }).click()
+  await page.getByRole('tab', { name: 'Samples', exact: true }).click()
   await guideSelect.selectOption('untranscribed')
   await expect(guideSelect.locator('option:checked')).toHaveText('Untranscribed')
   await expect(page.getByText('Explicitly Untranscribed for this session. Choose a guide to add an illustrative pattern.')).toBeVisible()
+  await page.getByRole('button', { name: 'Cancel' }).click()
+  await page.getByRole('tab', { name: 'Practice', exact: true }).click()
   await expect(page.locator('.sequence-event--ttm-untranscribed')).toHaveCount(8)
   await expect(page.locator('.sequence-ttm-motion')).toHaveCount(0)
   await expect(page.locator('.sequence-event').first()).toHaveAttribute('title', /explicitly set to Untranscribed/i)
-  await page.getByRole('button', { name: 'Cancel' }).click()
+  await page.getByRole('tab', { name: 'Samples', exact: true }).click()
   await expect(page.getByRole('button', { name: 'Save Sample Data' })).toBeEnabled()
   await page.getByRole('button', { name: 'Save Sample Data' }).click()
   await expect.poll(() => page.evaluate(() => window.__ttmSaveQa!.contents.length)).toBe(1)
