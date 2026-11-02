@@ -9,6 +9,12 @@ interface FakeSourceRecord {
   readonly stopTimes: number[];
 }
 
+interface FakeKeepAliveRecord {
+  readonly node: ConstantSourceNode;
+  readonly startTimes: number[];
+  readonly stopTimes: number[];
+}
+
 function makeBuffer(duration = 0.2, sampleRate = 1_000): AudioBuffer {
   const length = Math.max(1, Math.round(duration * sampleRate));
   const channel = new Float32Array(length);
@@ -48,12 +54,19 @@ function makeProcessor() {
 
 function makeFakeAudioContext(decodeAudioData?: (data: ArrayBuffer) => Promise<AudioBuffer>) {
   let currentTime = 0;
+  let outputLatencySeconds = 0;
+  let fixedOutputContextTime: number | undefined;
   let state: AudioContextState = "suspended";
   const sources: FakeSourceRecord[] = [];
+  const keepAliveSources: FakeKeepAliveRecord[] = [];
   const gains: GainNode[] = [];
   const contextLike = {
     get currentTime() { return currentTime; },
     get state() { return state; },
+    getOutputTimestamp: vi.fn(() => ({
+      contextTime: fixedOutputContextTime ?? Math.max(0, currentTime - outputLatencySeconds),
+      performanceTime: globalThis.performance.now(),
+    })),
     sampleRate: 1_000,
     destination: {} as AudioNode,
     resume: vi.fn(async () => { state = "running"; }),
@@ -72,6 +85,22 @@ function makeFakeAudioContext(decodeAudioData?: (data: ArrayBuffer) => Promise<A
         disconnect: vi.fn(),
       };
       gains.push(node as unknown as GainNode);
+      return node;
+    }),
+    createConstantSource: vi.fn(() => {
+      const startTimes: number[] = [];
+      const stopTimes: number[] = [];
+      let node: ConstantSourceNode;
+      const sourceLike = {
+        offset: makeFakeParam(0),
+        onended: null as ConstantSourceNode["onended"],
+        start: vi.fn((when = 0) => { startTimes.push(when); }),
+        stop: vi.fn((when = 0) => { stopTimes.push(when); }),
+        connect: vi.fn(() => node),
+        disconnect: vi.fn(),
+      };
+      node = sourceLike as unknown as ConstantSourceNode;
+      keepAliveSources.push({ node, startTimes, stopTimes });
       return node;
     }),
     createBufferSource: vi.fn(() => {
@@ -103,8 +132,11 @@ function makeFakeAudioContext(decodeAudioData?: (data: ArrayBuffer) => Promise<A
   return {
     context: contextLike as unknown as AudioContext,
     sources,
+    keepAliveSources,
     gains,
     setCurrentTime: (value: number) => { currentTime = value; },
+    setOutputLatency: (value: number) => { outputLatencySeconds = value; },
+    setOutputContextTime: (value: number | undefined) => { fixedOutputContextTime = value; },
   };
 }
 
@@ -150,6 +182,166 @@ describe("AudioTransport", () => {
     runScheduler();
     expect(fake.sources.map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55, 1.05]);
     expect(transport.getProgress()).toBeCloseTo(0.6);
+    transport.dispose();
+  });
+
+  it("separates scheduler progress from output-clock presentation through SoundTouch", async () => {
+    const fake = makeFakeAudioContext();
+    fake.setOutputLatency(0.04);
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+
+    await transport.play({ fixture, referenceBpm: 85, bpm: 85 });
+    expect(transport.getSnapshot().presentation).toMatchObject({
+      started: false,
+      progress: 0,
+      positionUnits: 0,
+      estimatedProcessorDelaySeconds: 0.13,
+      drainSeconds: 0.15,
+    });
+
+    fake.setCurrentTime(0.219);
+    runScheduler();
+    expect(transport.getSnapshot().progress).toBeGreaterThan(0.07);
+    expect(transport.getSnapshot().presentation).toMatchObject({ started: false, progress: 0, positionUnits: 0 });
+
+    fake.setCurrentTime(0.222);
+    runScheduler();
+    const presentation = transport.getSnapshot().presentation;
+    expect(presentation?.started).toBe(true);
+    expect(presentation?.progress).toBeLessThan(0.01);
+    expect(presentation?.positionUnits).toBeGreaterThanOrEqual(0);
+    expect(presentation?.positionUnits).toBeLessThan(0.1);
+    expect(presentation?.progress).toBeLessThan(transport.getSnapshot().progress);
+    transport.stop();
+    expect(transport.getSnapshot()).toEqual({ status: "idle", progress: 0 });
+    transport.dispose();
+  });
+
+  it("keeps the finite run active until outputTimestamp passes its final scheduled frame", async () => {
+    const fake = makeFakeAudioContext();
+    fake.setOutputLatency(0.04);
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const shortFixture: Fixture = {
+      events: [{ id: "finite-end", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+
+    await transport.play({ fixture: shortFixture, referenceBpm: 85, bpm: 85 });
+    expect(fake.keepAliveSources).toHaveLength(1);
+    expect(fake.keepAliveSources[0]?.startTimes).toEqual([0.05]);
+    expect(fake.keepAliveSources[0]?.stopTimes[0]).toBeCloseTo(
+      0.05 + 4 * 60 / 85 / 4 + 0.15,
+      10,
+    );
+    fake.setCurrentTime(0.80); // Output has passed the WAV end, but the measured DSP drain remains.
+    runScheduler();
+    expect(transport.getSnapshot().status).toBe("playing");
+    const scheduledDrainEnd = fake.keepAliveSources[0]?.stopTimes[0];
+    transport.setTempo(100); // A slider change in the tail cannot move the finite end again.
+    expect(fake.keepAliveSources[0]?.stopTimes[0]).toBe(scheduledDrainEnd);
+    expect(processor.playbackRate.value).toBeCloseTo(100 / 85);
+
+    fake.setCurrentTime(0.96);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({
+      status: "completed",
+      progress: 1,
+      presentation: { started: true, progress: 1, positionUnits: 4 },
+    });
+    expect(fake.keepAliveSources[0]?.stopTimes.at(-1)).toBe(0);
+    transport.dispose();
+  });
+
+  it("uses the context clock when outputTimestamp is invalid", async () => {
+    const fake = makeFakeAudioContext();
+    fake.setOutputContextTime(Number.NaN);
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+
+    await transport.play({ fixture, referenceBpm: 85, bpm: 85 });
+    fake.setCurrentTime(0.20);
+    runScheduler();
+    expect(transport.getSnapshot().presentation?.started).toBe(true);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("keeps output-clock presentation monotonic when a timestamp repeats or regresses", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+
+    await transport.play({ fixture, referenceBpm: 85, bpm: 85 });
+    fake.setCurrentTime(0.40);
+    fake.setOutputContextTime(0.25);
+    runScheduler();
+    const first = transport.getSnapshot().presentation!.positionUnits;
+
+    fake.setCurrentTime(0.50);
+    fake.setOutputContextTime(0.20);
+    runScheduler();
+    const repeated = transport.getSnapshot().presentation!.positionUnits;
+    expect(repeated).toBeGreaterThanOrEqual(first);
+
+    fake.setCurrentTime(0.60);
+    fake.setOutputContextTime(0.35);
+    runScheduler();
+    expect(transport.getSnapshot().presentation!.positionUnits).toBeGreaterThan(repeated);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("keeps the estimated heard position monotonic across live tempo epochs", async () => {
+    const fake = makeFakeAudioContext();
+    fake.setOutputLatency(0.04);
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const longFixture: Fixture = {
+      events: [{ id: "tempo-epoch", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 40,
+    };
+
+    await transport.play({ fixture: longFixture, referenceBpm: 85, bpm: 85 });
+    fake.setCurrentTime(0.30);
+    runScheduler();
+    const beforeChange = transport.getSnapshot().presentation!.positionUnits;
+    transport.setTempo(100);
+    const atChange = transport.getSnapshot().presentation!.positionUnits;
+    expect(atChange).toBeGreaterThanOrEqual(beforeChange);
+
+    fake.setCurrentTime(0.43); // Output still maps through the old tempo epoch.
+    runScheduler();
+    const beforeAudibleTempoChange = transport.getSnapshot().presentation!.positionUnits;
+    fake.setCurrentTime(0.49); // Output cursor has crossed the tempo epoch boundary.
+    runScheduler();
+    const afterAudibleTempoChange = transport.getSnapshot().presentation!.positionUnits;
+    expect(beforeAudibleTempoChange).toBeGreaterThanOrEqual(atChange);
+    expect(afterAudibleTempoChange).toBeGreaterThan(beforeAudibleTempoChange);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("bounds unpresented tempo history during rapid live adjustments", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport } = makeTransport(fake.context, async () => processor.node);
+    const longFixture: Fixture = {
+      events: [{ id: "rapid-tempo-history", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 128,
+    };
+    await transport.play({ fixture: longFixture, referenceBpm: 85, bpm: 85 });
+
+    for (let index = 0; index < 70; index += 1) {
+      fake.setCurrentTime(0.1 + index * 0.001);
+      transport.setTempo(index % 2 === 0 ? 100 : 85);
+    }
+
+    const playback = Reflect.get(transport, "activePlayback") as { presentationEpochs: readonly unknown[] };
+    expect(playback.presentationEpochs.length).toBeLessThanOrEqual(64);
+    expect(transport.getSnapshot().presentation?.positionUnits).toBeGreaterThanOrEqual(0);
+    transport.stop();
     transport.dispose();
   });
 
@@ -522,6 +714,135 @@ describe("AudioTransport", () => {
     transport.dispose();
   });
 
+  it("holds generated-plan presentation and callback until the estimated output boundary", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const fixtureFor = (id: string): Fixture => ({
+      events: [{ id, sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    });
+    let callbackRan = false;
+    const seenPlanSnapshots: number[] = [];
+    const onPlanBoundary = vi.fn(() => { callbackRan = true; });
+
+    const play = transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: fixtureFor("presented-first") }],
+      cyclesPerPlan: 1,
+      nextPlan: () => ({ slots: [{ kind: "fixture", fixture: fixtureFor("presented-next") }] }),
+      onPlanBoundary,
+      referenceBpm: 120,
+      bpm: 120,
+    });
+    transport.subscribe((snapshot) => {
+      if (snapshot.presentation?.cyclePlanIndex === 2) {
+        expect(callbackRan).toBe(true);
+        seenPlanSnapshots.push(snapshot.presentation.cyclePlanIndex);
+      }
+    });
+    await play;
+
+    const boundaryAt = 0.05 + 4 * 60 / 120 / 4;
+    fake.setCurrentTime(boundaryAt);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({
+      cyclePlanIndex: 2,
+      presentation: { cyclePlanIndex: 1, cycleSlotKind: "fixture" },
+    });
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+
+    fake.setCurrentTime(boundaryAt + 0.12);
+    runScheduler();
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+    expect(transport.getSnapshot().presentation?.cyclePlanIndex).toBe(1);
+
+    fake.setCurrentTime(boundaryAt + 0.14);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledWith({
+      planIndex: 2,
+      completedRounds: 1,
+      plan: expect.any(Object),
+    });
+    expect(transport.getSnapshot().presentation).toMatchObject({
+      started: true,
+      cyclePlanIndex: 2,
+      cycleIteration: 2,
+      cycleSlotIndex: 0,
+      cycleSlotKind: "fixture",
+    });
+    expect(seenPlanSnapshots).toEqual([2]);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("does not fire queued presentation callbacks after the first callback stops playback", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const tinyFixture: Fixture = {
+      events: [{ id: "rapid-boundary", sampleId: "synthPulse", startUnits: 0, durationUnits: 0.08, silent: false }],
+      totalUnits: 0.08,
+    };
+    const onPlanBoundary = vi.fn(() => transport.stop());
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: tinyFixture }],
+      cyclesPerPlan: 1,
+      nextPlan: () => ({ slots: [{ kind: "fixture", fixture: tinyFixture }] }),
+      onPlanBoundary,
+      referenceBpm: 85,
+      bpm: 85,
+    });
+
+    fake.setCurrentTime(0.30);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledTimes(1);
+    expect(transport.getSnapshot()).toEqual({ status: "idle", progress: 0 });
+    expect(fake.keepAliveSources[0]?.stopTimes.at(-1)).toBe(0);
+    transport.dispose();
+  });
+
+  it("keeps the audible Q&A fixture slot visible until the response slot reaches output", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const answerFixture: Fixture = {
+      events: [{ id: "qa-heard-answer", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: answerFixture }],
+      cyclesPerPlan: 1,
+      nextPlan: () => ({ slots: [{ kind: "fixture", fixture: answerFixture }] }),
+      referenceBpm: 120,
+      bpm: 120,
+    });
+    expect(transport.getSnapshot().presentation?.cyclePlanIndex).toBe(1);
+    transport.stop();
+
+    await transport.playCyclePlan({
+      slots: [
+        { kind: "fixture", fixture: answerFixture },
+        { kind: "silence", durationUnits: 4 },
+      ],
+      referenceBpm: 120,
+      bpm: 120,
+    });
+    expect(transport.getSnapshot().presentation?.cyclePlanIndex).toBeUndefined();
+
+    fake.setCurrentTime(0.65);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({
+      cycleSlotKind: "silence",
+      presentation: { cycleSlotKind: "fixture", cycleSlotIndex: 0 },
+    });
+
+    fake.setCurrentTime(0.73);
+    runScheduler();
+    expect(transport.getSnapshot().presentation).toMatchObject({ cycleSlotKind: "silence", cycleSlotIndex: 1 });
+    transport.stop();
+    transport.dispose();
+  });
+
   it("allows an initially silent Auto-generate plan to advance into an audible plan", async () => {
     const fake = makeFakeAudioContext();
     const { transport, runScheduler } = makeTransport(fake.context);
@@ -593,6 +914,9 @@ describe("AudioTransport", () => {
     expect(onPlanBoundary).not.toHaveBeenCalled();
 
     fake.setCurrentTime(rebasedBoundaryAt);
+    runScheduler();
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+    fake.setCurrentTime(rebasedBoundaryAt + 0.14);
     runScheduler();
     expect(onPlanBoundary).toHaveBeenCalledTimes(1);
     expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2 });
@@ -812,7 +1136,7 @@ describe("AudioTransport", () => {
   it("applies a live tempo change at a generated plan boundary without resetting beat phase", async () => {
     const fake = makeFakeAudioContext();
     const processor = makeProcessor();
-    const { transport } = makeTransport(fake.context, async () => processor.node);
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
     const beatFile = {
       name: "auto-tempo-beat.wav",
       arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
@@ -843,6 +1167,9 @@ describe("AudioTransport", () => {
     transport.setTempo(100);
 
     expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2, cycleIteration: 2 });
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+    fake.setCurrentTime(boundaryAt + 0.14);
+    runScheduler();
     expect(onPlanBoundary).toHaveBeenCalledWith({ planIndex: 2, completedRounds: 1, plan: expect.any(Object) });
     expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05, boundaryAt]);
     expect(fake.sources.filter(({ node }) => node.loop)).toHaveLength(1);
@@ -936,7 +1263,7 @@ describe("AudioTransport", () => {
 
     transport.setTempo(100);
     expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 1, cycleIteration: 2 });
-    fake.setCurrentTime(nextPlanBoundary);
+    fake.setCurrentTime(nextPlanBoundary + 0.14);
     runScheduler();
 
     expect(onPlanBoundary).toHaveBeenCalledWith({ planIndex: 2, completedRounds: 2, plan: expect.any(Object) });
@@ -1153,6 +1480,9 @@ describe("AudioTransport", () => {
     runScheduler();
     expect(transport.getSnapshot().status).toBe("playing");
     fake.setCurrentTime(2.21);
+    runScheduler();
+    expect(transport.getSnapshot().status).toBe("playing");
+    fake.setCurrentTime(2.40);
     runScheduler();
     expect(transport.getSnapshot().status).toBe("completed");
     transport.dispose();

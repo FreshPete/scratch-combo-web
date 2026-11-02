@@ -61,6 +61,7 @@ type PlaybackTarget =
 
 type PracticeMode = 'qa' | 'loop'
 type TimelineView = 'waveform' | 'ttm'
+type TimelineLayout = 'grid' | 'inline'
 type WorkspaceSection = 'sequence' | 'files' | 'session' | 'samples'
 type PresetSource = 'loading' | 'builtin' | 'custom' | 'demo'
 
@@ -84,6 +85,16 @@ function resolutionForSample(
 }
 
 type TimelineGuideState = 'suggested' | 'assigned' | 'unassigned' | 'untranscribed'
+
+function eventAtTimelinePosition(fixture: Fixture, positionUnits: number): Fixture['events'][number] | null {
+  if (!Number.isFinite(positionUnits) || positionUnits < 0) return null
+  return fixture.events.find((event) => (
+    !event.silent
+    && event.sampleId !== REST_SAMPLE_ID
+    && positionUnits >= event.startUnits
+    && positionUnits < event.startUnits + event.durationUnits
+  )) ?? null
+}
 
 function timelineGuideForSample(
   sampleId: string,
@@ -334,19 +345,28 @@ function cycleSlotsFor(fixture: Fixture, mode: PracticeMode, largePause: boolean
 }
 
 function SequenceTimeline({
-  fixture, preset, assets, progress, isPlaying, auditionedSampleId, timebase, view: requestedView, ttmDebugEnabled, ttmAnnotations, onViewChange,
+  fixture, preset, assets, progress, isPlaying, presentationStarted, presentationPositionUnits, presentationCycleSlotKind,
+  presentationCyclePlanIndex, activeSampleId, activeEventId, auditionedSampleId, timebase, view: requestedView, layout, ttmDebugEnabled, ttmAnnotations, onViewChange, onLayoutChange,
 }: {
   fixture: Fixture
   preset: Preset
   assets: ReadonlyMap<string, File>
   progress: number
   isPlaying: boolean
+  presentationStarted: boolean
+  presentationPositionUnits: number | null
+  presentationCycleSlotKind: CycleSlot['kind'] | undefined
+  presentationCyclePlanIndex: number | undefined
+  activeSampleId: string | null
+  activeEventId: string | null
   auditionedSampleId: string | null
   timebase: 'demo' | 'legacy'
   view: TimelineView
+  layout: TimelineLayout
   ttmDebugEnabled: boolean
   ttmAnnotations: Readonly<Record<string, TtmSampleGuideSelection>>
   onViewChange: (view: TimelineView) => void
+  onLayoutChange: (layout: TimelineLayout) => void
 }) {
   const [waveforms, setWaveforms] = useState<ReadonlyMap<string, WaveformData>>(() => new Map())
   const waveformGeneration = useRef(0)
@@ -450,8 +470,82 @@ function SequenceTimeline({
           + guideResolution.guide.label + ', not an audio transcription'
         : guideResolution?.state === 'unassigned' ? ', TTM guide: Unassigned (Untranscribed)' : ', TTM guide: Untranscribed'
       : ''
-    return <li key={event.id}>Event {index + 1}: {name}, starts at {startLabel}{event.startUnits + 1}, lasts {event.durationUnits}{durationLabel}{event.silent ? ', silent' : ''}{guideDescription}</li>
+    return <li key={event.id}>Event {index + 1}: {name}, starts at {startLabel}{event.startUnits + 1}, lasts {event.durationUnits}{durationLabel}{event.silent ? ', silent' : ''}{event.id === activeEventId ? ', now playing' : ''}{guideDescription}</li>
   })
+  const renderSequenceEvent = (event: Fixture['events'][number], inline = false) => {
+    const waveform = event.silent ? undefined : waveforms.get(event.sampleId)
+    const sample = preset.samples.find((candidate) => candidate.id === event.sampleId)
+    const name = event.sampleId === REST_SAMPLE_ID ? 'Rest' : sample?.name ?? event.sampleId
+    const guideResolution = !event.silent
+      ? timelineGuideForSample(event.sampleId, sample?.name ?? event.sampleId, ttmAnnotations)
+      : null
+    const guide = guideResolution?.guide ?? null
+    const sampleColor = event.silent ? null : sampleColorForName(sample?.name ?? event.sampleId)
+    const active = event.id === activeEventId
+    const slotDurationSeconds = timelineUnitsToSeconds(event.durationUnits, preset.bpm, unitsPerBeat)
+    const geometry = waveform && slotDurationSeconds
+      ? waveformDisplayGeometry(waveform.durationSeconds, slotDurationSeconds, waveform.peaks.length)
+      : null
+    const waveformClass = view === 'waveform' && waveform && geometry ? ' sequence-event--waveform' : ''
+    const guideClass = view === 'ttm' && !event.silent
+      ? guide ? ' sequence-event--ttm-guide' : ' sequence-event--ttm-' + guideResolution?.state
+      : ''
+    const sampleColorClass = sampleColor ? ' sequence-event--colored' : ''
+    const inlineClass = inline ? ' sequence-event--inline' : ''
+    const activeClass = active ? ' sequence-event--active' : ''
+    const guideDescription = guide
+      ? (guideResolution?.state === 'suggested' ? ' Suggested illustrative TTM guide: ' : ' Illustrative TTM guide: ')
+        + guide.label + '; not an audio transcription.'
+      : guideResolution?.state === 'unassigned'
+        ? ' TTM guide is unassigned (Untranscribed).'
+        : guideResolution?.state === 'untranscribed' ? ' TTM guide is explicitly set to Untranscribed.' : ''
+
+    return (
+      <span
+        key={event.id}
+        data-event-id={event.id}
+        data-active={active ? 'true' : undefined}
+        className={'sequence-event' + (event.silent ? ' sequence-event--silent' : '') + sampleColorClass + waveformClass + guideClass + inlineClass + activeClass}
+        style={{ ...(sampleColor ? { '--sample-color': sampleColor } : {}), left: (event.startUnits / totalUnits) * 100 + '%', width: (event.durationUnits / totalUnits) * 100 + '%' } as CSSProperties}
+        title={event.silent ? name + ': silent event' : (active ? 'Now playing · ' : '') + name + ': ' + event.durationUnits + ' units' + guideDescription}
+      >
+        {inline && <span className="sequence-inline-event-label">{active ? 'Now playing · ' : ''}{name}</span>}
+        {view === 'waveform' && waveform && geometry && (
+          <svg
+            className="sequence-waveform"
+            aria-hidden="true"
+            preserveAspectRatio="none"
+            viewBox={'0 0 ' + geometry.viewBoxWidth + ' ' + WAVEFORM_VIEWBOX_HEIGHT}
+            style={{ width: geometry.widthPercent + '%' }}
+          >
+            <line x1="0" y1={WAVEFORM_VIEWBOX_HEIGHT / 2} x2={waveform.peaks.length} y2={WAVEFORM_VIEWBOX_HEIGHT / 2} />
+            <path d={waveform.path} />
+          </svg>
+        )}
+        {view === 'ttm' && guide && (
+          <>
+            <svg className="sequence-ttm-motion" aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 100 100">
+              <path d={ttmMotionSvgPath(guide.motion)} />
+            </svg>
+            <span className="sequence-ttm-fader" aria-hidden="true">
+              {guide.faderIntervals.map((interval, index) => (
+                <span
+                  className={'sequence-ttm-fader__interval sequence-ttm-fader__interval--' + interval.state}
+                  key={guide.id + '-fader-' + index}
+                  style={{ left: interval.start * 100 + '%', width: (interval.end - interval.start) * 100 + '%' }}
+                />
+              ))}
+            </span>
+          </>
+        )}
+        {view === 'ttm' && !event.silent && !guide && (
+          <span className="sequence-ttm-placeholder-mark" aria-hidden="true">
+            {guideResolution?.state === 'untranscribed' ? '—' : '?'}
+          </span>
+        )}
+      </span>
+    )
+  }
 
   return (
     <figure className="timeline-figure" aria-labelledby="timeline-caption">
@@ -460,6 +554,11 @@ function SequenceTimeline({
           <strong>Sequence timeline</strong>
           <span>{fixture.totalUnits} {unitDescription} across {Math.ceil(fixture.totalUnits / unitsPerBar)} bars</span>
         </span>
+        <fieldset className="timeline-layout-control" aria-label="Timeline layout">
+          <legend>Layout</legend>
+          <label><input type="radio" name="timeline-layout" value="grid" checked={layout === 'grid'} onChange={() => onLayoutChange('grid')} />Grid</label>
+          <label><input type="radio" name="timeline-layout" value="inline" checked={layout === 'inline'} onChange={() => onLayoutChange('inline')} />Inline</label>
+        </fieldset>
         <fieldset className="timeline-view-control" aria-label="Timeline view">
           <legend>View</legend>
           <label><input type="radio" name="timeline-view" value="waveform" checked={view === 'waveform'} onChange={() => handleViewChange('waveform')} />Waveform</label>
@@ -468,7 +567,16 @@ function SequenceTimeline({
         </fieldset>
         <span className="timing-readout">{fixture.events.length} events</span>
       </figcaption>
-      <div className="timeline-scroll" role="img" tabIndex={0} aria-label={'Sequence timeline: ' + fixture.totalUnits + ' ' + unitDescription + ', ' + fixture.events.length + ' events'}>
+      <div
+        className="timeline-scroll"
+        role="img"
+        tabIndex={0}
+        aria-label={'Sequence timeline: ' + fixture.totalUnits + ' ' + unitDescription + ', ' + fixture.events.length + ' events'}
+        data-presentation-started={presentationStarted ? 'true' : 'false'}
+        data-presentation-position-units={presentationPositionUnits === null ? undefined : String(presentationPositionUnits)}
+        data-cycle-slot-kind={presentationCycleSlotKind}
+        data-cycle-plan-index={presentationCyclePlanIndex}
+      >
         <div className="timeline-board" style={{ minWidth: minBoardWidth }}>
           <div className="timeline-bar-row">
             <span className="timeline-axis-label">BAR</span>
@@ -480,90 +588,33 @@ function SequenceTimeline({
               {unitNumbers.map((unit) => <span className={unit % unitsPerBeat === 0 ? 'ruler-cell ruler-cell--beat' : 'ruler-cell'} key={unit}>{unit % unitsPerBeat === 0 ? String((Math.floor(unit / unitsPerBeat) % 4) + 1) : ''}</span>)}
             </div>
           </div>
-          {lanes.map((lane) => {
+          {layout === 'grid' && lanes.map((lane) => {
             const events = fixture.events.filter((event) => event.sampleId === lane.id)
             return (
-              <div className={lane.id === auditionedSampleId ? 'timeline-lane timeline-lane--auditioned' : 'timeline-lane'} key={lane.id}>
-                <span className={view === 'ttm' ? 'timeline-lane-label timeline-lane-label--ttm' : 'timeline-lane-label'} style={lane.color ? { '--sample-color': lane.color } as CSSProperties : undefined}>
+              <div className={'timeline-lane' + (lane.id === auditionedSampleId ? ' timeline-lane--auditioned' : '') + (lane.id === activeSampleId ? ' timeline-lane--active' : '')} key={lane.id} style={lane.color ? { '--sample-color': lane.color } as CSSProperties : undefined}>
+                <span className={view === 'ttm' ? 'timeline-lane-label timeline-lane-label--ttm' : 'timeline-lane-label'}>
                   <span className="timeline-lane-name"><span className={lane.color ? 'timeline-color-swatch' : 'timeline-color-swatch timeline-color-swatch--silent'} aria-hidden="true" /><span className="timeline-lane-name-text">{lane.name}</span></span>
                   <small>{lane.note}</small>
+                  {lane.id === activeSampleId && <span className="timeline-now-playing">Now playing</span>}
                 </span>
                 <span className="timeline-track" aria-hidden="true" style={{ gridTemplateColumns: 'repeat(' + totalUnits + ', minmax(8px, 1fr))' }}>
                   {unitNumbers.map((unit) => <span className={unit % unitsPerBeat === 0 ? 'timeline-tick timeline-tick--beat' : 'timeline-tick'} key={unit} />)}
-                  {events.map((event) => (
-                    (() => {
-                      const waveform = event.silent ? undefined : waveforms.get(event.sampleId)
-                      const sample = preset.samples.find((candidate) => candidate.id === event.sampleId)
-                      const guideResolution = !event.silent
-                        ? timelineGuideForSample(event.sampleId, sample?.name ?? event.sampleId, ttmAnnotations)
-                        : null
-                      const guide = guideResolution?.guide ?? null
-                      const sampleColor = event.silent ? null : sampleColorForName(sample?.name ?? event.sampleId)
-                      const slotDurationSeconds = timelineUnitsToSeconds(event.durationUnits, preset.bpm, unitsPerBeat)
-                      const geometry = waveform && slotDurationSeconds
-                        ? waveformDisplayGeometry(waveform.durationSeconds, slotDurationSeconds, waveform.peaks.length)
-                        : null
-                      const waveformClass = view === 'waveform' && waveform && geometry ? ' sequence-event--waveform' : ''
-                      const guideClass = view === 'ttm' && !event.silent
-                        ? guide ? ' sequence-event--ttm-guide' : ' sequence-event--ttm-' + guideResolution?.state
-                        : ''
-                      const sampleColorClass = sampleColor ? ' sequence-event--colored' : ''
-                      const guideDescription = guide
-                        ? (guideResolution?.state === 'suggested' ? ' Suggested illustrative TTM guide: ' : ' Illustrative TTM guide: ')
-                          + guide.label + '; not an audio transcription.'
-                        : guideResolution?.state === 'unassigned'
-                          ? ' TTM guide is unassigned (Untranscribed).'
-                          : guideResolution?.state === 'untranscribed' ? ' TTM guide is explicitly set to Untranscribed.' : ''
-
-                      return (
-                        <span
-                          key={event.id}
-                          className={'sequence-event' + (event.silent ? ' sequence-event--silent' : '') + sampleColorClass + waveformClass + guideClass}
-                          style={{ ...(sampleColor ? { '--sample-color': sampleColor } : {}), left: (event.startUnits / totalUnits) * 100 + '%', width: (event.durationUnits / totalUnits) * 100 + '%' } as CSSProperties}
-                          title={event.silent ? lane.name + ': silent event' : lane.name + ': ' + event.durationUnits + ' units' + guideDescription}
-                        >
-                          {view === 'waveform' && waveform && geometry && (
-                            <svg
-                              className="sequence-waveform"
-                              aria-hidden="true"
-                              preserveAspectRatio="none"
-                              viewBox={'0 0 ' + geometry.viewBoxWidth + ' ' + WAVEFORM_VIEWBOX_HEIGHT}
-                              style={{ width: geometry.widthPercent + '%' }}
-                            >
-                              <line x1="0" y1={WAVEFORM_VIEWBOX_HEIGHT / 2} x2={waveform.peaks.length} y2={WAVEFORM_VIEWBOX_HEIGHT / 2} />
-                              <path d={waveform.path} />
-                            </svg>
-                          )}
-                          {view === 'ttm' && guide && (
-                            <>
-                              <svg className="sequence-ttm-motion" aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 100 100">
-                                <path d={ttmMotionSvgPath(guide.motion)} />
-                              </svg>
-                              <span className="sequence-ttm-fader" aria-hidden="true">
-                                {guide.faderIntervals.map((interval, index) => (
-                                  <span
-                                    className={'sequence-ttm-fader__interval sequence-ttm-fader__interval--' + interval.state}
-                                    key={guide.id + '-fader-' + index}
-                                    style={{ left: interval.start * 100 + '%', width: (interval.end - interval.start) * 100 + '%' }}
-                                  />
-                                ))}
-                              </span>
-                            </>
-                          )}
-                          {view === 'ttm' && !event.silent && !guide && (
-                            <span className="sequence-ttm-placeholder-mark" aria-hidden="true">
-                              {guideResolution?.state === 'untranscribed' ? '—' : '?'}
-                            </span>
-                          )}
-                        </span>
-                      )
-                    })()
-                  ))}
+                  {events.map((event) => renderSequenceEvent(event))}
                   {isPlaying && <span className="timeline-playhead" style={{ left: Math.min(Math.max(progress, 0), 1) * 100 + '%' }} />}
                 </span>
               </div>
             )
           })}
+          {layout === 'inline' && (
+            <div className="timeline-inline-row">
+              <span className="timeline-axis-label">EVENT</span>
+              <span className="timeline-track timeline-track--inline" aria-hidden="true" style={{ gridTemplateColumns: 'repeat(' + totalUnits + ', minmax(8px, 1fr))' }}>
+                {unitNumbers.map((unit) => <span className={unit % unitsPerBeat === 0 ? 'timeline-tick timeline-tick--beat' : 'timeline-tick'} key={unit} />)}
+                {fixture.events.map((event) => renderSequenceEvent(event, true))}
+                {isPlaying && <span className="timeline-playhead" style={{ left: Math.min(Math.max(progress, 0), 1) * 100 + '%' }} />}
+              </span>
+            </div>
+          )}
         </div>
       </div>
       {view === 'ttm' && <p className="timeline-guide-note">TTM practice guides are illustrative examples, not WAV transcriptions. Exact Baby/Baby(F)/Baby(R) labels only suggest a guide; unassigned rows are marked. <a href="#sample-section">Edit a sample</a> to assign another guide or choose Untranscribed. Record motion: forward ↑, backward ↓; the bottom strip shows the fader open or closed.</p>}
@@ -790,6 +841,11 @@ export default function App() {
   const ttmDebugEnabled = import.meta.env.DEV
   const [transport] = useState(() => new AudioTransport())
   const transportSnapshot = useSyncExternalStore(transport.subscribe, transport.getSnapshot, transport.getSnapshot)
+  const presentation = transportSnapshot.presentation
+  const presentationCycleSlotKind = presentation?.cycleSlotKind
+  const presentationCycleSlotIndex = presentation?.cycleSlotIndex
+  const presentationCycleIteration = presentation?.cycleIteration
+  const presentationCyclePlanIndex = presentation?.cyclePlanIndex
   const isPlaybackLocked = transportSnapshot.status === 'loading' || transportSnapshot.status === 'playing'
   const isPlaybackLockedNow = () => {
     const status = transport.getSnapshot().status
@@ -797,8 +853,10 @@ export default function App() {
   }
   const [preset, setPreset] = useState<Preset>(DEMO_PRESET)
   const [fixture, setFixture] = useState<Fixture | null>(null)
+  const [visibleCyclePlanIndex, setVisibleCyclePlanIndex] = useState<number | null>(null)
   const [timebase, setTimebase] = useState<'demo' | 'legacy'>('demo')
   const [timelineView, setTimelineView] = useState<TimelineView>('waveform')
+  const [timelineLayout, setTimelineLayout] = useState<TimelineLayout>('grid')
   const [ttmAnnotations, setTtmAnnotations] = useState<Record<string, TtmSampleGuideSelection>>({})
   const [comboBeats, setComboBeats] = useState<number>(DEFAULT_COMBO_BEATS)
   const [practiceMode, setPracticeMode] = useState<PracticeMode>('qa')
@@ -1143,17 +1201,17 @@ export default function App() {
     if (transportSnapshot.status === 'playing') {
       if (playbackTarget?.kind === 'sample') {
         setTransportNote('Previewing ' + playbackTarget.name + '.')
-      } else if (playbackTarget?.kind === 'sequence' && transportSnapshot.cycleSlotKind) {
-        const iteration = transportSnapshot.cycleIteration ?? 1
-        const slotIndex = transportSnapshot.cycleSlotIndex ?? 0
+      } else if (playbackTarget?.kind === 'sequence' && presentationCycleSlotKind) {
+        const iteration = presentationCycleIteration ?? 1
+        const slotIndex = presentationCycleSlotIndex ?? 0
         const cycleNumber = ((iteration - 1) * cycleSlotCount) + slotIndex + 1
-        const planPrefix = transportSnapshot.cyclePlanIndex === undefined
+        const planPrefix = presentationCyclePlanIndex === undefined
           ? ''
-          : 'Auto-generate · combo ' + transportSnapshot.cyclePlanIndex + ' · '
+          : 'Auto-generate · combo ' + presentationCyclePlanIndex + ' · '
         if (practiceMode === 'loop') {
           setTransportNote(planPrefix + 'Loop · combo cycle ' + cycleNumber + '.')
         } else {
-          setTransportNote(planPrefix + (transportSnapshot.cycleSlotKind === 'fixture'
+          setTransportNote(planPrefix + (presentationCycleSlotKind === 'fixture'
             ? 'Q&A · question playback · cycle ' + cycleNumber + '.'
             : 'Q&A · answer pause · cycle ' + cycleNumber + '.'))
         }
@@ -1166,7 +1224,7 @@ export default function App() {
       setPlaybackTarget(null)
     }
     if (transportSnapshot.status === 'error') setTransportNote(transportSnapshot.error ?? 'Playback could not start.')
-  }, [transportSnapshot.status, transportSnapshot.error, transportSnapshot.cycleSlotKind, transportSnapshot.cycleSlotIndex, transportSnapshot.cycleIteration, transportSnapshot.cyclePlanIndex, playbackTarget, practiceMode, cycleSlotCount])
+  }, [transportSnapshot.status, transportSnapshot.error, presentationCycleSlotKind, presentationCycleSlotIndex, presentationCycleIteration, presentationCyclePlanIndex, playbackTarget, practiceMode, cycleSlotCount])
 
   const handlePresetChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0]
@@ -1587,6 +1645,7 @@ export default function App() {
     invalidateAutoGeneration()
     setActionError(null)
     setPlaybackTarget(target)
+    setVisibleCyclePlanIndex(null)
     const options = {
       referenceBpm: preset.bpm,
       bpm: bpmValue,
@@ -1613,6 +1672,7 @@ export default function App() {
           if (autoGenerateGeneration.current !== generation) return
           const activeFixture = boundary.plan.slots.find((slot) => slot.kind === 'fixture')
           if (!activeFixture || activeFixture.kind !== 'fixture') return
+          setVisibleCyclePlanIndex(boundary.planIndex)
           setFixture(activeFixture.fixture)
           const generated = generatedByPlan.get(boundary.planIndex)
           if (generated) {
@@ -1628,6 +1688,7 @@ export default function App() {
           onPlanBoundary,
           preloadSampleIds: autoGenerateSampleIds,
         }
+        setVisibleCyclePlanIndex(1)
         void transport.playCyclePlan(cyclePlanOptions)
         return
       }
@@ -1690,6 +1751,7 @@ export default function App() {
     invalidateAutoGeneration()
     transport.stop()
     setPlaybackTarget(null)
+    setVisibleCyclePlanIndex(null)
     setActionError(null)
     setTransportNote('Playback stopped.')
   }
@@ -1697,10 +1759,27 @@ export default function App() {
   const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating || isPlaybackLocked || autoGenerateBlocked
   const stopDisabled = transportSnapshot.status !== 'playing' && transportSnapshot.status !== 'loading'
   const isSequencePlaying = playbackTarget?.kind === 'sequence' && transportSnapshot.status === 'playing'
-  const progressPercent = transportSnapshot.status === 'completed' ? 1 : Math.max(0, Math.min(1, transportSnapshot.progress))
-  const timelineProgressPercent = isSequencePlaying && transportSnapshot.cycleSlotKind
-    ? (progressPercent * cycleSlotCount) % 1
+  const displayedProgress = transportSnapshot.status === 'playing' ? presentation?.progress : undefined
+  const progressPercent = transportSnapshot.status === 'completed'
+    ? 1
+    : Math.max(0, Math.min(1, displayedProgress ?? transportSnapshot.progress))
+  const timelineProgressPercent = presentation?.started && fixture
+    ? Math.max(0, Math.min(1, presentation.positionUnits / Math.max(fixture.totalUnits, 1)))
     : progressPercent
+  const visibleFixturePlanMatches = visibleCyclePlanIndex === null
+    ? presentationCyclePlanIndex === undefined
+    : presentationCyclePlanIndex === visibleCyclePlanIndex
+  const timelineIsPlaying = isSequencePlaying && Boolean(presentation?.started) && visibleFixturePlanMatches
+  const activeSequenceEvent = isSequencePlaying
+    && presentation?.started
+    && presentationCycleSlotKind !== 'silence'
+    && visibleFixturePlanMatches
+    && fixture
+    ? eventAtTimelinePosition(fixture, presentation.positionUnits)
+    : null
+  const activeSequenceSampleId = activeSequenceEvent?.sampleId ?? null
+  const timelinePresentationStarted = Boolean(isSequencePlaying && presentation?.started && visibleFixturePlanMatches)
+  const presentationPositionUnits = timelinePresentationStarted && presentation ? presentation.positionUnits : null
   const isImportedPreset = presetFileName !== null
   const comboLengthTicks = comboBeats * LEGACY_TICKS_PER_BEAT
   const activeBuiltInEntry = builtInCatalog?.presets.find((entry) => entry.id === selectedPresetId)
@@ -1758,24 +1837,6 @@ export default function App() {
             />
           )}
           {isPlaybackLocked && <p className="playback-lock-note" role="status">Stop playback to change combo options or sample settings.</p>}
-          {fixture
-            ? <SequenceTimeline
-                fixture={fixture}
-                preset={preset}
-                assets={sampleAssets}
-                progress={timelineProgressPercent}
-                isPlaying={isSequencePlaying}
-                auditionedSampleId={playbackTarget?.kind === 'sample' ? playbackTarget.sampleId : null}
-                timebase={timebase}
-                view={timelineView}
-                ttmDebugEnabled={ttmDebugEnabled}
-                ttmAnnotations={ttmAnnotations}
-                onViewChange={setTimelineView}
-              />
-            : <div className="sequence-empty" role="status" aria-live="polite">
-                <strong>{isBootstrapLoading ? 'Loading built-in preset' : isReadingPreset ? 'Reading preset' : !isPresetReady ? 'Preset is not ready' : isImportedPreset ? 'Generate a combo to preview the sequence' : 'Build a preview to see the sequence'}</strong>
-                <span>{isBootstrapLoading ? 'The selected INI and every referenced WAV must load before playback is enabled.' : isReadingPreset ? 'The previous sequence was cleared while the local file is read.' : !isPresetReady ? 'Retry the built-in preset or choose a valid custom INI in Local files.' : isImportedPreset ? comboBeats + ' beats · ' + comboLengthTicks + ' legacy ticks' : 'The fixed demo uses synthetic sounds.'}</span>
-              </div>}
           <div className="transport-row">
             <div className="transport-actions">
               <button className="button button--play" type="button" onClick={handlePlaySequence} disabled={playDisabled || isReadingPreset}>
@@ -1798,6 +1859,32 @@ export default function App() {
           </div>
           {actionError && <p className="inline-error" role="alert">{actionError}</p>}
           {transportSnapshot.status === 'error' && <p className="inline-error" role="alert">{transportSnapshot.error ?? 'Audio could not start.'}</p>}
+          {fixture
+            ? <SequenceTimeline
+                fixture={fixture}
+                preset={preset}
+                assets={sampleAssets}
+                progress={timelineProgressPercent}
+                isPlaying={timelineIsPlaying}
+                presentationStarted={timelinePresentationStarted}
+                presentationPositionUnits={presentationPositionUnits}
+                presentationCycleSlotKind={isSequencePlaying && visibleFixturePlanMatches ? presentationCycleSlotKind : undefined}
+                presentationCyclePlanIndex={isSequencePlaying && visibleFixturePlanMatches ? presentationCyclePlanIndex : undefined}
+                activeSampleId={activeSequenceSampleId}
+                activeEventId={activeSequenceEvent?.id ?? null}
+                auditionedSampleId={playbackTarget?.kind === 'sample' ? playbackTarget.sampleId : null}
+                timebase={timebase}
+                view={timelineView}
+                layout={timelineLayout}
+                ttmDebugEnabled={ttmDebugEnabled}
+                ttmAnnotations={ttmAnnotations}
+                onViewChange={setTimelineView}
+                onLayoutChange={setTimelineLayout}
+              />
+            : <div className="sequence-empty" role="status" aria-live="polite">
+                <strong>{isBootstrapLoading ? 'Loading built-in preset' : isReadingPreset ? 'Reading preset' : !isPresetReady ? 'Preset is not ready' : isImportedPreset ? 'Generate a combo to preview the sequence' : 'Build a preview to see the sequence'}</strong>
+                <span>{isBootstrapLoading ? 'The selected INI and every referenced WAV must load before playback is enabled.' : isReadingPreset ? 'The previous sequence was cleared while the local file is read.' : !isPresetReady ? 'Retry the built-in preset or choose a valid custom INI in Local files.' : isImportedPreset ? comboBeats + ' beats · ' + comboLengthTicks + ' legacy ticks' : 'The fixed demo uses synthetic sounds.'}</span>
+              </div>}
         </section>
 
         <LocalImportPanel

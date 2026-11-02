@@ -14,7 +14,10 @@ export type TransportStatus = "idle" | "loading" | "playing" | "completed" | "er
 
 export interface TransportSnapshot {
   readonly status: TransportStatus;
+  /** Scheduler/input-clock progress. AudioWorklet output can trail this clock. */
   readonly progress: number;
+  /** Estimated heard position, mapped from the output-device clock and SoundTouch delay. */
+  readonly presentation?: TransportPresentation;
   readonly error?: string;
   /** Zero-based slot index, present only during cycle-plan playback. */
   readonly cycleSlotIndex?: number;
@@ -23,6 +26,23 @@ export interface TransportSnapshot {
   /** Current slot type, present only during cycle-plan playback. */
   readonly cycleSlotKind?: CycleSlot["kind"];
   /** One-based generated cycle-plan index, present only when Auto-generate is enabled. */
+  readonly cyclePlanIndex?: number;
+}
+
+export interface TransportPresentation {
+  /** True after the initial fixture position is expected to have reached output. */
+  readonly started: boolean;
+  /** Estimated SoundTouch content lag; zero if playback bypasses the processor. */
+  readonly estimatedProcessorDelaySeconds: number;
+  /** Finite SoundTouch output drain after the last input source; zero for looping playback. */
+  readonly drainSeconds: number;
+  /** Normalized progress through the finite fixture or current full cycle plan. */
+  readonly progress: number;
+  /** Position in timeline units within the active slot, or the finite fixture. */
+  readonly positionUnits: number;
+  readonly cycleSlotIndex?: number;
+  readonly cycleIteration?: number;
+  readonly cycleSlotKind?: CycleSlot["kind"];
   readonly cyclePlanIndex?: number;
 }
 
@@ -109,7 +129,14 @@ interface ActivePlayback {
   readonly sampleGain: GainNode;
   readonly beatGain?: GainNode;
   readonly beatSource?: AudioBufferSourceNode;
+  readonly keepAliveSource?: ConstantSourceNode;
+  drainEndAt?: number;
   readonly processor?: TempoPitchProcessorNode;
+  readonly presentationDelaySeconds: number;
+  presentationEpochs: PresentationEpoch[];
+  pendingPresentationBoundaries: PendingPresentationBoundary[];
+  lastOutputContextTime: number;
+  hasPresentedStart: boolean;
   readonly referenceBpm?: number;
   tempoRatio: number;
   pitchSemitones: number;
@@ -118,6 +145,22 @@ interface ActivePlayback {
   maxSampleDuration: number;
   nextEventIndex: number;
   nextCycleStartAt: number;
+}
+
+interface PresentationEpoch {
+  /** AudioContext time at which this plan/tempo mapping became schedulable. */
+  readonly effectiveAt: number;
+  /** Start anchor for the fixture/cycle in the scheduler clock. */
+  readonly startAt: number;
+  readonly timeline: FixtureTimeline;
+  readonly cycleIterationBase: number;
+  readonly cyclePlanIndex?: number;
+}
+
+interface PendingPresentationBoundary {
+  readonly at: number;
+  readonly boundary: CyclePlanBoundary;
+  readonly handler?: CyclePlanBoundaryHandler;
 }
 
 interface DynamicCyclePlayback {
@@ -154,6 +197,15 @@ const DEFAULT_SCHEDULER_INTERVAL_MS = 25;
 const DEFAULT_START_DELAY_SECONDS = 0.05;
 const MAX_PARALLEL_AUDIO_DECODES = 4;
 const MAX_DYNAMIC_CYCLE_ADVANCES_PER_TICK = 64;
+const MAX_PRESENTATION_EPOCHS = 64;
+/**
+ * Edge actual-worklet PCM probes at 48 kHz measured first/repeated transient offsets of
+ * 102–137 ms for common 0.75–1.176 tempo ratios and 0/+3 semitones. Use 130 ms as an
+ * estimated SoundTouch content lag; WSOLA can move individual attacks by about 28 ms.
+ */
+export const SOUNDTOUCH_ESTIMATED_PRESENTATION_DELAY_SECONDS = 0.13;
+/** Zero-input end-marker probes at 48 kHz drained 116–128 ms after input end at ratios 0.5–2. */
+export const SOUNDTOUCH_FINITE_DRAIN_SECONDS = 0.15;
 
 /**
  * Web Audio transport for finite fixtures and repeating cycle plans. One context is retained
@@ -173,6 +225,7 @@ export class AudioTransport {
   private selectedReferenceBpm: number | undefined;
   private selectedPitchSemitones = 0;
   private readonly sources = new Set<AudioBufferSourceNode>();
+  private readonly keepAliveSources = new Set<ConstantSourceNode>();
   private readonly sampleSources = new Map<AudioBufferSourceNode, SampleSourceState>();
   private readonly outputNodes = new Set<AudioNode>();
   private readonly listeners = new Set<(snapshot: TransportSnapshot) => void>();
@@ -278,6 +331,11 @@ export class AudioTransport {
 
     const tempoRatio = this.validateTempoRatio(bpm, playback.referenceBpm);
     this.selectedBpm = bpm;
+    if (!playback.cyclePlan && playback.context.currentTime >= playback.finishAt) {
+      playback.tempoRatio = tempoRatio;
+      setAudioParamValue(playback.processor.playbackRate, tempoRatio, playback.context.currentTime);
+      return;
+    }
     try {
       this.retimePlayback(playback, bpm, tempoRatio);
     } catch (error) {
@@ -438,6 +496,12 @@ export class AudioTransport {
         finishAt = Math.max(finishAt, startAt + event.offsetSeconds + buffer.duration / tempoRatio);
         maxSampleDuration = Math.max(maxSampleDuration, buffer.duration / tempoRatio);
       }
+      const drainEndAt = processor && !cyclePlan
+        ? finishAt + SOUNDTOUCH_FINITE_DRAIN_SECONDS
+        : undefined;
+      const keepAliveSource = processor
+        ? this.scheduleProcessorKeepAlive(context, processor, startAt, drainEndAt)
+        : undefined;
 
       const playback: ActivePlayback = {
         generation,
@@ -447,10 +511,23 @@ export class AudioTransport {
         startAt,
         fixtureEndAt,
         finishAt,
+        ...(drainEndAt === undefined ? {} : { drainEndAt }),
         buffers,
         sampleGain,
         ...(beat ? { beatGain: beat.gain, beatSource: beat.source } : {}),
+        ...(keepAliveSource ? { keepAliveSource } : {}),
         ...(processor ? { processor } : {}),
+        presentationDelaySeconds: processor ? SOUNDTOUCH_ESTIMATED_PRESENTATION_DELAY_SECONDS : 0,
+        presentationEpochs: [{
+          effectiveAt: startAt,
+          startAt,
+          timeline,
+          cycleIterationBase: 0,
+          ...(dynamicCycleConfig ? { cyclePlanIndex: 1 } : {}),
+        }],
+        pendingPresentationBoundaries: [],
+        lastOutputContextTime: 0,
+        hasPresentedStart: false,
         ...(referenceBpm === undefined ? {} : { referenceBpm }),
         tempoRatio,
         pitchSemitones: currentPitch,
@@ -475,12 +552,17 @@ export class AudioTransport {
         ? {
           status: "playing",
           progress: 0,
+          presentation: this.presentationAt(playback, this.presentationTimeAt(playback)),
           cycleSlotIndex: 0,
           cycleIteration: 1,
           cycleSlotKind: cyclePlan.slots[0]!.kind,
           ...(dynamicCycleConfig ? { cyclePlanIndex: 1 } : {}),
         }
-        : { status: "playing", progress: 0 });
+        : {
+          status: "playing",
+          progress: 0,
+          presentation: this.presentationAt(playback, this.presentationTimeAt(playback)),
+        });
       this.intervalHandle = this.scheduleInterval(() => this.tick(generation), this.schedulerIntervalMs);
       this.tick(generation);
     } catch (error) {
@@ -544,9 +626,21 @@ export class AudioTransport {
 
     if (!this.isCurrent(generation) || this.activePlayback !== playback) return;
 
-    if (!playback.cyclePlan && now >= playback.finishAt) {
+    const presentationTime = this.presentationTimeAt(playback);
+    const presentation = this.presentationAt(playback, presentationTime);
+    this.flushPresentedBoundaries(playback, presentationTime);
+    if (!this.isCurrent(generation) || this.activePlayback !== playback) return;
+
+    const completionAt = playback.drainEndAt ?? playback.finishAt;
+    if (!playback.cyclePlan && playback.lastOutputContextTime >= completionAt) {
+      const completedPresentation = this.presentationAt(playback, Math.max(presentationTime, playback.finishAt));
       this.cancelRun();
-      this.publish({ status: "completed", progress: 1 });
+      this.publish({ status: "completed", progress: 1, presentation: {
+        ...completedPresentation,
+        started: true,
+        progress: 1,
+        positionUnits: playback.timeline.totalUnits,
+      } });
       return;
     }
 
@@ -555,6 +649,7 @@ export class AudioTransport {
       this.publish({
         status: "playing",
         progress: repeatingProgressAt(now, playback.startAt, playback.cyclePlan.totalSeconds),
+        presentation,
         cycleSlotIndex: phase.slotIndex,
         cycleIteration: phase.iteration,
         cycleSlotKind: phase.kind,
@@ -563,7 +658,135 @@ export class AudioTransport {
       return;
     }
 
-    this.publish({ status: "playing", progress: progressAt(now, playback.startAt, playback.timeline.totalSeconds) });
+    this.publish({
+      status: "playing",
+      progress: progressAt(now, playback.startAt, playback.timeline.totalSeconds),
+      presentation,
+    });
+  }
+
+  private presentationTimeAt(playback: ActivePlayback): number {
+    const context = playback.context;
+    let outputTime = context.currentTime;
+    const getOutputTimestamp = context.getOutputTimestamp;
+    if (typeof getOutputTimestamp === "function") {
+      try {
+        const timestamp = getOutputTimestamp.call(context);
+        const performanceNow = globalThis.performance?.now?.();
+        const contextTime = timestamp?.contextTime;
+        const performanceTime = timestamp?.performanceTime;
+        if (typeof contextTime === "number"
+          && Number.isFinite(contextTime)
+          && typeof performanceTime === "number"
+          && Number.isFinite(performanceTime)
+          && contextTime > 0
+          && performanceTime > 0
+          && Number.isFinite(performanceNow)
+          && performanceNow! >= performanceTime) {
+          const projectedOutputTime = contextTime + (performanceNow! - performanceTime) / 1_000;
+          if (Number.isFinite(projectedOutputTime) && projectedOutputTime >= 0) {
+            outputTime = Math.min(context.currentTime, projectedOutputTime);
+          }
+        }
+      } catch {
+        // Fall back to the scheduler clock on browsers without a usable output timestamp.
+      }
+    }
+    playback.lastOutputContextTime = Math.max(playback.lastOutputContextTime, outputTime);
+    return playback.lastOutputContextTime - playback.presentationDelaySeconds;
+  }
+
+  private presentationAt(playback: ActivePlayback, presentationTime: number): TransportPresentation {
+    const epochs = playback.presentationEpochs;
+    let epochIndex = 0;
+    for (let index = 1; index < epochs.length; index += 1) {
+      if (epochs[index]!.effectiveAt > presentationTime) break;
+      epochIndex = index;
+    }
+    const epoch = epochs[epochIndex] ?? epochs[0]!;
+    const timingMetadata = {
+      estimatedProcessorDelaySeconds: playback.presentationDelaySeconds,
+      drainSeconds: playback.drainEndAt === undefined ? 0 : SOUNDTOUCH_FINITE_DRAIN_SECONDS,
+    };
+    if (presentationTime >= (epochs[0]?.startAt ?? playback.startAt)) {
+      playback.hasPresentedStart = true;
+    }
+
+    let presentation: TransportPresentation;
+    if ("slots" in epoch.timeline) {
+      const cyclePlan = epoch.timeline as CyclePlanTimeline;
+      const elapsedSeconds = Math.max(0, presentationTime - epoch.startAt);
+      const cycleProgressSeconds = elapsedSeconds % cyclePlan.totalSeconds;
+      const cycleUnits = cycleProgressSeconds / cyclePlan.secondsPerUnit;
+      const slotIndex = cyclePlan.slots.findIndex((slot) => cycleUnits < slot.startUnits + slot.durationUnits);
+      const resolvedSlotIndex = slotIndex < 0 ? cyclePlan.slots.length - 1 : slotIndex;
+      const slot = cyclePlan.slots[resolvedSlotIndex]!;
+      const positionUnits = Math.min(
+        slot.durationUnits,
+        Math.max(0, cycleUnits - slot.startUnits),
+      );
+      presentation = {
+        started: playback.hasPresentedStart,
+        ...timingMetadata,
+        progress: cycleProgressSeconds / cyclePlan.totalSeconds,
+        positionUnits,
+        cycleSlotIndex: resolvedSlotIndex,
+        cycleIteration: Math.min(
+          Number.MAX_SAFE_INTEGER,
+          epoch.cycleIterationBase + Math.floor(elapsedSeconds / cyclePlan.totalSeconds) + 1,
+        ),
+        cycleSlotKind: slot.kind,
+        ...(epoch.cyclePlanIndex === undefined ? {} : { cyclePlanIndex: epoch.cyclePlanIndex }),
+      };
+    } else {
+      const elapsedSeconds = Math.max(0, presentationTime - epoch.startAt);
+      const durationSeconds = epoch.timeline.totalSeconds;
+      presentation = {
+        started: playback.hasPresentedStart,
+        ...timingMetadata,
+        progress: progressAt(presentationTime, epoch.startAt, durationSeconds),
+        positionUnits: Math.min(epoch.timeline.totalUnits, elapsedSeconds / epoch.timeline.secondsPerUnit),
+      };
+    }
+
+    while (playback.presentationEpochs.length > 1
+      && playback.presentationEpochs[1]!.effectiveAt <= presentationTime) {
+      playback.presentationEpochs.shift();
+    }
+    return presentation;
+  }
+
+  private appendPresentationEpoch(
+    playback: ActivePlayback,
+    effectiveAt: number,
+    cyclePlanIndex?: number,
+  ): void {
+    const last = playback.presentationEpochs.at(-1);
+    if (last?.effectiveAt === effectiveAt) playback.presentationEpochs.pop();
+    playback.presentationEpochs.push({
+      effectiveAt,
+      startAt: playback.startAt,
+      timeline: playback.timeline,
+      cycleIterationBase: playback.cycleIterationBase,
+      ...(cyclePlanIndex === undefined ? {} : { cyclePlanIndex }),
+    });
+    while (playback.presentationEpochs.length > MAX_PRESENTATION_EPOCHS) {
+      playback.presentationEpochs.shift();
+    }
+  }
+
+  private flushPresentedBoundaries(playback: ActivePlayback, presentationTime: number): void {
+    while (playback.pendingPresentationBoundaries[0]
+      && playback.pendingPresentationBoundaries[0].at <= presentationTime) {
+      if (this.activePlayback !== playback || !this.isCurrent(playback.generation)) return;
+      const pending = playback.pendingPresentationBoundaries.shift()!;
+      try {
+        pending.handler?.(pending.boundary);
+      } catch {
+        // A UI notification must not interrupt output scheduling.
+      }
+      if (this.activePlayback !== playback || !this.isCurrent(playback.generation)) return;
+    }
   }
 
   private scheduleFixtureEvents(playback: ActivePlayback, now: number, schedulingHorizon: number): void {
@@ -791,15 +1014,17 @@ export class AudioTransport {
     delete dynamic.preparedEventIndex;
     delete dynamic.providerError;
 
-    try {
-      dynamic.onPlanBoundary?.({
+    this.appendPresentationEpoch(playback, boundaryAt, dynamic.planIndex);
+
+    playback.pendingPresentationBoundaries.push({
+      at: boundaryAt,
+      boundary: {
         planIndex: dynamic.planIndex,
         completedRounds: dynamic.completedRounds,
         plan: definition,
-      });
-    } catch {
-      // The UI notification must not interrupt the audio clock.
-    }
+      },
+      ...(dynamic.onPlanBoundary ? { handler: dynamic.onPlanBoundary } : {}),
+    });
   }
 
   private skipExpiredCycles(playback: ActivePlayback, now: number): void {
@@ -846,6 +1071,44 @@ export class AudioTransport {
     } catch (error) {
       this.releaseSource(source);
       throw error;
+    }
+  }
+
+  private scheduleProcessorKeepAlive(
+    context: AudioContext,
+    processor: TempoPitchProcessorNode,
+    startAt: number,
+    stopAt?: number,
+  ): ConstantSourceNode {
+    const source = context.createConstantSource();
+    source.offset.value = 0;
+    source.connect(processor);
+    this.keepAliveSources.add(source);
+    this.outputNodes.add(source);
+    source.onended = () => this.releaseKeepAlive(source);
+    try {
+      source.start(startAt);
+      if (stopAt !== undefined) source.stop(stopAt);
+    } catch (error) {
+      this.releaseKeepAlive(source);
+      try {
+        source.stop(0);
+      } catch {
+        // The node may not have started.
+      }
+      throw error;
+    }
+    return source;
+  }
+
+  private releaseKeepAlive(source: ConstantSourceNode): void {
+    source.onended = null;
+    this.keepAliveSources.delete(source);
+    this.outputNodes.delete(source);
+    try {
+      source.disconnect();
+    } catch {
+      // The context may already have disconnected this node.
     }
   }
 
@@ -976,6 +1239,21 @@ export class AudioTransport {
     this.sources.clear();
     this.sampleSources.clear();
 
+    for (const source of this.keepAliveSources) {
+      source.onended = null;
+      try {
+        source.stop(0);
+      } catch {
+        // Stop is best-effort during playback replacement or context shutdown.
+      }
+      try {
+        source.disconnect();
+      } catch {
+        // The node may already have ended.
+      }
+    }
+    this.keepAliveSources.clear();
+
     for (const node of this.outputNodes) {
       try {
         node.disconnect();
@@ -1077,6 +1355,24 @@ export class AudioTransport {
       playback.maxSampleDuration = Math.max(playback.maxSampleDuration, scaledDuration);
     }
     playback.finishAt = finishAt;
+    if (playback.keepAliveSource) {
+      if (playback.cyclePlan) {
+        delete playback.drainEndAt;
+      } else {
+        playback.drainEndAt = finishAt + SOUNDTOUCH_FINITE_DRAIN_SECONDS;
+        try {
+          playback.keepAliveSource.stop(playback.drainEndAt);
+        } catch {
+          // The zero-input keep-alive may have ended during context shutdown.
+        }
+      }
+    }
+
+    this.appendPresentationEpoch(
+      playback,
+      now,
+      playback.dynamicCycle?.planIndex,
+    );
 
     setAudioParamValue(playback.processor!.playbackRate, tempoRatio, now);
     for (const source of this.sources) {

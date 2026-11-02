@@ -1,4 +1,8 @@
-export { AudioTransport } from "./AudioTransport";
+export {
+  AudioTransport,
+  SOUNDTOUCH_ESTIMATED_PRESENTATION_DELAY_SECONDS,
+  SOUNDTOUCH_FINITE_DRAIN_SECONDS,
+} from "./AudioTransport";
 export type {
   AudioTransportOptions,
   CyclePlanBoundary,
@@ -9,6 +13,7 @@ export type {
   CyclePlanRequest,
   PlayOptions,
   TransportSnapshot,
+  TransportPresentation,
   TransportStatus,
 } from "./AudioTransport";
 export { createCyclePlanTimeline, createFixtureTimeline, secondsForUnits } from "./timeline";

@@ -14,6 +14,15 @@ const audioHarness = vi.hoisted(() => {
     cycleIteration?: number
     cycleSlotKind?: 'fixture' | 'silence'
     cyclePlanIndex?: number
+    presentation?: {
+      started: boolean
+      progress: number
+      positionUnits: number
+      cycleSlotIndex?: number
+      cycleIteration?: number
+      cycleSlotKind?: 'fixture' | 'silence'
+      cyclePlanIndex?: number
+    }
   }
   let snapshot: Snapshot = { status: 'idle', progress: 0 }
   let tempoAvailable = false
@@ -36,7 +45,10 @@ const audioHarness = vi.hoisted(() => {
   })
   const playCyclePlan = vi.fn(async (options: unknown) => {
     tempoAvailable = hasTempoReference(options)
-    emit({ status: 'playing', progress: 0, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture' })
+    emit({
+      status: 'playing', progress: 0, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture',
+      presentation: { started: false, progress: 0, positionUnits: 0, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture' },
+    })
   })
   const setTempo = vi.fn((_bpm: number) => {
     if (!tempoAvailable || (snapshot.status !== 'playing' && snapshot.status !== 'loading')) {
@@ -206,6 +218,111 @@ afterEach(async () => {
 })
 
 describe('workspace import and transport lifecycle', () => {
+  it('keeps Play and Stop before the expanded timeline', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    const timeline = await screen.findByRole('img', { name: /Sequence timeline/ }) as HTMLElement
+    const transportRow = document.querySelector<HTMLElement>('.transport-row')
+
+    expect(transportRow).toBeInTheDocument()
+    expect(transportRow!.compareDocumentPosition(timeline) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(within(transportRow!).getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+    expect(within(transportRow!).getByRole('button', { name: 'Stop' })).toBeDisabled()
+  })
+
+  it('switches Grid and Inline without changing event timing or restarting playback', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    await screen.findByRole('img', { name: /Sequence timeline/ })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled())
+
+    const gridGeometry = Array.from(document.querySelectorAll<HTMLElement>('.timeline-lane .sequence-event'))
+      .map((event) => [event.dataset.eventId, event.style.left, event.style.width])
+      .sort(([first = ''], [second = '']) => first.localeCompare(second))
+    const barLabels = document.querySelector('.timeline-bar-labels')?.textContent
+    const beatLabels = document.querySelector('.timeline-ruler')?.textContent
+
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+    act(() => audioHarness.emit({
+      status: 'playing', progress: 0.25, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture',
+      presentation: { started: true, progress: 0.25, positionUnits: 0, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture' },
+    }))
+    const playheadBefore = document.querySelector('.timeline-playhead')?.getAttribute('style')
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Inline' }))
+    expect(screen.getByRole('radio', { name: 'Inline' })).toBeChecked()
+    expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1)
+    expect(audioHarness.getSnapshot().status).toBe('playing')
+    expect(document.querySelector('.timeline-playhead')?.getAttribute('style')).toBe(playheadBefore)
+    expect(document.querySelector('.timeline-bar-labels')?.textContent).toBe(barLabels)
+    expect(document.querySelector('.timeline-ruler')?.textContent).toBe(beatLabels)
+
+    const inlineGeometry = Array.from(document.querySelectorAll<HTMLElement>('.timeline-inline-row .sequence-event'))
+      .map((event) => [event.dataset.eventId, event.style.left, event.style.width])
+      .sort(([first = ''], [second = '']) => first.localeCompare(second))
+    expect(document.querySelectorAll('.timeline-inline-row .sequence-event')).toHaveLength(gridGeometry.length)
+    expect(inlineGeometry).toEqual(gridGeometry)
+
+    fireEvent.click(screen.getByRole('radio', { name: 'TTM practice guides' }))
+    expect(screen.getByRole('radio', { name: 'TTM practice guides' })).toBeChecked()
+    expect(screen.getByRole('radio', { name: 'Inline' })).toBeChecked()
+    expect(document.querySelector('.timeline-inline-row')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('radio', { name: 'Waveform' }))
+    expect(screen.getByRole('radio', { name: 'Waveform' })).toBeChecked()
+    expect(screen.getByRole('radio', { name: 'Inline' })).toBeChecked()
+  })
+
+  it('follows the presented event in both layouts and clears it in rests and answer pauses', async () => {
+    vi.mocked(domain.generateLegacyCombo).mockReturnValue({
+      events: [
+        { eventNumber: 1, sampleNumber: 1, sampleId: 'Sample01', startTick: 0, durationTicks: 8, startForward: true, endForward: false, silent: false },
+        { eventNumber: 2, sampleNumber: 1, sampleId: 'Sample01', startTick: 8, durationTicks: 8, startForward: true, endForward: false, silent: false },
+      ],
+      requestedRawTicks: 64,
+      completedRawTicks: 16,
+      remainingRawTicks: 48,
+      terminalReason: 'minimum-fit-exhausted',
+      restarts: 0,
+    })
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+    expect(document.querySelector('.sequence-event--active')).not.toBeInTheDocument()
+
+    act(() => audioHarness.emit({
+      status: 'playing', progress: 0.1, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture',
+      presentation: { started: true, progress: 0.1, positionUnits: 9, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture' },
+    }))
+    expect(document.querySelector('.timeline-scroll')).toHaveAttribute('data-presentation-position-units', '9')
+    expect(document.querySelector('.sequence-event--active')).toHaveAttribute('data-event-id', 'legacy-2-Sample01')
+    expect(document.querySelector('.timeline-lane--active')).toContainElement(document.querySelector('.timeline-now-playing'))
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Inline' }))
+    expect(document.querySelector('.sequence-event--active .sequence-inline-event-label')).toHaveTextContent('Now playing · Bundled kick')
+    expect(document.querySelector('.sequence-event--active')).toHaveAttribute('data-event-id', 'legacy-2-Sample01')
+
+    act(() => audioHarness.emit({
+      status: 'playing', progress: 0.2, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture',
+      presentation: { started: true, progress: 0.2, positionUnits: 17, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture' },
+    }))
+    expect(document.querySelector('.sequence-event--active')).not.toBeInTheDocument()
+
+    act(() => audioHarness.emit({
+      status: 'playing', progress: 0.75, cycleSlotIndex: 1, cycleIteration: 1, cycleSlotKind: 'silence',
+      presentation: { started: true, progress: 0.75, positionUnits: 9, cycleSlotIndex: 1, cycleIteration: 1, cycleSlotKind: 'silence' },
+    }))
+    expect(document.querySelector('.timeline-scroll')).toHaveAttribute('data-cycle-slot-kind', 'silence')
+    expect(document.querySelector('.sequence-event--active')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    expect(document.querySelector('.sequence-event--active')).not.toBeInTheDocument()
+    expect(document.querySelector('.timeline-scroll')).toHaveAttribute('data-presentation-started', 'false')
+    expect(document.querySelector('.timeline-scroll')).not.toHaveAttribute('data-presentation-position-units')
+  })
+
   it('shows a decoded WAV envelope inside the event slot at its reference-time width', async () => {
     waveformHarness.loadWaveform.mockResolvedValue({
       durationSeconds: 0.1,
@@ -1017,7 +1134,10 @@ describe('workspace import and transport lifecycle', () => {
     audioHarness.stop.mockClear()
 
     await act(async () => {
-      audioHarness.emit({ status: 'playing', progress: 0.75, cycleSlotIndex: 1, cycleIteration: 1, cycleSlotKind: 'silence' })
+      audioHarness.emit({
+        status: 'playing', progress: 0.75, cycleSlotIndex: 1, cycleIteration: 1, cycleSlotKind: 'silence',
+        presentation: { started: true, progress: 0.75, positionUnits: 32, cycleSlotIndex: 1, cycleIteration: 1, cycleSlotKind: 'silence' },
+      })
     })
     expect(await screen.findByText('Q&A · answer pause · cycle 2.')).toBeInTheDocument()
     expect(screen.getByRole('img', { name: 'Sequence timeline: 64 legacy ticks, 4 events' })).toBe(timeline)

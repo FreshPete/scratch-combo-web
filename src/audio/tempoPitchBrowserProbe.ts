@@ -8,6 +8,48 @@ export interface BrowserDspProbeResult {
   readonly durationSeconds: number;
   readonly finiteInputTailEndSeconds: number;
   readonly sourceContinuityRms: readonly number[];
+  readonly transientAlignment: readonly {
+    readonly tempoRatio: number;
+    readonly pitchSemitones: number;
+    readonly measuredDelaySeconds: number;
+    readonly repeatedMeasuredDelaysSeconds: readonly (number | null)[];
+  }[];
+  readonly finitePresentationWindows: readonly {
+    readonly paddingMode: "none" | "zero" | "beat";
+    readonly tempoRatio: number;
+    readonly pitchSemitones: number;
+    readonly sourceStartSeconds: number;
+    readonly expectedSourceEndSeconds: number;
+    readonly firstRenderedSoundSeconds: number;
+    readonly lastRenderedSoundSeconds: number;
+    readonly renderedTailAfterSourceEndSeconds: number;
+    readonly expectedEndMarkerSeconds: number;
+    readonly renderedEndMarkerSeconds: number | null;
+    readonly endMarkerTimingErrorSeconds: number | null;
+  }[];
+  readonly finitePaddingComparison: readonly {
+    readonly paddingMode: "none" | "zero" | "beat";
+    readonly expectedEndMarkerSeconds: number;
+    readonly renderedEndMarkerSeconds: number | null;
+    readonly endMarkerTimingErrorSeconds: number | null;
+    readonly renderedTailAfterSourceEndSeconds: number;
+  }[];
+  readonly finiteZeroPaddingWindows: readonly {
+    readonly tempoRatio: number;
+    readonly pitchSemitones: number;
+    readonly expectedEndMarkerSeconds: number;
+    readonly renderedEndMarkerSeconds: number | null;
+    readonly endMarkerTimingErrorSeconds: number | null;
+    readonly renderedTailAfterSourceEndSeconds: number;
+  }[];
+  readonly finitePitchDrainWindows: readonly {
+    readonly tempoRatio: number;
+    readonly pitchSemitones: number;
+    readonly expectedEndMarkerSeconds: number;
+    readonly renderedEndMarkerSeconds: number | null;
+    readonly endMarkerTimingErrorSeconds: number | null;
+    readonly renderedTailAfterSourceEndSeconds: number;
+  }[];
 }
 
 /** Browser-only integration probe that renders the actual bundled worklet. */
@@ -61,6 +103,45 @@ export async function runTempoPitchBrowserProbe(): Promise<BrowserDspProbeResult
     pitchSemitones: 0,
   });
   const finiteInputTailEndSeconds = await renderFiniteSourceTail(sampleRate, tempoRatio);
+  const transientAlignment = [];
+  for (const rate of [0.5, 0.75, 1, tempoRatio, 2]) {
+    for (const pitchSemitones of [0, 3]) {
+      transientAlignment.push(await measureTransientAlignment(sampleRate, rate, pitchSemitones));
+    }
+  }
+  const finitePresentationWindows = [];
+  for (const rate of [0.5, 1, tempoRatio, 2]) {
+    finitePresentationWindows.push(await measureFinitePresentationWindow(sampleRate, rate, 0));
+  }
+  const finitePaddingComparison = [
+    finitePresentationWindows.find((window) => window.tempoRatio === 1)!,
+    await measureFinitePresentationWindow(sampleRate, 1, 0, "zero"),
+    await measureFinitePresentationWindow(sampleRate, 1, 0, "beat"),
+  ];
+  const finiteZeroPaddingWindows = [];
+  for (const rate of [0.5, 0.75, 1, tempoRatio, 2]) {
+    const window = await measureFinitePresentationWindow(sampleRate, rate, 0, "zero");
+    finiteZeroPaddingWindows.push({
+      tempoRatio: window.tempoRatio,
+      pitchSemitones: window.pitchSemitones,
+      expectedEndMarkerSeconds: window.expectedEndMarkerSeconds,
+      renderedEndMarkerSeconds: window.renderedEndMarkerSeconds,
+      endMarkerTimingErrorSeconds: window.endMarkerTimingErrorSeconds,
+      renderedTailAfterSourceEndSeconds: window.renderedTailAfterSourceEndSeconds,
+    });
+  }
+  const finitePitchDrainWindows = [];
+  for (const pitchSemitones of [-12, 12]) {
+    const window = await measureFinitePresentationWindow(sampleRate, 1, pitchSemitones, "zero");
+    finitePitchDrainWindows.push({
+      tempoRatio: window.tempoRatio,
+      pitchSemitones: window.pitchSemitones,
+      expectedEndMarkerSeconds: window.expectedEndMarkerSeconds,
+      renderedEndMarkerSeconds: window.renderedEndMarkerSeconds,
+      endMarkerTimingErrorSeconds: window.endMarkerTimingErrorSeconds,
+      renderedTailAfterSourceEndSeconds: window.renderedTailAfterSourceEndSeconds,
+    });
+  }
 
   return {
     before,
@@ -69,6 +150,197 @@ export async function runTempoPitchBrowserProbe(): Promise<BrowserDspProbeResult
     durationSeconds: processed.length / processed.sampleRate,
     finiteInputTailEndSeconds,
     sourceContinuityRms,
+    transientAlignment,
+    finitePresentationWindows,
+    finitePaddingComparison,
+    finiteZeroPaddingWindows,
+    finitePitchDrainWindows,
+  };
+}
+
+async function measureFinitePresentationWindow(
+  sampleRate: number,
+  tempoRatio: number,
+  pitchSemitones: number,
+  paddingMode: "none" | "zero" | "beat" = "none",
+): Promise<{
+  readonly paddingMode: "none" | "zero" | "beat";
+  readonly tempoRatio: number;
+  readonly pitchSemitones: number;
+  readonly sourceStartSeconds: number;
+  readonly expectedSourceEndSeconds: number;
+  readonly firstRenderedSoundSeconds: number;
+  readonly lastRenderedSoundSeconds: number;
+  readonly renderedTailAfterSourceEndSeconds: number;
+  readonly expectedEndMarkerSeconds: number;
+  readonly renderedEndMarkerSeconds: number | null;
+  readonly endMarkerTimingErrorSeconds: number | null;
+}> {
+  const sourceStartSeconds = 0.05;
+  const inputDurationSeconds = 1.5;
+  const expectedSourceEndSeconds = sourceStartSeconds + inputDurationSeconds / tempoRatio;
+  const context = new OfflineAudioContext(1, Math.ceil(sampleRate * (expectedSourceEndSeconds + 0.5)), sampleRate);
+  const worklet = await createWorklet(context);
+  const buffer = context.createBuffer(1, Math.ceil(sampleRate * inputDurationSeconds), sampleRate);
+  const channel = buffer.getChannelData(0);
+  const endMarkerInputStartSeconds = inputDurationSeconds - 0.3;
+  const endMarkerInputEndSeconds = inputDurationSeconds - 0.005;
+  for (let index = 0; index < channel.length; index += 1) {
+    const time = index / sampleRate;
+    if (time >= endMarkerInputStartSeconds && time < endMarkerInputEndSeconds) {
+      const markerTime = time - endMarkerInputStartSeconds;
+      const fade = Math.min(1, markerTime / 0.002, (endMarkerInputEndSeconds - time) / 0.002);
+      channel[index] = 0.4 * Math.sin(2 * Math.PI * 1_900 * markerTime) * fade;
+    } else if (time < endMarkerInputStartSeconds - 0.005) {
+      const fadeIn = Math.min(1, time / 0.005);
+      channel[index] = 0.4 * Math.sin(2 * Math.PI * 440 * time) * fadeIn;
+    }
+  }
+
+  const source = context.createBufferSource();
+  source.buffer = buffer;
+  source.playbackRate.value = tempoRatio;
+  worklet.playbackRate.value = tempoRatio;
+  worklet.pitchSemitones.value = pitchSemitones;
+  source.connect(worklet);
+  worklet.connect(context.destination);
+  source.start(sourceStartSeconds);
+
+  if (paddingMode === "zero") {
+    const keepAlive = context.createConstantSource();
+    keepAlive.offset.value = 0;
+    keepAlive.connect(worklet);
+    keepAlive.start(0);
+    keepAlive.stop(expectedSourceEndSeconds + 0.4);
+  } else if (paddingMode === "beat") {
+    const beatSource = context.createBufferSource();
+    beatSource.buffer = createToneBuffer(context, 220, 0.25);
+    beatSource.loop = true;
+    beatSource.playbackRate.value = tempoRatio;
+    beatSource.connect(worklet);
+    beatSource.start(sourceStartSeconds);
+    beatSource.stop(expectedSourceEndSeconds + 0.4);
+  }
+
+  const rendered = await context.startRendering();
+  const data = rendered.getChannelData(0);
+  let peak = 0;
+  for (const sample of data) peak = Math.max(peak, Math.abs(sample));
+  if (!Number.isFinite(peak) || peak < 0.001) {
+    throw new Error(`The worklet produced no finite-source signal at tempo ${tempoRatio}.`);
+  }
+  const threshold = peak * 0.05;
+  let first = -1;
+  let last = -1;
+  for (let index = 0; index < data.length; index += 1) {
+    if (Math.abs(data[index]!) < threshold) continue;
+    if (first < 0) first = index;
+    last = index;
+  }
+  if (first < 0 || last < 0) throw new Error(`No finite-source output was detected at tempo ${tempoRatio}.`);
+  const firstRenderedSoundSeconds = first / sampleRate;
+  const lastRenderedSoundSeconds = last / sampleRate;
+  const expectedEndMarkerSeconds = sourceStartSeconds + endMarkerInputStartSeconds / tempoRatio;
+  const markerSearchStart = Math.max(0, Math.floor((expectedEndMarkerSeconds - 0.15) * sampleRate));
+  const markerSearchEnd = Math.min(data.length, Math.ceil((expectedEndMarkerSeconds + 0.15) * sampleRate));
+  const markerWindowSamples = Math.floor(sampleRate * 0.006);
+  const markerStepSamples = Math.max(1, Math.floor(sampleRate * 0.001));
+  const markerThreshold = 0.04;
+  const endMarkerOutputFrequency = 1_900 * Math.pow(2, pitchSemitones / 12);
+  let renderedEndMarkerSeconds: number | null = null;
+  for (let start = markerSearchStart; start + markerWindowSamples <= markerSearchEnd; start += markerStepSamples) {
+    if (goertzelAmplitude(data, start, start + markerWindowSamples, sampleRate, endMarkerOutputFrequency) >= markerThreshold) {
+      renderedEndMarkerSeconds = start / sampleRate;
+      break;
+    }
+  }
+  return {
+    paddingMode,
+    tempoRatio,
+    pitchSemitones,
+    sourceStartSeconds,
+    expectedSourceEndSeconds,
+    firstRenderedSoundSeconds,
+    lastRenderedSoundSeconds,
+    renderedTailAfterSourceEndSeconds: lastRenderedSoundSeconds - expectedSourceEndSeconds,
+    expectedEndMarkerSeconds,
+    renderedEndMarkerSeconds,
+    endMarkerTimingErrorSeconds: renderedEndMarkerSeconds === null
+      ? null
+      : renderedEndMarkerSeconds - expectedEndMarkerSeconds,
+  };
+}
+
+function goertzelAmplitude(data: Float32Array, start: number, end: number, sampleRate: number, frequency: number): number {
+  const length = end - start;
+  if (length <= 0) return 0;
+  let real = 0;
+  let imaginary = 0;
+  for (let offset = 0; offset < length; offset += 1) {
+    const angle = 2 * Math.PI * frequency * offset / sampleRate;
+    const sample = data[start + offset] ?? 0;
+    real += sample * Math.cos(angle);
+    imaginary -= sample * Math.sin(angle);
+  }
+  return 2 * Math.hypot(real, imaginary) / length;
+}
+
+async function measureTransientAlignment(
+  sampleRate: number,
+  tempoRatio: number,
+  pitchSemitones: number,
+): Promise<{
+  readonly tempoRatio: number;
+  readonly pitchSemitones: number;
+  readonly measuredDelaySeconds: number;
+  readonly repeatedMeasuredDelaysSeconds: readonly (number | null)[];
+}> {
+  const inputOnsetSeconds = [0.05, 0.85, 1.65, 2.45];
+  const context = new OfflineAudioContext(1, sampleRate * 4, sampleRate);
+  const worklet = await createWorklet(context);
+  const buffer = context.createBuffer(1, Math.floor(sampleRate * 0.2), sampleRate);
+  const channel = buffer.getChannelData(0);
+  for (let index = 0; index < channel.length; index += 1) {
+    const time = index / sampleRate;
+    channel[index] = 0.5 * Math.sin(2 * Math.PI * 440 * time) * Math.min(1, time / 0.002) * Math.exp(-5 * time);
+  }
+  worklet.playbackRate.value = tempoRatio;
+  worklet.pitchSemitones.value = pitchSemitones;
+  worklet.connect(context.destination);
+  for (const startAt of inputOnsetSeconds) {
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = tempoRatio;
+    source.connect(worklet);
+    source.start(startAt);
+  }
+
+  const rendered = await context.startRendering();
+  const data = rendered.getChannelData(0);
+  let peak = 0;
+  for (const sample of data) peak = Math.max(peak, Math.abs(sample));
+  if (!Number.isFinite(peak) || peak < 0.001) {
+    throw new Error(`The worklet produced no usable signal at tempo ${tempoRatio} and pitch ${pitchSemitones}.`);
+  }
+  const threshold = Math.max(0.0005, peak * 0.04);
+  const repeatedMeasuredDelaysSeconds = inputOnsetSeconds.map((expectedOnsetSeconds) => {
+    const startIndex = Math.floor(expectedOnsetSeconds * sampleRate);
+    const endIndex = Math.min(data.length, Math.ceil((expectedOnsetSeconds + 0.25) * sampleRate));
+    let onsetIndex = -1;
+    for (let index = startIndex; index < endIndex; index += 1) {
+      if (Math.abs(data[index]!) >= threshold) {
+        onsetIndex = index;
+        break;
+      }
+    }
+    return onsetIndex < 0 ? null : onsetIndex / sampleRate - expectedOnsetSeconds;
+  });
+
+  return {
+    tempoRatio,
+    pitchSemitones,
+    measuredDelaySeconds: repeatedMeasuredDelaysSeconds.find((delay) => delay !== null) ?? Number.NaN,
+    repeatedMeasuredDelaysSeconds,
   };
 }
 
