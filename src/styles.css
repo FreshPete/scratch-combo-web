@@ -406,7 +406,7 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
   .workspace { width: 100%; margin-left: 0; padding: 22px 18px 30px; }
   .quick-preset-row { grid-template-columns: 1fr; gap: 6px; }
   .workspace-header { min-height: 64px; margin-bottom: 20px; }
-  .transport-dock { position: sticky; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-top: 0; }
+  .transport-dock { position: static; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-top: 0; }
   .transport-dock__meter { width: 100%; grid-template-columns: minmax(72px, .35fr) minmax(0, 1fr); }
   .file-picker-grid { grid-template-columns: 1fr; }
   .transport-row { align-items: flex-start; flex-direction: column; }

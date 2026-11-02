@@ -753,3 +753,76 @@ test('saved count-in settings round-trip, legacy fields default off, and control
   await expect(clickLevel).toBeDisabled()
   await expect(countIn).toBeEnabled({ timeout: 15_000 })
 })
+
+test('mobile scrolling and keyboard focus keep saved session actions clear of the playback dock', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: 'Generated combo' })).toBeVisible({ timeout: 30_000 })
+  await page.getByRole('tab', { name: 'Practice', exact: true }).click()
+  await openSaveManager(page)
+
+  const sessionName = page.getByRole('textbox', { name: 'Session name' })
+  await expect(sessionName).toBeEnabled({ timeout: 15_000 })
+  await sessionName.fill('Mobile actions')
+  await page.getByRole('button', { name: 'Save as new session', exact: true }).click()
+  const sessionSelect = page.locator('#saved-sessions-select')
+  await expect(sessionSelect).toContainText('Mobile actions')
+  await sessionSelect.selectOption({ index: 1 })
+
+  const actionNames = [
+    'Load session',
+    'Reload last saved',
+    'Save session',
+    'Save as new session',
+    'Delete selected session',
+  ]
+
+  await page.evaluate(() => { document.documentElement.style.scrollBehavior = 'auto' })
+  for (const name of actionNames) {
+    const action = page.getByRole('button', { name, exact: true })
+    await expect(action).toBeEnabled()
+    const geometry = await action.evaluate((button) => {
+      const dock = document.querySelector<HTMLElement>('.transport-dock')
+      if (!dock) throw new Error('Playback dock was not found.')
+      const initialRect = button.getBoundingClientRect()
+      const documentCenter = window.scrollY + initialRect.top + initialRect.height / 2
+      window.scrollTo(0, documentCenter - 70)
+      button.focus({ preventScroll: true })
+
+      const rect = button.getBoundingClientRect()
+      const dockRect = dock.getBoundingClientRect()
+      const centerX = rect.left + rect.width / 2
+      const centerY = rect.top + rect.height / 2
+      const hitTarget = document.elementFromPoint(centerX, centerY)
+      const overlapsDock = rect.left < dockRect.right
+        && rect.right > dockRect.left
+        && rect.top < dockRect.bottom
+        && rect.bottom > dockRect.top
+
+      return {
+        top: rect.top,
+        bottom: rect.bottom,
+        viewportHeight: window.innerHeight,
+        overlapsDock,
+        receivesPointerAtCenter: hitTarget === button || button.contains(hitTarget),
+        focused: document.activeElement === button,
+      }
+    })
+
+    expect(geometry.top, `${name} should remain in view after scrolling`).toBeGreaterThanOrEqual(0)
+    expect(geometry.bottom, `${name} should remain in view after scrolling`).toBeLessThanOrEqual(geometry.viewportHeight)
+    expect(geometry.overlapsDock, `${name} should not be covered by the playback dock`).toBe(false)
+    expect(geometry.receivesPointerAtCenter, `${name} should receive pointer input`).toBe(true)
+    expect(geometry.focused, `${name} should accept keyboard focus`).toBe(true)
+  }
+
+  await page.evaluate(() => {
+    const library = document.querySelector<HTMLElement>('.practice-library')
+    if (!library) throw new Error('Saved session controls were not found.')
+    document.documentElement.style.scrollBehavior = 'auto'
+    window.scrollTo(0, library.getBoundingClientRect().top + window.scrollY - 16)
+  })
+  const screenshotDirectory = path.resolve(process.cwd(), '.forge', 'responsive-saved-library')
+  mkdirSync(screenshotDirectory, { recursive: true })
+  await page.screenshot({ path: path.join(screenshotDirectory, 'mobile-saved-actions.png') })
+})

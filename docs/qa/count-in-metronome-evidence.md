@@ -1,5 +1,11 @@
 # Count-in and metronome QA evidence
 
+## Mobile overlap correction
+
+The playback dock now scrolls in the normal page flow at widths up to 760px. This prevents the tall mobile bar from covering saved-session controls; desktop keeps its sticky dock. A focused 390×844 regression failed with the original sticky rule and passes in Edge and Chrome after the fix, checking Load/Reload/Save/Delete visibility, pointer hit targets, focusability and separation from the dock. The Pages build also passes.
+
+![Unobstructed mobile saved-session actions](../images/count-in-metronome/mobile-saved-actions-fixed.png)
+
 - Date: 2026-11-02
 - Runtime: portable Node.js v24.22.2
 - Browser runs: Microsoft Edge and Google Chrome, Playwright channels
