@@ -4,7 +4,9 @@ Status: approved for the current browser practice slice.
 
 ## Application shape
 
-The app is a static React, TypeScript, and Vite SPA. Presets and selected audio files are read in the browser and held in session memory. Selected files are never uploaded or copied into the repository. Web Audio is the only playback transport in this slice.
+The app is a static React, TypeScript, and Vite SPA. Presets and selected audio files are read in the browser and held in session memory. A user can explicitly save named sessions and exact-combo favourites to IndexedDB on the current browser origin; those records contain preset state, fixture, relative asset paths, and Blob copies of referenced WAVs and any applied custom beat. Restore reconstructs browser `File` objects, validates and decodes required audio before committing state, and always remains stopped. It never restores file handles or uploads audio. Localhost and the hosted site have separate browser storage; users can delete records in Practice, and browser site-data clearing or storage eviction can remove them.
+
+Saved records use a versioned payload, a 320 MiB per-item ceiling, a 512 MiB aggregate ceiling, and limits of 12 sessions and 30 favourites. All limits are checked in one IndexedDB read/write transaction so concurrent tabs cannot exceed the recorded storage budget. Browser quota can be lower than these product limits; quota and storage errors remain visible and do not partially replace the active preset.
 
 ## Focused workspace
 

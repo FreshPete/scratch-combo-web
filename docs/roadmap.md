@@ -1,6 +1,6 @@
 # Work list
 
-## Delivered in this pass
+## Delivered
 
 - [x] Draw real sample waveforms inside the existing time grid.
 - [x] Add consistent sample colours to waveforms, inspired by the [reference combo generator](https://sideshow-combo-gen.digitalvertigo.workers.dev/). Keep labels and shapes readable without relying on colour alone.
@@ -15,9 +15,19 @@
 
 - [x] Replace the three file pickers with a staged INI → audio folder/files → review wizard. Retain copied audio in session memory, verify required playback files, preserve the active preset until Load, and support cancellation and repair.
 
-## Queued
+- [x] Save and reload named practice sessions and favourite the exact generated combo from Practice. IndexedDB stores preset/settings/fixture data and referenced local audio bytes; restore validates audio, stays stopped, and never autoplays.
 
-- [ ] Expand notation coverage only where reliable technique definitions and clear teaching patterns are available; full WAV transcription is not implemented.
+## Queued — ordered follow-ups
+
+- [ ] Beat downbeat alignment and loop trimming.
+- [ ] Count-in and metronome.
+- [ ] Tempo-ramp trainer.
+- [ ] Real pause and resume.
+- [ ] Physical output synchronization checks and real mobile-device evidence.
+- [ ] Pull-request CI before merge.
+- [ ] Audio export is deferred for discussion before implementation is scoped.
+
+Notation coverage can expand only where reliable technique definitions and clear teaching patterns are available; full WAV transcription is not implemented.
 
 
 BPM analysis is an estimate with half/double-time ambiguity; manual correction remains available. See [audio processing](../src/audio/README.md#local-beat-import-and-bpm-estimate) for limits.
