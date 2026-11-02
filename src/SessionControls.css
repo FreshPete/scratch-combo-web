@@ -130,6 +130,11 @@
   cursor: pointer;
 }
 
+.session-controls__range--tempo input { accent-color: #17d9ff; }
+.session-controls__slider--pitch { accent-color: #b176ff; }
+.session-controls__slider--sample { accent-color: #ff4fa3; }
+.session-controls__slider--beat { accent-color: #18e4b0; }
+
 .session-controls__hint {
   color: var(--text-muted);
   font-size: 10px;

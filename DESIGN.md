@@ -6,7 +6,7 @@ Scratch Combo is an Operate surface: a DJ working through a practice preset shou
 
 ## Visual direction
 
-A precise practice workspace built from graphite and slate surfaces, warm off-white type, and a restrained acid-lime action color. Timing ticks and numeric readouts use a compact system monospace. The interface feels like a focused instrument panel through spacing and alignment, not through ornament.
+A precise practice workspace built from graphite and slate surfaces, warm off-white type, and a vivid acid-lime action color. The sequence uses a compact electric palette to keep each sample lane easy to trace. Timing ticks and numeric readouts use a compact system monospace. The interface feels like a focused instrument panel through spacing and alignment, not through ornament.
 
 The first viewport places a slim navigation rail beside one working column. A compact header identifies the practice workspace, followed by local import controls and a session strip. The sequence timeline is the primary reading surface; the complete sample metadata table follows directly below. There is no marketing hero, decorative gradient, generic card grid, or badge-shaped control.
 
@@ -20,8 +20,10 @@ The first viewport places a slim navigation rail beside one working column. A co
 - Primary text: `#EEECE2`
 - Secondary text: `#A5AEAA`
 - Muted text: `#78827E`
-- Primary action: `#C4D94B`
+- Primary action: `#D5FF30`
 - Primary action ink: `#202517`
+- Focus: `#EAFF76`
+- Sample waveform palette: electric cyan `#17D9FF`, hot pink `#FF4FA3`, orange `#FF9F1C`, neon lime `#A8F000`, violet `#B176FF`, teal `#18E4B0`, and electric blue `#4D91FF`
 - Warning: `#E3B263`
 - Error: `#EF7770`
 - Body face: local system sans-serif stack
@@ -31,7 +33,7 @@ The first viewport places a slim navigation rail beside one working column. A co
 
 ## Interaction
 
-Actions are plain rectangular controls with visible text and a clear keyboard focus ring. The lime color is reserved for the primary preview-building action and active sequence markers. Secondary controls stay slate. Import errors name the missing or ambiguous file and keep the relevant control nearby. Playback state is visible in the transport and announced through a polite live region. Preview, sample, and session edits last only for the open browser session.
+Actions are plain rectangular controls with visible text and a clear keyboard focus ring. Acid lime marks primary actions, current navigation, selected modes, and the playhead. Waveform channels and their lane swatches share one stable sample color; session sliders use related distinct colors. Secondary surfaces stay slate, and the production-disabled local TTM debug control stays muted. Import errors name the missing or ambiguous file and keep the relevant control nearby. Playback state is visible in the transport and announced through a polite live region. Preview, sample, and session edits last only for the open browser session.
 
 ## Responsive behavior
 

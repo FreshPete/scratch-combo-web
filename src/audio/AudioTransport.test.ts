@@ -402,6 +402,584 @@ describe("AudioTransport", () => {
     transport.dispose();
   });
 
+  it("generates distinct plans after full audible and silent rounds without restarting the beat bed", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const beatFile = {
+      name: "auto-generate-beat.wav",
+      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
+    } as unknown as File;
+    const fixtureFor = (id: string, sampleId: string): Fixture => ({
+      events: [{ id, sampleId, startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    });
+    const initialFixture = fixtureFor("initial", "synthPulse");
+    const secondFixture = fixtureFor("second", "synthBrush");
+    const thirdFixture = fixtureFor("third", "synthPulse");
+    const nextPlan = vi.fn(({ nextPlanIndex }: { completedRounds: number; nextPlanIndex: number }) => ({
+      slots: [
+        { kind: "fixture" as const, fixture: nextPlanIndex === 2 ? secondFixture : thirdFixture },
+        { kind: "silence" as const, durationUnits: 4 },
+      ],
+    }));
+    const onPlanBoundary = vi.fn();
+
+    await transport.playCyclePlan({
+      slots: [
+        { kind: "fixture", fixture: initialFixture },
+        { kind: "silence", durationUnits: 4 },
+      ],
+      cyclesPerPlan: 2,
+      nextPlan,
+      onPlanBoundary,
+      bpm: 120,
+      beatFile,
+      preloadSampleIds: ["synthBrush"],
+    });
+
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 1 });
+    expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05]);
+    const beatSource = fake.sources.find(({ node }) => node.loop);
+
+    fake.setCurrentTime(0.95);
+    runScheduler();
+    expect(nextPlan).toHaveBeenCalledWith({ completedRounds: 1, nextPlanIndex: 2 });
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+    expect(transport.getSnapshot()).toMatchObject({ cyclePlanIndex: 1, cycleSlotIndex: 1, cycleSlotKind: "silence" });
+
+    fake.setCurrentTime(2.05);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledTimes(1);
+    expect(onPlanBoundary).toHaveBeenLastCalledWith({
+      planIndex: 2,
+      completedRounds: 2,
+      plan: expect.objectContaining({ slots: expect.any(Array) }),
+    });
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2, cycleIteration: 3 });
+
+    fake.setCurrentTime(2.95);
+    runScheduler();
+    expect(nextPlan).toHaveBeenLastCalledWith({ completedRounds: 3, nextPlanIndex: 3 });
+    fake.setCurrentTime(4.05);
+    runScheduler();
+
+    expect(onPlanBoundary).toHaveBeenCalledTimes(2);
+    expect(onPlanBoundary).toHaveBeenLastCalledWith({
+      planIndex: 3,
+      completedRounds: 4,
+      plan: expect.objectContaining({ slots: expect.any(Array) }),
+    });
+    expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05, 1.05, 2.05, 3.05, 4.05]);
+    expect(fake.sources.filter(({ node }) => node.loop)).toHaveLength(1);
+    expect(beatSource?.startTimes).toEqual([0.05]);
+    expect(beatSource?.stopTimes).toEqual([]);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("schedules a prepared generated hit at the exact plan boundary and publishes only at that boundary", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const initialFixture: Fixture = {
+      events: [{ id: "boundary-first", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const nextFixture: Fixture = {
+      events: [{ id: "boundary-next", sampleId: "synthBrush", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const onPlanBoundary = vi.fn();
+    const boundaryAt = 0.05 + 4 * 60 / 120 / 4;
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: initialFixture }],
+      cyclesPerPlan: 1,
+      nextPlan: () => ({ slots: [{ kind: "fixture", fixture: nextFixture }] }),
+      onPlanBoundary,
+      bpm: 120,
+      preloadSampleIds: ["synthBrush"],
+    });
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+
+    fake.setCurrentTime(boundaryAt - 0.1);
+    runScheduler();
+    const sampleRecords = fake.sources.filter(({ node }) => !node.loop);
+    const sampleStarts = sampleRecords.map(({ startTimes }) => startTimes[0]);
+    expect(sampleStarts).toEqual([0.05, boundaryAt]);
+    expect(sampleRecords[1]?.startOffsets).toEqual([0]);
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 1 });
+
+    fake.setCurrentTime(boundaryAt);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledWith({
+      planIndex: 2,
+      completedRounds: 1,
+      plan: expect.objectContaining({ slots: expect.any(Array) }),
+    });
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2, cycleIteration: 2 });
+    expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05, boundaryAt]);
+    transport.dispose();
+  });
+
+  it("allows an initially silent Auto-generate plan to advance into an audible plan", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const nextFixture: Fixture = {
+      events: [{ id: "first-audible", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const onPlanBoundary = vi.fn();
+    const boundaryAt = 0.05 + 4 * 60 / 120 / 4;
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "silence", durationUnits: 4 }],
+      cyclesPerPlan: 1,
+      nextPlan: () => ({ slots: [{ kind: "fixture", fixture: nextFixture }] }),
+      onPlanBoundary,
+      preloadSampleIds: ["synthPulse"],
+      bpm: 120,
+    });
+    expect(fake.sources.filter(({ node }) => !node.loop)).toHaveLength(0);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 1, cycleSlotKind: "silence" });
+
+    fake.setCurrentTime(boundaryAt - 0.1);
+    runScheduler();
+    expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([boundaryAt]);
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+
+    fake.setCurrentTime(boundaryAt);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledTimes(1);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2, cycleSlotKind: "fixture" });
+    transport.dispose();
+  });
+
+  it("rebuilds a prepared boundary hit at the rebased tempo without early publication", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const initialFixture: Fixture = {
+      events: [{ id: "retime-initial", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const nextFixture: Fixture = {
+      events: [{ id: "retime-next", sampleId: "synthBrush", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const onPlanBoundary = vi.fn();
+    const rebasedBoundaryAt = 0.45 - ((0.45 - 0.05) / (60 / 120 / 4)) * (60 / 100 / 4)
+      + 4 * 60 / 100 / 4;
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: initialFixture }],
+      cyclesPerPlan: 1,
+      nextPlan: () => ({ slots: [{ kind: "fixture", fixture: nextFixture }] }),
+      onPlanBoundary,
+      referenceBpm: 120,
+      bpm: 120,
+      preloadSampleIds: ["synthBrush"],
+    });
+    fake.setCurrentTime(0.45);
+    transport.setTempo(100);
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+    const cancelledOldBoundarySource = fake.sources.find(({ startTimes }) => startTimes[0] === 0.55);
+    expect(cancelledOldBoundarySource?.stopTimes).toEqual([0]);
+
+    fake.setCurrentTime(rebasedBoundaryAt - 0.1);
+    runScheduler();
+    expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55, rebasedBoundaryAt]);
+    expect(fake.sources.filter(({ node }) => !node.loop).at(-1)?.startOffsets).toEqual([0]);
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+
+    fake.setCurrentTime(rebasedBoundaryAt);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledTimes(1);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2 });
+    expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55, rebasedBoundaryAt]);
+    transport.dispose();
+  });
+
+  it("continues from an all-silent generated plan into the following audible plan", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const fixtureFor = (id: string): Fixture => ({
+      events: [{ id, sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    });
+    const onPlanBoundary = vi.fn();
+    const firstBoundaryAt = 0.05 + 4 * 60 / 120 / 4;
+    const secondBoundaryAt = firstBoundaryAt + 4 * 60 / 120 / 4;
+    const nextPlan = vi.fn(({ nextPlanIndex }: { completedRounds: number; nextPlanIndex: number }) => ({
+      slots: nextPlanIndex === 2
+        ? [{ kind: "silence" as const, durationUnits: 4 }]
+        : [{ kind: "fixture" as const, fixture: fixtureFor("after-silent-plan") }],
+    }));
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: fixtureFor("initial-audible") }],
+      cyclesPerPlan: 1,
+      nextPlan,
+      onPlanBoundary,
+      bpm: 120,
+      preloadSampleIds: ["synthPulse"],
+    });
+
+    fake.setCurrentTime(firstBoundaryAt - 0.1);
+    runScheduler();
+    expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05]);
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+    expect(nextPlan).toHaveBeenCalledWith({ completedRounds: 0, nextPlanIndex: 2 });
+
+    fake.setCurrentTime(firstBoundaryAt);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledWith({
+      planIndex: 2,
+      completedRounds: 1,
+      plan: expect.objectContaining({ slots: [{ kind: "silence", durationUnits: 4 }] }),
+    });
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2, cycleSlotKind: "silence" });
+
+    fake.setCurrentTime(secondBoundaryAt - 0.1);
+    runScheduler();
+    expect(nextPlan).toHaveBeenLastCalledWith({ completedRounds: 1, nextPlanIndex: 3 });
+    expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05, secondBoundaryAt]);
+    expect(onPlanBoundary).toHaveBeenCalledTimes(1);
+
+    fake.setCurrentTime(secondBoundaryAt);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledTimes(2);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 3, cycleSlotKind: "fixture" });
+    expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05, secondBoundaryAt]);
+    transport.dispose();
+  });
+
+  it("stops launching queued candidate decodes after Stop and allows a newer playback", async () => {
+    const pendingReads: Array<(bytes: ArrayBuffer) => void> = [];
+    const fake = makeFakeAudioContext();
+    const { transport } = makeTransport(fake.context);
+    const candidateIds = Array.from({ length: 8 }, (_, index) => `queued-candidate-${index}`);
+    const assets = new Map(candidateIds.map((id) => [id, {
+      name: `${id}.wav`,
+      arrayBuffer: vi.fn(() => new Promise<ArrayBuffer>((resolve) => pendingReads.push(resolve))),
+    } as unknown as File] as const));
+    const initialFixture: Fixture = {
+      events: [{ id: "queued-initial", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+
+    const pendingPlay = transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: initialFixture }],
+      cyclesPerPlan: 1,
+      nextPlan: () => ({ slots: [{ kind: "fixture", fixture: initialFixture }] }),
+      preloadSampleIds: candidateIds,
+      assets,
+      bpm: 120,
+    });
+    await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
+    expect(pendingReads).toHaveLength(4);
+
+    transport.stop();
+    for (const resolveRead of pendingReads) resolveRead(new ArrayBuffer(1));
+    await pendingPlay;
+
+    expect([...assets.values()].reduce((total, file) => total + vi.mocked(file.arrayBuffer).mock.calls.length, 0)).toBe(4);
+    expect(fake.context.decodeAudioData).toHaveBeenCalledTimes(4);
+    await transport.play({ fixture: initialFixture, bpm: 120 });
+    expect(transport.getSnapshot().status).toBe("playing");
+    transport.dispose();
+  });
+
+  it("finishes the current full round before reporting a synchronous provider failure", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const beatFile = {
+      name: "provider-error-beat.wav",
+      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
+    } as unknown as File;
+    const oneRound: Fixture = {
+      events: [{ id: "round-hit", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const nextPlan = vi.fn(() => { throw new Error("fixture generation failed"); });
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: oneRound }],
+      cyclesPerPlan: 1,
+      nextPlan,
+      bpm: 120,
+      beatFile,
+    });
+    expect(nextPlan).toHaveBeenCalledTimes(1);
+    expect(fake.sources.find(({ node }) => !node.loop)?.startTimes).toEqual([0.05]);
+    expect(transport.getSnapshot().status).toBe("playing");
+
+    fake.setCurrentTime(0.54);
+    runScheduler();
+    expect(transport.getSnapshot().status).toBe("playing");
+    fake.setCurrentTime(0.55);
+    runScheduler();
+
+    expect(transport.getSnapshot()).toMatchObject({
+      status: "error",
+      error: expect.stringContaining("fixture generation failed"),
+    });
+    expect(fake.sources.find(({ node }) => node.loop)?.stopTimes).toEqual([0]);
+    transport.dispose();
+  });
+
+  it("cancels auto-generation preloads on Stop without calling the provider", async () => {
+    let resolveDecode!: (buffer: AudioBuffer) => void;
+    const decodePromise = new Promise<AudioBuffer>((resolve) => { resolveDecode = resolve; });
+    const fake = makeFakeAudioContext(() => decodePromise);
+    const { transport } = makeTransport(fake.context);
+    const futureFile = {
+      name: "future-sample.wav",
+      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
+    } as unknown as File;
+    const initialFixture: Fixture = {
+      events: [{ id: "current-hit", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const nextPlan = vi.fn(() => ({ slots: [{ kind: "fixture" as const, fixture: initialFixture }] }));
+
+    const pendingPlay = transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: initialFixture }],
+      cyclesPerPlan: 1,
+      nextPlan,
+      preloadSampleIds: ["future-sample"],
+      assets: new Map([["future-sample", futureFile]]),
+      bpm: 120,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    transport.stop();
+    resolveDecode(makeBuffer());
+    await pendingPlay;
+
+    expect(nextPlan).not.toHaveBeenCalled();
+    expect(fake.sources).toHaveLength(0);
+    expect(transport.getSnapshot()).toEqual({ status: "idle", progress: 0 });
+    transport.dispose();
+  });
+
+  it("preloads candidate and beat files with bounded decode concurrency", async () => {
+    let activeDecodes = 0;
+    let maxActiveDecodes = 0;
+    const fake = makeFakeAudioContext(async () => {
+      activeDecodes += 1;
+      maxActiveDecodes = Math.max(maxActiveDecodes, activeDecodes);
+      await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
+      activeDecodes -= 1;
+      return makeBuffer();
+    });
+    const { transport } = makeTransport(fake.context);
+    const candidateIds = Array.from({ length: 6 }, (_, index) => `candidate-${index}`);
+    const assets = new Map(candidateIds.map((id) => [id, {
+      name: `${id}.wav`,
+      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
+    } as unknown as File] as const));
+    const beatFile = {
+      name: "bounded-beat.wav",
+      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
+    } as unknown as File;
+    const initialFixture: Fixture = {
+      events: [{ id: "current", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: initialFixture }],
+      cyclesPerPlan: 1,
+      nextPlan: () => ({
+        slots: [{ kind: "fixture", fixture: {
+          events: [{ id: "future", sampleId: candidateIds[0]!, startUnits: 0, durationUnits: 4, silent: false }],
+          totalUnits: 4,
+        } }],
+      }),
+      preloadSampleIds: candidateIds,
+      assets,
+      beatFile,
+      bpm: 120,
+    });
+
+    expect(maxActiveDecodes).toBe(4);
+    expect(fake.context.decodeAudioData).toHaveBeenCalledTimes(7);
+    expect(transport.getSnapshot().status).toBe("playing");
+    transport.dispose();
+  });
+
+  it("applies a live tempo change at a generated plan boundary without resetting beat phase", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport } = makeTransport(fake.context, async () => processor.node);
+    const beatFile = {
+      name: "auto-tempo-beat.wav",
+      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
+    } as unknown as File;
+    const fixtureFor = (id: string, sampleId: string): Fixture => ({
+      events: [{ id, sampleId, startUnits: 0, durationUnits: 16, silent: false }],
+      totalUnits: 16,
+    });
+    const nextFixture = fixtureFor("next-plan-hit", "synthBrush");
+    const nextPlan = vi.fn(() => ({ slots: [{ kind: "fixture" as const, fixture: nextFixture }] }));
+    const onPlanBoundary = vi.fn();
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: fixtureFor("first-plan-hit", "synthPulse") }],
+      cyclesPerPlan: 1,
+      nextPlan,
+      onPlanBoundary,
+      referenceBpm: 85,
+      bpm: 85,
+      unitsPerBeat: 16,
+      beatFile,
+      preloadSampleIds: ["synthBrush"],
+    });
+    const beatSource = fake.sources.find(({ node }) => node.loop);
+    const boundaryAt = 0.05 + 16 * 60 / 85 / 16;
+    fake.setCurrentTime(boundaryAt);
+
+    transport.setTempo(100);
+
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2, cycleIteration: 2 });
+    expect(onPlanBoundary).toHaveBeenCalledWith({ planIndex: 2, completedRounds: 1, plan: expect.any(Object) });
+    expect(fake.sources.filter(({ node }) => !node.loop).map(({ startTimes }) => startTimes[0])).toEqual([0.05, boundaryAt]);
+    expect(fake.sources.filter(({ node }) => node.loop)).toHaveLength(1);
+    expect(beatSource?.startTimes).toEqual([0.05]);
+    expect(beatSource?.stopTimes).toEqual([]);
+    expect(beatSource?.node.playbackRate.value).toBeCloseTo(100 / 85);
+    expect(fake.sources.at(-1)?.node.playbackRate.value).toBeCloseTo(100 / 85);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("reschedules only not-yet-started generated hits after tempo changes at the boundary", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const initialFixture: Fixture = {
+      events: [{ id: "boundary-tempo-first", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 16,
+    };
+    const generatedFixture: Fixture = {
+      events: [
+        { id: "boundary-tempo-tick-zero", sampleId: "synthBrush", startUnits: 0, durationUnits: 1, silent: false },
+        { id: "boundary-tempo-next-tick", sampleId: "synthBrush", startUnits: 1, durationUnits: 1, silent: false },
+      ],
+      totalUnits: 16,
+    };
+    const nextPlan = vi.fn(() => ({ slots: [{ kind: "fixture" as const, fixture: generatedFixture }] }));
+    const boundaryAt = 0.05 + 16 * 60 / 85 / 16;
+    const oldNextHitAt = boundaryAt + 60 / 85 / 16;
+    const newNextHitAt = boundaryAt + 60 / 100 / 16;
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: initialFixture }],
+      cyclesPerPlan: 1,
+      nextPlan,
+      referenceBpm: 85,
+      bpm: 85,
+      unitsPerBeat: 16,
+      preloadSampleIds: ["synthBrush"],
+    });
+    fake.setCurrentTime(boundaryAt - 0.05);
+    runScheduler();
+    const tickZeroSource = fake.sources.find(({ startTimes }) => startTimes[0] === boundaryAt);
+    const oldFutureSource = fake.sources.find(({ startTimes }) => startTimes[0] === oldNextHitAt);
+    expect(tickZeroSource).toBeDefined();
+    expect(oldFutureSource).toBeDefined();
+
+    fake.setCurrentTime(boundaryAt);
+    transport.setTempo(100);
+
+    expect(tickZeroSource?.stopTimes).toEqual([]);
+    expect(oldFutureSource?.stopTimes).toEqual([0]);
+    expect(fake.sources.filter(({ startTimes }) => startTimes[0] === boundaryAt)).toHaveLength(1);
+    const rescheduledHit = fake.sources.find(({ startTimes }) => startTimes[0] === newNextHitAt);
+    expect(rescheduledHit).toBeDefined();
+    expect(rescheduledHit?.startOffsets).toEqual([0]);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2, cycleIteration: 2 });
+    transport.dispose();
+  });
+
+  it("keeps generated cycle iteration monotonic after retiming mid-round", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const fixtureFor = (id: string): Fixture => ({
+      events: [{ id, sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 16,
+    });
+    const nextPlan = vi.fn(() => ({ slots: [{ kind: "fixture" as const, fixture: fixtureFor("next-plan") }] }));
+    const onPlanBoundary = vi.fn();
+    const cycleSeconds = 16 * 60 / 85 / 16;
+    const secondCycleStart = 0.05 + cycleSeconds;
+    const retimeAt = secondCycleStart + 0.1;
+    const positionUnits = 0.1 / (60 / 85 / 16);
+    const rebasedCycleStart = retimeAt - positionUnits * (60 / 100 / 16);
+    const nextPlanBoundary = rebasedCycleStart + 16 * 60 / 100 / 16;
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: fixtureFor("two-round-plan") }],
+      cyclesPerPlan: 2,
+      nextPlan,
+      onPlanBoundary,
+      referenceBpm: 85,
+      bpm: 85,
+      unitsPerBeat: 16,
+    });
+    fake.setCurrentTime(retimeAt);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 1, cycleIteration: 2 });
+    expect(nextPlan).toHaveBeenCalledWith({ completedRounds: 1, nextPlanIndex: 2 });
+
+    transport.setTempo(100);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 1, cycleIteration: 2 });
+    fake.setCurrentTime(nextPlanBoundary);
+    runScheduler();
+
+    expect(onPlanBoundary).toHaveBeenCalledWith({ planIndex: 2, completedRounds: 2, plan: expect.any(Object) });
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing", cyclePlanIndex: 2, cycleIteration: 3 });
+    transport.dispose();
+  });
+
+  it("bounds Auto-generate catch-up after a long scheduler gap", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const fixtureFor = (id: string): Fixture => ({
+      events: [{ id, sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    });
+    const nextPlan = vi.fn(() => ({ slots: [{ kind: "fixture" as const, fixture: fixtureFor("catch-up") }] }));
+    const onPlanBoundary = vi.fn();
+    const beatFile = {
+      name: "catch-up-beat.wav",
+      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
+    } as unknown as File;
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: fixtureFor("initial-catch-up") }],
+      cyclesPerPlan: 1,
+      nextPlan,
+      onPlanBoundary,
+      beatFile,
+      bpm: 120,
+    });
+    const beatSource = fake.sources.find(({ node }) => node.loop);
+    fake.setCurrentTime(5 * 60 * 60);
+    runScheduler();
+
+    expect(transport.getSnapshot()).toMatchObject({
+      status: "error",
+      error: expect.stringContaining("fell too far behind the audio clock"),
+    });
+    expect(nextPlan.mock.calls.length).toBeLessThanOrEqual(65);
+    expect(onPlanBoundary.mock.calls.length).toBeLessThanOrEqual(64);
+    expect(beatSource?.stopTimes).toEqual([0]);
+    transport.dispose();
+  });
+
   it("changes sample and beat gain independently without restarting either source", async () => {
     const fake = makeFakeAudioContext();
     const { transport } = makeTransport(fake.context);

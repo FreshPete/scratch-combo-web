@@ -1,6 +1,7 @@
 import { StrictMode } from 'react'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { CyclePlanOptions } from './audio'
 import * as domain from './domain'
 import App from './App'
 
@@ -12,6 +13,7 @@ const audioHarness = vi.hoisted(() => {
     cycleSlotIndex?: number
     cycleIteration?: number
     cycleSlotKind?: 'fixture' | 'silence'
+    cyclePlanIndex?: number
   }
   let snapshot: Snapshot = { status: 'idle', progress: 0 }
   let tempoAvailable = false
@@ -74,6 +76,10 @@ const presetHarness = vi.hoisted(() => ({
   loaded: undefined as unknown,
 }))
 
+const waveformHarness = vi.hoisted(() => ({
+  loadWaveform: vi.fn(async (_file: File): Promise<unknown> => null),
+}))
+
 vi.mock('./audio', () => ({
   AudioTransport: class {
     subscribe = audioHarness.subscribe
@@ -96,10 +102,17 @@ vi.mock('./presets/catalog', () => ({
   loadBuiltInPreset: presetHarness.loadBuiltInPreset,
 }))
 
+vi.mock('./waveforms/waveform', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./waveforms/waveform')>()
+  return { ...actual, loadWaveform: waveformHarness.loadWaveform }
+})
+
 vi.mock('./domain', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./domain')>()
   return { ...actual, generateLegacyCombo: vi.fn(actual.generateLegacyCombo) }
 })
+
+const defaultLegacyGenerator = vi.mocked(domain.generateLegacyCombo).getMockImplementation()
 
 function delayedIniFile(name: string) {
   let resolveText: (text: string) => void = () => undefined
@@ -151,9 +164,12 @@ function selectDemoPreset() {
 
 beforeEach(() => {
   audioHarness.reset()
-  vi.mocked(domain.generateLegacyCombo).mockClear()
+  vi.mocked(domain.generateLegacyCombo).mockReset()
+  if (defaultLegacyGenerator) vi.mocked(domain.generateLegacyCombo).mockImplementation(defaultLegacyGenerator)
   presetHarness.fetchBuiltInPresetCatalog.mockReset()
   presetHarness.loadBuiltInPreset.mockReset()
+  waveformHarness.loadWaveform.mockReset()
+  waveformHarness.loadWaveform.mockResolvedValue(null)
   const builtinIni = samplePreset('85 BPM - Beginner', 'Bundled kick', 'kick.wav')
     .replace('BPM01=100', 'BPM01=85')
     .replace('SampleRepeatMax=2', 'SampleRepeatMax=512')
@@ -185,10 +201,431 @@ beforeEach(() => {
 })
 afterEach(async () => {
   cleanup()
+  vi.unstubAllEnvs()
   await Promise.resolve()
 })
 
 describe('workspace import and transport lifecycle', () => {
+  it('shows a decoded WAV envelope inside the event slot at its reference-time width', async () => {
+    waveformHarness.loadWaveform.mockResolvedValue({
+      durationSeconds: 0.1,
+      peaks: Float32Array.from([1, 0.5]),
+      path: 'M0 1 L1 2 Z',
+    })
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+
+    await waitFor(() => expect(document.querySelector('.sequence-event--waveform svg.sequence-waveform')).toBeInTheDocument())
+    expect(waveformHarness.loadWaveform).toHaveBeenCalledWith((presetHarness.loaded as { audioFiles: File[] }).audioFiles[0])
+    const waveform = document.querySelector('.sequence-event--waveform svg.sequence-waveform') as SVGSVGElement
+    expect(Number.parseFloat(waveform.style.width)).toBeCloseTo((0.1 / (8 * 60 / (85 * 16))) * 100)
+    expect(waveform.querySelector('path')).toHaveAttribute('d', 'M0 1 L1 2 Z')
+    expect(audioHarness.play).not.toHaveBeenCalled()
+    expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
+  })
+
+  it('keeps the normal event block when decoding fails and leaves silent slots dashed', async () => {
+    vi.mocked(domain.generateLegacyCombo).mockReturnValue({
+      events: [{
+        eventNumber: 1, sampleNumber: 1, sampleId: 'Sample01', startTick: 0, durationTicks: 8,
+        startForward: true, endForward: false, silent: false,
+      }],
+      requestedRawTicks: 128,
+      completedRawTicks: 8,
+      remainingRawTicks: 120,
+      terminalReason: 'minimum-fit-exhausted',
+      restarts: 0,
+    })
+    const file = new File(['audio'], 'kick.wav', { type: 'audio/wav' })
+    waveformHarness.loadWaveform.mockResolvedValue(null)
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    chooseFiles(screen.getByLabelText('Choose WAV files') as HTMLInputElement, [file])
+    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [
+      new File([samplePreset('Local preset', 'Local kick', 'kick.wav')], 'local.ini', { type: 'text/plain' }),
+    ])
+    await screen.findByText('Local kick')
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+
+    await waitFor(() => expect(document.querySelectorAll('.sequence-event').length).toBeGreaterThan(0))
+    expect(waveformHarness.loadWaveform).toHaveBeenCalledWith(file)
+    expect(document.querySelector('.sequence-event--waveform')).not.toBeInTheDocument()
+    expect(document.querySelector('.sequence-event--silent')).toBeInTheDocument()
+    expect(audioHarness.play).not.toHaveBeenCalled()
+    expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
+  })
+
+  it('renders assigned TTM guides in the shared timeline and keeps assignments out of saved audio settings', async () => {
+    const write = vi.fn(async (_value: string | Blob) => undefined)
+    const close = vi.fn(async () => undefined)
+    const createWritable = vi.fn(async () => ({ write, close }))
+    Object.defineProperty(window, 'showSaveFilePicker', {
+      configurable: true,
+      value: vi.fn(async (options: { suggestedName: string }) => ({ name: options.suggestedName, createWritable })),
+    })
+    try {
+      render(<App />)
+      await screen.findByRole('heading', { name: 'Generated combo' })
+      fireEvent.click(screen.getByRole('button', { name: 'Edit Bundled kick' }))
+
+      const guideSelect = screen.getByRole('combobox', { name: 'TTM guide for Bundled kick' })
+      expect(guideSelect).toHaveValue('untranscribed')
+      fireEvent.change(guideSelect, { target: { value: 'forward-cut' } })
+      await waitFor(() => expect(screen.getByRole('combobox', { name: 'TTM guide for Bundled kick' })).toHaveValue('forward-cut'))
+      fireEvent.click(screen.getByRole('radio', { name: 'TTM practice guides' }))
+
+      const guidePath = document.querySelector('.sequence-ttm-motion path')
+      expect(guidePath).toHaveAttribute('d', 'M0 100 L50 0 L100 100')
+      const guideEvent = document.querySelector('.sequence-event--ttm-guide')
+      expect(guideEvent?.querySelectorAll('.sequence-ttm-fader__interval--open')).toHaveLength(1)
+      expect(guideEvent?.querySelectorAll('.sequence-ttm-fader__interval--closed')).toHaveLength(1)
+      expect(screen.getByText(/not WAV transcriptions/i)).toBeInTheDocument()
+      expect(screen.getByRole('img', { name: /Sequence timeline/ })).toBeInTheDocument()
+      expect(audioHarness.play).not.toHaveBeenCalled()
+      expect(audioHarness.playCyclePlan).not.toHaveBeenCalled()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Save Sample Data' }))
+      await waitFor(() => expect(write).toHaveBeenCalledTimes(1))
+      expect(write.mock.calls[0]?.[0]).not.toContain('forward-cut')
+      expect(write.mock.calls[0]?.[0]).not.toContain('TTM')
+    } finally {
+      delete (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker
+    }
+  })
+
+  it('shows exact sample-name suggestions in TTM view and lets explicit Untranscribed override them', async () => {
+    const loaded = presetHarness.loaded as { preset: domain.Preset }
+    presetHarness.loaded = {
+      ...(presetHarness.loaded as object),
+      preset: {
+        ...loaded.preset,
+        samples: loaded.preset.samples.map((sample) => sample.id === 'Sample01' ? { ...sample, name: 'Baby(F)' } : sample),
+      },
+    }
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Baby(F)' }))
+    const guideSelect = screen.getByRole('combobox', { name: 'TTM guide for Baby(F)' })
+    expect(guideSelect).toHaveValue('forward-movement')
+    expect(guideSelect.querySelector('option:checked')).toHaveTextContent('Suggested: Forward movement')
+    expect(screen.getByText(/suggested from the exact sample label only/i)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('radio', { name: 'TTM practice guides' }))
+    expect(document.querySelector('.sequence-ttm-motion path')).toHaveAttribute('d', 'M0 100 L100 0')
+    expect(document.querySelector('.timeline-lane-label--ttm small')).toHaveTextContent('Suggested: Forward movement')
+
+    fireEvent.change(guideSelect, { target: { value: 'untranscribed' } })
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'TTM guide for Baby(F)' })).toHaveValue('untranscribed'))
+    expect(document.querySelector('.sequence-ttm-motion path')).not.toBeInTheDocument()
+    expect(document.querySelector('.sequence-event--ttm-untranscribed')).toBeInTheDocument()
+    expect(document.querySelector('.timeline-lane-label--ttm small')).toHaveTextContent('Untranscribed')
+    expect(document.querySelector('.visually-hidden[aria-label="Sequence events"]')).toHaveTextContent('TTM guide: Untranscribed')
+  })
+
+  it('marks a name without an exact TTM alias as unassigned', async () => {
+    vi.mocked(domain.generateLegacyCombo).mockReturnValue({
+      events: [{
+        eventNumber: 1, sampleNumber: 1, sampleId: 'Sample01', startTick: 0, durationTicks: 8,
+        startForward: true, endForward: false, silent: false,
+      }],
+      requestedRawTicks: 128,
+      completedRawTicks: 8,
+      remainingRawTicks: 120,
+      terminalReason: 'minimum-fit-exhausted',
+      restarts: 0,
+    })
+    const ini = samplePreset('Unknown TTM label', 'Mystery scratch', 'mystery.wav')
+      .replace('SampleRepeatMax=2', 'SampleRepeatMax=512')
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'unknown-ttm.ini', { type: 'text/plain' })])
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+    await screen.findByRole('img', { name: 'Sequence timeline: 128 legacy ticks, 2 events' })
+    fireEvent.click(screen.getByRole('radio', { name: 'TTM practice guides' }))
+
+    expect(document.querySelector('.sequence-event--ttm-unassigned')).toBeInTheDocument()
+    expect(document.querySelector('.sequence-ttm-motion path')).not.toBeInTheDocument()
+    expect(document.querySelector('.timeline-lane-label--ttm small')).toHaveTextContent('Unassigned')
+    expect(screen.getByRole('link', { name: 'Edit a sample' })).toHaveAttribute('href', '#sample-section')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Mystery scratch' }))
+    const guideSelect = screen.getByRole('combobox', { name: 'TTM guide for Mystery scratch' })
+    expect(guideSelect).toHaveValue('untranscribed')
+    expect(guideSelect.querySelector('option:checked')).toHaveTextContent('Unassigned · Untranscribed')
+    expect(screen.getByText(/No guide is assigned/i)).toBeInTheDocument()
+  })
+
+  it('keeps TTM available only as a disabled local-debug view outside development', async () => {
+    vi.stubEnv('DEV', false)
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+
+    const ttmView = screen.getByRole('radio', { name: 'TTM practice guides' })
+    expect(ttmView).toBeDisabled()
+    expect(ttmView).toHaveAttribute('aria-describedby', 'ttm-local-debug-note')
+    expect(screen.getByText('Local debug only')).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'Waveform' })).toBeChecked()
+
+    fireEvent.click(ttmView)
+    expect(screen.getByRole('radio', { name: 'Waveform' })).toBeChecked()
+    expect(document.querySelector('.sequence-ttm-motion')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Bundled kick' }))
+    expect(screen.queryByRole('combobox', { name: /TTM guide for/ })).not.toBeInTheDocument()
+  })
+
+  it('starts auto-generation off and replaces the visible fixture only at a completed-round boundary', async () => {
+    const result = (startTick: number): ReturnType<typeof domain.generateLegacyCombo> => ({
+      events: [{
+        eventNumber: 1, sampleNumber: 1, sampleId: 'Sample01', startTick, durationTicks: 8,
+        startForward: true, endForward: false, silent: false,
+      }],
+      requestedRawTicks: 128,
+      completedRawTicks: startTick + 8,
+      remainingRawTicks: 120 - startTick,
+      terminalReason: 'minimum-fit-exhausted',
+      restarts: 0,
+    })
+    vi.mocked(domain.generateLegacyCombo).mockReturnValueOnce(result(0)).mockReturnValueOnce(result(16))
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    const autoGenerate = screen.getByRole('checkbox', { name: /Auto-generate/ })
+    const roundCount = screen.getByRole('combobox', { name: 'New combo every' })
+    expect(autoGenerate).not.toBeChecked()
+    expect(roundCount).toHaveValue('2')
+    expect(roundCount).toBeDisabled()
+
+    fireEvent.click(autoGenerate)
+    expect(roundCount).toBeEnabled()
+    fireEvent.change(roundCount, { target: { value: '4' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+
+    const options = audioHarness.playCyclePlan.mock.calls[0]?.[0] as CyclePlanOptions
+    expect(options.cyclesPerPlan).toBe(4)
+    expect(options.preloadSampleIds).toEqual(['Sample01'])
+    expect(options.nextPlan).toBeTypeOf('function')
+    expect(options.onPlanBoundary).toBeTypeOf('function')
+    const eventsBeforeBoundary = document.querySelector('.visually-hidden[aria-label="Sequence events"]')?.textContent ?? ''
+    const eventCountBeforeBoundary = document.querySelectorAll('.sequence-event').length
+    expect(eventsBeforeBoundary).toContain('starts at legacy tick 1')
+
+    let nextPlan: ReturnType<NonNullable<CyclePlanOptions['nextPlan']>> | undefined
+    await act(async () => { nextPlan = options.nextPlan?.({ completedRounds: 4, nextPlanIndex: 2 }) })
+    expect(nextPlan?.slots).toHaveLength(2)
+    expect(document.querySelector('.visually-hidden[aria-label="Sequence events"]')?.textContent).toBe(eventsBeforeBoundary)
+
+    await act(async () => {
+      options.onPlanBoundary?.({ planIndex: 2, completedRounds: 4, plan: nextPlan! })
+    })
+    const eventsAfterBoundary = document.querySelector('.visually-hidden[aria-label="Sequence events"]')?.textContent ?? ''
+    expect(eventsAfterBoundary).toContain('starts at legacy tick 17')
+      expect(eventsAfterBoundary).not.toContain('starts at legacy tick 1, lasts')
+    expect(document.querySelectorAll('.sequence-event')).toHaveLength(eventCountBeforeBoundary)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Loop' }))
+    fireEvent.change(roundCount, { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(2))
+    const loopOptions = audioHarness.playCyclePlan.mock.calls[1]?.[0] as CyclePlanOptions
+    expect(loopOptions.cyclesPerPlan).toBe(1)
+    expect(loopOptions.slots).toHaveLength(1)
+  })
+
+  it('locks fixture-changing controls during sequence playback and sample audition', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    const sequenceEvents = () => document.querySelector('.visually-hidden[aria-label="Sequence events"]')?.textContent ?? ''
+    const originalEvents = sequenceEvents()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Generate combo' })).toBeDisabled()
+    expect(screen.getByLabelText('Combo length')).toBeDisabled()
+    expect(screen.getByRole('radio', { name: 'Loop' })).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: /Large pause/ })).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: /Auto-generate/ })).toBeDisabled()
+    expect(screen.getByRole('combobox', { name: 'New combo every' })).toBeDisabled()
+    expect(screen.getByRole('combobox', { name: 'New combo every' })).toHaveValue('2')
+    expect(screen.getByRole('checkbox', { name: /Large pause/ })).toBeDisabled()
+    expect(screen.getByLabelText('Quick preset')).toBeDisabled()
+    expect(screen.getByLabelText('Choose INI preset')).toBeDisabled()
+    expect(screen.getByLabelText('Choose audio folder')).toBeDisabled()
+    expect(screen.getByLabelText('Choose WAV files')).toBeDisabled()
+    expect(screen.getByLabelText('Enable Bundled kick for next combo')).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Preview Bundled kick' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Edit Bundled kick' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Save Sample Data' })).toBeDisabled()
+    expect(screen.getByLabelText('Beat bed')).toBeDisabled()
+
+    expect(screen.getByRole('spinbutton', { name: 'BPM' })).toBeEnabled()
+    expect(screen.getByRole('slider', { name: 'Pitch shift in semitones' })).toBeEnabled()
+    expect(screen.getByRole('slider', { name: 'Sample level' })).toBeEnabled()
+    expect(screen.getByRole('slider', { name: 'Beat level' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Reset controls' })).toBeEnabled()
+
+    fireEvent.change(screen.getByLabelText('Combo length'), { target: { value: '16' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: /Auto-generate/ }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Loop' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: /Large pause/ }))
+    fireEvent.change(screen.getByRole('combobox', { name: 'New combo every' }), { target: { value: '8' } })
+    fireEvent.click(screen.getByLabelText('Enable Bundled kick for next combo'))
+    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [
+      new File([samplePreset('Locked choice', 'Locked kick', 'locked.wav')], 'locked.ini', { type: 'text/plain' }),
+    ])
+    expect(sequenceEvents()).toBe(originalEvents)
+    expect(screen.getByRole('checkbox', { name: /Auto-generate/ })).not.toBeChecked()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    expect(screen.getByLabelText('Quick preset')).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Bundled kick' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Preview Bundled kick' }))
+    await waitFor(() => expect(audioHarness.play).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('button', { name: 'Generate combo' })).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: /Auto-generate/ })).toBeDisabled()
+    expect(screen.getByRole('combobox', { name: 'New combo every' })).toBeDisabled()
+    expect(screen.getByRole('combobox', { name: 'TTM guide for Bundled kick' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Save sample changes' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    expect(screen.getByLabelText('BPM')).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+  })
+
+  it('keeps manual playback available with unresolved unselected samples until Auto-generate is enabled', async () => {
+    vi.mocked(domain.generateLegacyCombo).mockReturnValue({
+      events: [{
+        eventNumber: 1, sampleNumber: 1, sampleId: 'Sample01', startTick: 0, durationTicks: 8,
+        startForward: true, endForward: false, silent: false,
+      }],
+      requestedRawTicks: 128,
+      completedRawTicks: 8,
+      remainingRawTicks: 120,
+      terminalReason: 'minimum-fit-exhausted',
+      restarts: 0,
+    })
+    const availableFile = new File(['available'], 'kick.wav', { type: 'audio/wav' })
+    const secondSample = [
+      '', '[Sample02]', 'SamplePlayFq=1', 'SampleIsSilent=False', 'SampleRepeatsPoss=True', 'SampleRepeatMax=512',
+      'SampleFileName=missing.wav', 'SampleDisplayName=Missing row', 'SampleStartsForward=True', 'SampleEndsForward=False',
+      'Sample16ths=8', 'UseSample=True',
+    ].join('\n')
+    const ini = samplePreset('Local preset', 'Available kick', 'kick.wav').replace('SampleRepeatMax=2', 'SampleRepeatMax=512') + '\n' + secondSample
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    chooseFiles(screen.getByLabelText('Choose WAV files') as HTMLInputElement, [availableFile])
+    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'local.ini', { type: 'text/plain' })])
+    await screen.findByText('Missing row')
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('checkbox', { name: /Auto-generate/ }))
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    expect(document.querySelector('.auto-generation-help')).toHaveTextContent('Missing row')
+  })
+
+  it('allows Auto-generate with an all-silent preset and an empty preload list', async () => {
+    const ini = samplePreset('Silent only preset', 'Silent practice slot', 'silent.wav')
+      .replace('SampleIsSilent=False', 'SampleIsSilent=True')
+      .replace('SampleRepeatMax=2', 'SampleRepeatMax=512')
+      .replace('Sample16ths=8', 'Sample16ths=16')
+      .replace('UseSample=True', 'UseSample=False')
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'silent-only.ini', { type: 'text/plain' })])
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+    await screen.findByRole('img', { name: 'Sequence timeline: 128 legacy ticks, 8 events' })
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /Auto-generate/ }))
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+    expect(document.querySelector('.auto-generation-help')).toHaveTextContent('No audible samples need preloading')
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+
+    const options = audioHarness.playCyclePlan.mock.calls[0]?.[0] as CyclePlanOptions
+    expect(options.preloadSampleIds).toEqual([])
+    expect(options.nextPlan).toBeTypeOf('function')
+    await act(async () => {
+      const nextPlan = options.nextPlan?.({ completedRounds: 2, nextPlanIndex: 2 })
+      expect(nextPlan?.slots[0]).toMatchObject({ kind: 'fixture' })
+    })
+  })
+
+  it('discards an older waveform decode after a different preset replaces its file', async () => {
+    vi.mocked(domain.generateLegacyCombo).mockReturnValue({
+      events: [{
+        eventNumber: 1, sampleNumber: 1, sampleId: 'Sample01', startTick: 0, durationTicks: 8,
+        startForward: true, endForward: false, silent: false,
+      }],
+      requestedRawTicks: 128,
+      completedRawTicks: 8,
+      remainingRawTicks: 120,
+      terminalReason: 'minimum-fit-exhausted',
+      restarts: 0,
+    })
+    let resolveOriginal: (value: unknown) => void = () => undefined
+    const originalFile = (presetHarness.loaded as { audioFiles: File[] }).audioFiles[0]
+    const originalWaveform = {
+      durationSeconds: 0.1,
+      peaks: Float32Array.from([1, 0.5]),
+      path: 'M0 1 L1 2 Z',
+    }
+    const replacementWaveform = {
+      durationSeconds: 0.1,
+      peaks: Float32Array.from([0.5, 1]),
+      path: 'M0 2 L1 1 Z',
+    }
+    const originalDecode = new Promise<unknown>((resolve) => { resolveOriginal = resolve })
+    const replacementFile = new File(['replacement audio'], 'replacement.wav', { type: 'audio/wav' })
+    waveformHarness.loadWaveform.mockImplementation((file: File) => file === originalFile
+      ? originalDecode
+      : Promise.resolve(replacementWaveform))
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+    await waitFor(() => expect(waveformHarness.loadWaveform).toHaveBeenCalledWith(originalFile))
+
+    chooseFiles(screen.getByLabelText('Choose WAV files') as HTMLInputElement, [replacementFile])
+    chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [
+      new File([samplePreset('Replacement preset', 'Replacement kick', 'replacement.wav').replace('SampleRepeatMax=2', 'SampleRepeatMax=512')], 'replacement.ini', { type: 'text/plain' }),
+    ])
+    await screen.findByText('Replacement kick')
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
+    waveformHarness.loadWaveform.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
+
+    await waitFor(() => expect(waveformHarness.loadWaveform).toHaveBeenCalledWith(replacementFile))
+    await waitFor(() => expect(document.querySelector('.sequence-event--waveform path')).toHaveAttribute('d', replacementWaveform.path))
+    await act(async () => { resolveOriginal(originalWaveform); await originalDecode })
+
+    const paths = Array.from(document.querySelectorAll('.sequence-event--waveform path'))
+    expect(paths.length).toBeGreaterThan(0)
+    expect(paths.every((path) => path.getAttribute('d') === replacementWaveform.path)).toBe(true)
+  })
+
   it('keeps the latest INI when an older file read finishes last', async () => {
     render(<App />)
     const input = screen.getByLabelText('Choose INI preset') as HTMLInputElement
@@ -362,12 +799,13 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
   })
 
-  it('keeps tempo, pitch, sample level, beat level, and beat selection independent while playing', async () => {
+  it('keeps live tempo, pitch, levels, and reset available while locking fixture and beat-bed changes', async () => {
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
 
     fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
     await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+    audioHarness.stop.mockClear()
     const options = audioHarness.playCyclePlan.mock.calls[0]?.[0] as {
       bpm: number
       referenceBpm: number
@@ -387,15 +825,16 @@ describe('workspace import and transport lifecycle', () => {
     fireEvent.change(screen.getByRole('slider', { name: 'Pitch shift in semitones' }), { target: { value: '3' } })
     fireEvent.change(document.getElementById('sample-volume') as HTMLInputElement, { target: { value: '55' } })
     fireEvent.change(document.getElementById('beat-volume') as HTMLInputElement, { target: { value: '40' } })
+    expect(screen.getByLabelText('Beat bed')).toBeDisabled()
     fireEvent.change(screen.getByLabelText('Beat bed'), { target: { value: '1' } })
 
     expect(audioHarness.setTempo).toHaveBeenCalledWith(100)
     expect(audioHarness.setPitchSemitones).toHaveBeenCalledWith(3)
     expect(audioHarness.setSampleVolume).toHaveBeenCalledWith(55)
     expect(audioHarness.setBeatVolume).toHaveBeenCalledWith(40)
-    expect(audioHarness.stop).toHaveBeenCalled()
-    expect(screen.getByLabelText('Beat bed')).toHaveValue('1')
-    expect(screen.getByText('Playback stopped. Beat selection changed; play again to hear it.')).toBeInTheDocument()
+    expect(audioHarness.stop).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Beat bed')).toHaveValue('0')
+    expect(screen.getByText('Stop playback to change combo options or sample settings.')).toBeInTheDocument()
   })
 
   it('resets live tempo, pitch, and levels to the selected preset without stopping playback', async () => {
@@ -541,6 +980,7 @@ describe('workspace import and transport lifecycle', () => {
       .replace('UseSample=True', 'UseSample=False')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'ticks.ini', { type: 'text/plain' })])
     await screen.findByRole('button', { name: 'Generate combo' })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
 
     fireEvent.change(screen.getByLabelText('Combo length'), { target: { value: String(beats) } })
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
@@ -565,6 +1005,7 @@ describe('workspace import and transport lifecycle', () => {
       .replace('UseSample=True', 'UseSample=False')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'qa.ini', { type: 'text/plain' })])
     await screen.findByRole('button', { name: 'Generate combo' })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     fireEvent.change(screen.getByLabelText('Combo length'), { target: { value: '4' } })
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
     const timeline = await screen.findByRole('img', { name: 'Sequence timeline: 64 legacy ticks, 4 events' })
@@ -573,6 +1014,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByText('1 audio cycle, then 1 silent cycle.')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
     await screen.findByText('Q&A · question playback · cycle 1.')
+    audioHarness.stop.mockClear()
 
     await act(async () => {
       audioHarness.emit({ status: 'playing', progress: 0.75, cycleSlotIndex: 1, cycleIteration: 1, cycleSlotKind: 'silence' })
@@ -581,6 +1023,11 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByRole('img', { name: 'Sequence timeline: 64 legacy ticks, 4 events' })).toBe(timeline)
     expect(document.querySelector('.timeline-playhead')).toHaveStyle({ left: '50%' })
 
+    expect(screen.getByRole('checkbox', { name: /Large pause/ })).toBeDisabled()
+    fireEvent.click(screen.getByRole('checkbox', { name: /Large pause/ }))
+    expect(screen.getByText('1 audio cycle, then 1 silent cycle.')).toBeInTheDocument()
+    expect(audioHarness.stop).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
     fireEvent.click(screen.getByRole('checkbox', { name: /Large pause/ }))
     expect(audioHarness.stop).toHaveBeenCalled()
     expect(screen.getByRole('img', { name: 'Sequence timeline: 64 legacy ticks, 4 events' })).toBeInTheDocument()
@@ -591,6 +1038,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(options.slots.map((slot) => slot.kind)).toEqual(['fixture', 'silence', 'silence', 'silence'])
     expect(options.slots.slice(1).map((slot) => slot.durationUnits)).toEqual([64, 64, 64])
 
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
     fireEvent.click(screen.getByRole('radio', { name: 'Loop' }))
     expect(screen.queryByRole('checkbox', { name: /Large pause/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
@@ -620,6 +1068,7 @@ describe('workspace import and transport lifecycle', () => {
       .replace('Sample16ths=8', 'Sample16ths=16')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'unresolved.ini', { type: 'text/plain' })])
     await screen.findByRole('button', { name: 'Generate combo' })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
 
     await screen.findByRole('img', { name: 'Sequence timeline: 128 legacy ticks, 8 events' })
@@ -637,6 +1086,7 @@ describe('workspace import and transport lifecycle', () => {
       .replace('Sample16ths=8', 'Sample16ths=16')
     chooseFiles(screen.getByLabelText('Choose INI preset') as HTMLInputElement, [new File([ini], 'toggle.ini', { type: 'text/plain' })])
     await screen.findByRole('button', { name: 'Generate combo' })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Generate combo' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
     await screen.findByRole('img', { name: 'Sequence timeline: 128 legacy ticks, 8 events' })
 

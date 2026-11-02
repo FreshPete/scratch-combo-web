@@ -1,8 +1,8 @@
 import {
   useEffect, useMemo, useRef, useState, useSyncExternalStore,
-  type ChangeEvent, type InputHTMLAttributes,
+  type ChangeEvent, type CSSProperties, type InputHTMLAttributes,
 } from 'react'
-import { AudioTransport, type CycleSlot, type PlayOptions } from './audio'
+import { AudioTransport, type CyclePlanOptions, type CycleSlot, type PlayOptions } from './audio'
 import { SessionControls } from './SessionControls'
 import {
   buildAssetIndex, buildPreviewFixture, DEMO_PRESET, generateLegacyCombo, parseLegacyIni,
@@ -14,10 +14,21 @@ import {
   fetchBuiltInPresetCatalog, loadBuiltInPreset,
   type BuiltInPresetCatalog,
 } from './presets/catalog'
+import {
+  getTtmGuide, suggestedGuideForSampleName, ttmMotionSvgPath,
+  UNTRANSCRIBED, TTM_GUIDES,
+  type TtmSampleGuideSelection,
+} from './notation/ttm-guides'
+import {
+  loadWaveform, timelineUnitsToSeconds, waveformDisplayGeometry,
+  WAVEFORM_VIEWBOX_HEIGHT, type WaveformData,
+} from './waveforms/waveform'
+import { sampleColorForName } from './waveforms/sample-color'
 
 const TARGET_UNITS = 32
 const DEFAULT_COMBO_BEATS = 8
 const COMBO_BEAT_OPTIONS = [4, 8, 16, 32] as const
+const AUTO_GENERATE_ROUND_OPTIONS = [1, 2, 4, 8] as const
 const LEGACY_TICKS_PER_BEAT = 16
 const SYNTHETIC_SAMPLE_IDS = new Set(['synthPulse', 'synthBrush', 'synthSilence'])
 const WAV_ACCEPT = '.wav,audio/wav,audio/x-wav'
@@ -49,6 +60,7 @@ type PlaybackTarget =
   | null
 
 type PracticeMode = 'qa' | 'loop'
+type TimelineView = 'waveform' | 'ttm'
 type WorkspaceSection = 'sequence' | 'files' | 'session' | 'samples'
 type PresetSource = 'loading' | 'builtin' | 'custom' | 'demo'
 
@@ -69,6 +81,25 @@ function resolutionForSample(
   resolution: PresetAssetResolution | undefined,
 ): AssetResolution | undefined {
   return resolution?.samplesById.get(sample.id)
+}
+
+type TimelineGuideState = 'suggested' | 'assigned' | 'unassigned' | 'untranscribed'
+
+function timelineGuideForSample(
+  sampleId: string,
+  sampleName: string,
+  annotations: Readonly<Record<string, TtmSampleGuideSelection>>,
+): { guide: ReturnType<typeof getTtmGuide>; state: TimelineGuideState } {
+  if (Object.hasOwn(annotations, sampleId)) {
+    const selected = annotations[sampleId]!
+    if (typeof selected === 'string') return { guide: getTtmGuide(selected), state: 'assigned' }
+    return { guide: null, state: 'untranscribed' }
+  }
+
+  const suggestion = suggestedGuideForSampleName(sampleName)
+  return suggestion
+    ? { guide: getTtmGuide(suggestion), state: 'suggested' }
+    : { guide: null, state: 'unassigned' }
 }
 
 function sampleFileState(
@@ -130,7 +161,7 @@ function legacyFixtureFor(preset: Preset, requestedRawTicks: number) {
 }
 
 function LocalFilePicker({
-  inputId, label, description, accept, multiple = false, directory = false, onChange,
+  inputId, label, description, accept, multiple = false, directory = false, disabled = false, onChange,
 }: {
   inputId: string
   label: string
@@ -138,6 +169,7 @@ function LocalFilePicker({
   accept: string
   multiple?: boolean
   directory?: boolean
+  disabled?: boolean
   onChange: (event: ChangeEvent<HTMLInputElement>) => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
@@ -151,7 +183,7 @@ function LocalFilePicker({
     : {}
 
   return (
-    <label className="file-picker" htmlFor={inputId}>
+    <label className={disabled ? 'file-picker file-picker--disabled' : 'file-picker'} htmlFor={inputId}>
       <span className="file-picker__copy">
         <span className="file-picker__label">{label}</span>
         <span className="file-picker__description">{description}</span>
@@ -165,6 +197,7 @@ function LocalFilePicker({
         accept={accept}
         multiple={multiple || directory}
         aria-label={label}
+        disabled={disabled}
         onChange={onChange}
         {...extraAttributes}
       />
@@ -175,7 +208,7 @@ function LocalFilePicker({
 function LocalImportPanel({
   presetFileName, localFileCount, importMessage, presetError, selectionError,
   builtInCatalog, selectedPresetId, presetSource, isBootstrapLoading, bootstrapError,
-  onBuiltInPresetChange, onRetryBuiltIn, onPresetChange, onFolderChange, onFilesChange,
+  locked, onBuiltInPresetChange, onRetryBuiltIn, onPresetChange, onFolderChange, onFilesChange,
 }: {
   presetFileName: string | null
   localFileCount: number
@@ -187,6 +220,7 @@ function LocalImportPanel({
   presetSource: PresetSource
   isBootstrapLoading: boolean
   bootstrapError: string | null
+  locked: boolean
   onBuiltInPresetChange: (id: string) => void
   onRetryBuiltIn: () => void
   onPresetChange: (event: ChangeEvent<HTMLInputElement>) => void
@@ -207,6 +241,7 @@ function LocalImportPanel({
         <select
           id="quick-preset"
           value={selectedPresetId}
+          disabled={locked || isBootstrapLoading}
           onChange={(event) => onBuiltInPresetChange(event.currentTarget.value)}
           aria-describedby="quick-preset-help"
         >
@@ -220,9 +255,9 @@ function LocalImportPanel({
         <span id="quick-preset-help">Built-ins load their INI and every referenced WAV. Playback stays stopped until loading finishes.</span>
       </div>
       <div className="file-picker-grid">
-        <LocalFilePicker inputId="preset-file" label="Choose INI preset" description="One .ini file" accept=".ini,text/plain" onChange={onPresetChange} />
-        <LocalFilePicker inputId="audio-folder" label="Choose audio folder" description="Folder picker for WAV files" accept={WAV_ACCEPT} directory onChange={onFolderChange} />
-        <LocalFilePicker inputId="audio-files" label="Choose WAV files" description="Multi-file fallback" accept={WAV_ACCEPT} multiple onChange={onFilesChange} />
+        <LocalFilePicker inputId="preset-file" label="Choose INI preset" description="One .ini file" accept=".ini,text/plain" disabled={locked} onChange={onPresetChange} />
+        <LocalFilePicker inputId="audio-folder" label="Choose audio folder" description="Folder picker for WAV files" accept={WAV_ACCEPT} directory disabled={locked} onChange={onFolderChange} />
+        <LocalFilePicker inputId="audio-files" label="Choose WAV files" description="Multi-file fallback" accept={WAV_ACCEPT} multiple disabled={locked} onChange={onFilesChange} />
       </div>
       <div className="import-status">
         <span className="status-led" aria-hidden="true" />
@@ -233,7 +268,7 @@ function LocalImportPanel({
         <span className="import-status__count">{localFileCount} WAV {localFileCount === 1 ? 'file' : 'files'}</span>
       </div>
       {isBootstrapLoading && <p className="inline-status" role="status">Loading the preset and its referenced WAV files. Playback is unavailable until every reference is ready.</p>}
-      {bootstrapError && <div className="inline-error" role="alert"><p>{bootstrapError}</p><button className="button button--small" type="button" onClick={onRetryBuiltIn}>Retry built-in preset</button></div>}
+      {bootstrapError && <div className="inline-error" role="alert"><p>{bootstrapError}</p><button className="button button--small" type="button" disabled={locked} onClick={onRetryBuiltIn}>Retry built-in preset</button></div>}
       {presetError && <p className="inline-error" role="alert">{presetError}</p>}
       {selectionError && <p className="inline-error inline-error--quiet" role="status">{selectionError}</p>}
     </section>
@@ -241,13 +276,19 @@ function LocalImportPanel({
 }
 
 function PracticeCycleControls({
-  mode, largePause, disabled, onModeChange, onLargePauseChange,
+  mode, largePause, disabled, autoGenerate, autoGenerateRounds, autoGenerateHint,
+  onModeChange, onLargePauseChange, onAutoGenerateChange, onAutoGenerateRoundsChange,
 }: {
   mode: PracticeMode
   largePause: boolean
   disabled: boolean
+  autoGenerate: boolean
+  autoGenerateRounds: number
+  autoGenerateHint: string
   onModeChange: (mode: PracticeMode) => void
   onLargePauseChange: (enabled: boolean) => void
+  onAutoGenerateChange: (enabled: boolean) => void
+  onAutoGenerateRoundsChange: (rounds: number) => void
 }) {
   return (
     <div className="practice-cycle-controls" role="group" aria-label="Practice cycle settings">
@@ -262,6 +303,20 @@ function PracticeCycleControls({
           <span><strong>Large pause</strong><small>{largePause ? '1 audio cycle, then 3 silent cycles.' : '1 audio cycle, then 1 silent cycle.'}</small></span>
         </label>
       )}
+      <div className="auto-generation-controls">
+        <label className="auto-generate-toggle">
+          <input type="checkbox" checked={autoGenerate} disabled={disabled} onChange={(event) => onAutoGenerateChange(event.currentTarget.checked)} />
+          <span className="auto-generate-copy"><strong>Auto-generate</strong><small>Prepare a fresh combo after complete practice rounds.</small></span>
+        </label>
+        <label className="auto-generation-rounds" htmlFor="auto-generation-rounds">
+          <span>New combo every</span>
+          <select id="auto-generation-rounds" aria-label="New combo every" value={autoGenerateRounds} disabled={disabled || !autoGenerate} onChange={(event) => onAutoGenerateRoundsChange(Number(event.currentTarget.value))}>
+            {AUTO_GENERATE_ROUND_OPTIONS.map((rounds) => <option key={rounds} value={rounds}>{rounds}</option>)}
+          </select>
+          <span>{autoGenerateRounds === 1 ? 'round' : 'rounds'}</span>
+        </label>
+        <p id="auto-generation-help" className="auto-generation-help" role="status" aria-live="polite">{autoGenerateHint}</p>
+      </div>
     </div>
   )
 }
@@ -279,15 +334,22 @@ function cycleSlotsFor(fixture: Fixture, mode: PracticeMode, largePause: boolean
 }
 
 function SequenceTimeline({
-  fixture, preset, progress, isPlaying, auditionedSampleId, timebase,
+  fixture, preset, assets, progress, isPlaying, auditionedSampleId, timebase, view: requestedView, ttmDebugEnabled, ttmAnnotations, onViewChange,
 }: {
   fixture: Fixture
   preset: Preset
+  assets: ReadonlyMap<string, File>
   progress: number
   isPlaying: boolean
   auditionedSampleId: string | null
   timebase: 'demo' | 'legacy'
+  view: TimelineView
+  ttmDebugEnabled: boolean
+  ttmAnnotations: Readonly<Record<string, TtmSampleGuideSelection>>
+  onViewChange: (view: TimelineView) => void
 }) {
+  const [waveforms, setWaveforms] = useState<ReadonlyMap<string, WaveformData>>(() => new Map())
+  const waveformGeneration = useRef(0)
   const totalUnits = Math.max(fixture.totalUnits, 1)
   const minBoardWidth = Math.max(
     TIMELINE_MIN_BOARD_WIDTH,
@@ -296,22 +358,82 @@ function SequenceTimeline({
   const unitsPerBeat = timebase === 'legacy' ? LEGACY_TICKS_PER_BEAT : 4
   const unitsPerBar = unitsPerBeat * 4
   const unitDescription = timebase === 'legacy' ? 'legacy ticks' : 'sixteenth units'
+  const view: TimelineView = ttmDebugEnabled ? requestedView : 'waveform'
+  const handleViewChange = (nextView: TimelineView) => {
+    if (!ttmDebugEnabled && nextView === 'ttm') return
+    onViewChange(nextView)
+  }
+
+  useEffect(() => {
+    const generation = waveformGeneration.current + 1
+    waveformGeneration.current = generation
+    let cancelled = false
+    setWaveforms(new Map())
+
+    const filesBySample = new Map<string, File>()
+    for (const event of fixture.events) {
+      if (event.silent || event.sampleId === REST_SAMPLE_ID || SYNTHETIC_SAMPLE_IDS.has(event.sampleId)) continue
+      if (filesBySample.has(event.sampleId)) continue
+      const file = assets.get(event.sampleId)
+      if (file) filesBySample.set(event.sampleId, file)
+    }
+
+    const candidates = Array.from(filesBySample)
+    let nextCandidate = 0
+    const worker = async () => {
+      while (!cancelled && waveformGeneration.current === generation) {
+        const candidate = candidates[nextCandidate]
+        nextCandidate += 1
+        if (!candidate) return
+        const [sampleId, file] = candidate
+        const waveform = await loadWaveform(file)
+        if (cancelled || waveformGeneration.current !== generation) return
+        if (waveform) {
+          setWaveforms((current) => {
+            if (cancelled || waveformGeneration.current !== generation) return current
+            const next = new Map(current)
+            next.set(sampleId, waveform)
+            return next
+          })
+        }
+      }
+    }
+    void Promise.all(Array.from({ length: Math.min(3, candidates.length) }, () => worker()))
+
+    return () => {
+      cancelled = true
+    }
+  }, [assets, fixture])
+
   const unitNumbers = Array.from({ length: totalUnits }, (_, index) => index)
   const bars = Array.from({ length: Math.ceil(totalUnits / unitsPerBar) }, (_, index) => {
     const unitsInBar = Math.min(unitsPerBar, totalUnits - index * unitsPerBar)
     return <span className="timeline-bar-label" key={index} style={{ width: (unitsInBar / totalUnits) * 100 + '%' }}>Bar {index + 1}</span>
   })
   const activeSampleIds = new Set(fixture.events.map((event) => event.sampleId))
-  const lanes: Array<{ id: string; name: string; note: string }> = preset.samples.filter((sample) => activeSampleIds.has(sample.id)).map((sample) => ({
-    id: sample.id, name: sample.name,
-    note: sample.silent ? 'silent' : sample.durationUnits + (timebase === 'legacy' ? ' ticks' : ' units'),
-  }))
+  const lanes: Array<{ id: string; name: string; note: string; color: string | null }> = preset.samples.filter((sample) => activeSampleIds.has(sample.id)).map((sample) => {
+    if (view === 'ttm' && !sample.silent) {
+      const resolution = timelineGuideForSample(sample.id, sample.name, ttmAnnotations)
+      const note = resolution.state === 'suggested'
+        ? 'Suggested: ' + resolution.guide?.label
+        : resolution.state === 'assigned'
+          ? 'Guide: ' + (resolution.guide?.label ?? 'Unassigned')
+          : resolution.state === 'untranscribed' ? 'Untranscribed' : 'Unassigned'
+      return { id: sample.id, name: sample.name, note, color: sample.silent ? null : sampleColorForName(sample.name) }
+    }
+    return {
+      id: sample.id,
+      name: sample.name,
+      note: sample.silent ? 'silent' : sample.durationUnits + (timebase === 'legacy' ? ' ticks' : ' units'),
+      color: sample.silent ? null : sampleColorForName(sample.name),
+    }
+  })
   if (fixture.events.some((event) => event.sampleId === REST_SAMPLE_ID)) {
-    lanes.push({ id: REST_SAMPLE_ID, name: 'Rest', note: 'unused time' })
+    lanes.push({ id: REST_SAMPLE_ID, name: 'Rest', note: 'unused time', color: null })
   }
   for (const event of fixture.events) {
     if (!lanes.some((lane) => lane.id === event.sampleId)) {
-      lanes.push({ id: event.sampleId, name: event.sampleId, note: 'event' })
+      lanes.push({ id: event.sampleId, name: event.sampleId, note: 'event', color: event.silent ? null : sampleColorForName(event.sampleId) })
     }
   }
   const eventDescription = fixture.events.map((event, index) => {
@@ -319,7 +441,16 @@ function SequenceTimeline({
     const name = event.sampleId === REST_SAMPLE_ID ? 'Rest' : sample?.name ?? event.sampleId
     const startLabel = timebase === 'legacy' ? 'legacy tick ' : 'sixteenth unit '
     const durationLabel = timebase === 'legacy' ? ' legacy ticks' : ' units'
-    return <li key={event.id}>Event {index + 1}: {name}, starts at {startLabel}{event.startUnits + 1}, lasts {event.durationUnits}{durationLabel}{event.silent ? ', silent' : ''}</li>
+    const guideResolution = sample && !event.silent
+      ? timelineGuideForSample(event.sampleId, sample.name, ttmAnnotations)
+      : null
+    const guideDescription = view === 'ttm' && !event.silent
+      ? guideResolution?.guide
+        ? (guideResolution.state === 'suggested' ? ', suggested illustrative TTM guide: ' : ', illustrative TTM guide: ')
+          + guideResolution.guide.label + ', not an audio transcription'
+        : guideResolution?.state === 'unassigned' ? ', TTM guide: Unassigned (Untranscribed)' : ', TTM guide: Untranscribed'
+      : ''
+    return <li key={event.id}>Event {index + 1}: {name}, starts at {startLabel}{event.startUnits + 1}, lasts {event.durationUnits}{durationLabel}{event.silent ? ', silent' : ''}{guideDescription}</li>
   })
 
   return (
@@ -329,6 +460,12 @@ function SequenceTimeline({
           <strong>Sequence timeline</strong>
           <span>{fixture.totalUnits} {unitDescription} across {Math.ceil(fixture.totalUnits / unitsPerBar)} bars</span>
         </span>
+        <fieldset className="timeline-view-control" aria-label="Timeline view">
+          <legend>View</legend>
+          <label><input type="radio" name="timeline-view" value="waveform" checked={view === 'waveform'} onChange={() => handleViewChange('waveform')} />Waveform</label>
+          <label className={ttmDebugEnabled ? undefined : 'timeline-view-option--disabled'}><input type="radio" name="timeline-view" value="ttm" checked={view === 'ttm'} disabled={!ttmDebugEnabled} aria-describedby={ttmDebugEnabled ? undefined : 'ttm-local-debug-note'} onChange={() => handleViewChange('ttm')} />TTM practice guides</label>
+          {!ttmDebugEnabled && <small className="timeline-debug-note" id="ttm-local-debug-note">Local debug only</small>}
+        </fieldset>
         <span className="timing-readout">{fixture.events.length} events</span>
       </figcaption>
       <div className="timeline-scroll" role="img" tabIndex={0} aria-label={'Sequence timeline: ' + fixture.totalUnits + ' ' + unitDescription + ', ' + fixture.events.length + ' events'}>
@@ -347,16 +484,80 @@ function SequenceTimeline({
             const events = fixture.events.filter((event) => event.sampleId === lane.id)
             return (
               <div className={lane.id === auditionedSampleId ? 'timeline-lane timeline-lane--auditioned' : 'timeline-lane'} key={lane.id}>
-                <span className="timeline-lane-label"><span>{lane.name}</span><small>{lane.note}</small></span>
+                <span className={view === 'ttm' ? 'timeline-lane-label timeline-lane-label--ttm' : 'timeline-lane-label'} style={lane.color ? { '--sample-color': lane.color } as CSSProperties : undefined}>
+                  <span className="timeline-lane-name"><span className={lane.color ? 'timeline-color-swatch' : 'timeline-color-swatch timeline-color-swatch--silent'} aria-hidden="true" /><span className="timeline-lane-name-text">{lane.name}</span></span>
+                  <small>{lane.note}</small>
+                </span>
                 <span className="timeline-track" aria-hidden="true" style={{ gridTemplateColumns: 'repeat(' + totalUnits + ', minmax(8px, 1fr))' }}>
                   {unitNumbers.map((unit) => <span className={unit % unitsPerBeat === 0 ? 'timeline-tick timeline-tick--beat' : 'timeline-tick'} key={unit} />)}
                   {events.map((event) => (
-                    <span
-                      key={event.id}
-                      className={event.silent ? 'sequence-event sequence-event--silent' : 'sequence-event'}
-                      style={{ left: (event.startUnits / totalUnits) * 100 + '%', width: (event.durationUnits / totalUnits) * 100 + '%' }}
-                      title={event.silent ? lane.name + ': silent event' : lane.name + ': ' + event.durationUnits + ' units'}
-                    />
+                    (() => {
+                      const waveform = event.silent ? undefined : waveforms.get(event.sampleId)
+                      const sample = preset.samples.find((candidate) => candidate.id === event.sampleId)
+                      const guideResolution = !event.silent
+                        ? timelineGuideForSample(event.sampleId, sample?.name ?? event.sampleId, ttmAnnotations)
+                        : null
+                      const guide = guideResolution?.guide ?? null
+                      const sampleColor = event.silent ? null : sampleColorForName(sample?.name ?? event.sampleId)
+                      const slotDurationSeconds = timelineUnitsToSeconds(event.durationUnits, preset.bpm, unitsPerBeat)
+                      const geometry = waveform && slotDurationSeconds
+                        ? waveformDisplayGeometry(waveform.durationSeconds, slotDurationSeconds, waveform.peaks.length)
+                        : null
+                      const waveformClass = view === 'waveform' && waveform && geometry ? ' sequence-event--waveform' : ''
+                      const guideClass = view === 'ttm' && !event.silent
+                        ? guide ? ' sequence-event--ttm-guide' : ' sequence-event--ttm-' + guideResolution?.state
+                        : ''
+                      const sampleColorClass = sampleColor ? ' sequence-event--colored' : ''
+                      const guideDescription = guide
+                        ? (guideResolution?.state === 'suggested' ? ' Suggested illustrative TTM guide: ' : ' Illustrative TTM guide: ')
+                          + guide.label + '; not an audio transcription.'
+                        : guideResolution?.state === 'unassigned'
+                          ? ' TTM guide is unassigned (Untranscribed).'
+                          : guideResolution?.state === 'untranscribed' ? ' TTM guide is explicitly set to Untranscribed.' : ''
+
+                      return (
+                        <span
+                          key={event.id}
+                          className={'sequence-event' + (event.silent ? ' sequence-event--silent' : '') + sampleColorClass + waveformClass + guideClass}
+                          style={{ ...(sampleColor ? { '--sample-color': sampleColor } : {}), left: (event.startUnits / totalUnits) * 100 + '%', width: (event.durationUnits / totalUnits) * 100 + '%' } as CSSProperties}
+                          title={event.silent ? lane.name + ': silent event' : lane.name + ': ' + event.durationUnits + ' units' + guideDescription}
+                        >
+                          {view === 'waveform' && waveform && geometry && (
+                            <svg
+                              className="sequence-waveform"
+                              aria-hidden="true"
+                              preserveAspectRatio="none"
+                              viewBox={'0 0 ' + geometry.viewBoxWidth + ' ' + WAVEFORM_VIEWBOX_HEIGHT}
+                              style={{ width: geometry.widthPercent + '%' }}
+                            >
+                              <line x1="0" y1={WAVEFORM_VIEWBOX_HEIGHT / 2} x2={waveform.peaks.length} y2={WAVEFORM_VIEWBOX_HEIGHT / 2} />
+                              <path d={waveform.path} />
+                            </svg>
+                          )}
+                          {view === 'ttm' && guide && (
+                            <>
+                              <svg className="sequence-ttm-motion" aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 100 100">
+                                <path d={ttmMotionSvgPath(guide.motion)} />
+                              </svg>
+                              <span className="sequence-ttm-fader" aria-hidden="true">
+                                {guide.faderIntervals.map((interval, index) => (
+                                  <span
+                                    className={'sequence-ttm-fader__interval sequence-ttm-fader__interval--' + interval.state}
+                                    key={guide.id + '-fader-' + index}
+                                    style={{ left: interval.start * 100 + '%', width: (interval.end - interval.start) * 100 + '%' }}
+                                  />
+                                ))}
+                              </span>
+                            </>
+                          )}
+                          {view === 'ttm' && !event.silent && !guide && (
+                            <span className="sequence-ttm-placeholder-mark" aria-hidden="true">
+                              {guideResolution?.state === 'untranscribed' ? '—' : '?'}
+                            </span>
+                          )}
+                        </span>
+                      )
+                    })()
                   ))}
                   {isPlaying && <span className="timeline-playhead" style={{ left: Math.min(Math.max(progress, 0), 1) * 100 + '%' }} />}
                 </span>
@@ -365,6 +566,7 @@ function SequenceTimeline({
           })}
         </div>
       </div>
+      {view === 'ttm' && <p className="timeline-guide-note">TTM practice guides are illustrative examples, not WAV transcriptions. Exact Baby/Baby(F)/Baby(R) labels only suggest a guide; unassigned rows are marked. <a href="#sample-section">Edit a sample</a> to assign another guide or choose Untranscribed. Record motion: forward ↑, backward ↓; the bottom strip shows the fader open or closed.</p>}
       <ol className="visually-hidden" aria-label="Sequence events">{eventDescription}</ol>
     </figure>
   )
@@ -394,12 +596,16 @@ function DiagnosticList({ diagnostics }: { diagnostics: AssetDiagnostic[] }) {
 }
 
 function SampleEditor({
-  sample, draft, disabled, onDraftChange, onSave, onCancel,
+  sample, draft, disabled, ttmDebugEnabled, ttmGuide, ttmGuideIsExplicit, onDraftChange, onTtmGuideChange, onSave, onCancel,
 }: {
   sample: SampleDefinition
   draft: SampleDefinition
   disabled: boolean
+  ttmDebugEnabled: boolean
+  ttmGuide: TtmSampleGuideSelection
+  ttmGuideIsExplicit: boolean
   onDraftChange: (next: SampleDefinition) => void
+  onTtmGuideChange: (selection: string) => void
   onSave: () => void
   onCancel: () => void
 }) {
@@ -409,6 +615,17 @@ function SampleEditor({
   const setNumeric = (field: 'durationUnits' | 'weight' | 'maxRepeat', raw: string) => {
     onDraftChange({ ...draft, [field]: raw === '' ? Number.NaN : Number(raw) })
   }
+  const suggestedGuide = suggestedGuideForSampleName(sample.name)
+  const selectedGuideId = typeof ttmGuide === 'string'
+    ? ttmGuide
+    : !ttmGuideIsExplicit && suggestedGuide ? suggestedGuide : UNTRANSCRIBED.kind
+  const guideHelperText = !ttmGuideIsExplicit && suggestedGuide
+    ? 'Suggested from the exact sample label only: ' + TTM_GUIDES[suggestedGuide].label + '. Choose a guide or Untranscribed; no audio is analyzed.'
+    : !ttmGuideIsExplicit
+      ? 'No guide is assigned. Choose an illustrative guide or leave this sample Untranscribed.'
+      : typeof ttmGuide !== 'string'
+        ? 'Explicitly Untranscribed for this session. Choose a guide to add an illustrative pattern.'
+        : 'Session-only illustrative guide; this does not change audio or INI data.'
   return (
     <form className="sample-editor" aria-label={'Edit ' + sample.name} noValidate onSubmit={(event) => { event.preventDefault(); onSave() }}>
       <div className="sample-editor__heading">
@@ -451,9 +668,17 @@ function SampleEditor({
           <input id="sample-use" type="checkbox" checked={draft.enabled || draft.silent} disabled={disabled || draft.silent} onChange={(event) => onDraftChange({ ...draft, enabled: event.currentTarget.checked })} />
           <span>{draft.silent ? 'Use sample · always included (silent)' : 'Use sample'}</span>
         </label>
+        {ttmDebugEnabled && <label className="sample-editor__field sample-editor__field--guide" htmlFor="sample-ttm-guide">
+          <span>TTM guide</span>
+          <select id="sample-ttm-guide" aria-label={'TTM guide for ' + sample.name} value={selectedGuideId} disabled={disabled} onChange={(event) => onTtmGuideChange(event.currentTarget.value)}>
+            <option value={UNTRANSCRIBED.kind}>{!ttmGuideIsExplicit && !suggestedGuide ? 'Unassigned · Untranscribed' : 'Untranscribed'}</option>
+            {Object.values(TTM_GUIDES).map((guide) => <option key={guide.id} value={guide.id}>{!ttmGuideIsExplicit && suggestedGuide === guide.id ? 'Suggested: ' : ''}{guide.label}</option>)}
+          </select>
+          <small>{guideHelperText}</small>
+        </label>}
       </div>
       <div className="sample-editor__actions">
-        <button className="button button--small" type="button" onClick={onCancel}>Cancel</button>
+        <button className="button button--small" type="button" disabled={disabled} onClick={onCancel}>Cancel</button>
         <button className="button button--small button--primary" type="submit" disabled={disabled}>Save sample changes</button>
       </div>
     </form>
@@ -461,8 +686,8 @@ function SampleEditor({
 }
 
 function SampleTable({
-  preset, resolution, actionsDisabled, legacyMode, sourceAvailable, editingSample, saveError, isSavingData,
-  onToggle, onPreview, onEdit, onDraftChange, onSaveEdit, onCancelEdit, onSaveData,
+  preset, resolution, actionsDisabled, legacyMode, sourceAvailable, editingSample, saveError, isSavingData, ttmDebugEnabled,
+  ttmAnnotations, onTtmGuideChange, onToggle, onPreview, onEdit, onDraftChange, onSaveEdit, onCancelEdit, onSaveData,
 }: {
   preset: Preset
   resolution: PresetAssetResolution | undefined
@@ -472,6 +697,9 @@ function SampleTable({
   editingSample: SampleDefinition | null
   saveError: string | null
   isSavingData: boolean
+  ttmDebugEnabled: boolean
+  ttmAnnotations: Readonly<Record<string, TtmSampleGuideSelection>>
+  onTtmGuideChange: (sampleId: string, selection: string) => void
   onToggle: (sample: SampleDefinition, enabled: boolean) => void
   onPreview: (sample: SampleDefinition) => void
   onEdit: (sample: SampleDefinition) => void
@@ -492,7 +720,18 @@ function SampleTable({
           <span className="sample-count">{preset.samples.length} {preset.samples.length === 1 ? 'sample' : 'samples'}</span>
         </div>
       </div>
-      {editingSample && <SampleEditor sample={preset.samples.find((sample) => sample.id === editingSample.id) ?? editingSample} draft={editingSample} disabled={actionsDisabled} onDraftChange={onDraftChange} onSave={onSaveEdit} onCancel={onCancelEdit} />}
+      {editingSample && <SampleEditor
+        sample={preset.samples.find((sample) => sample.id === editingSample.id) ?? editingSample}
+        draft={editingSample}
+        disabled={actionsDisabled}
+        ttmDebugEnabled={ttmDebugEnabled}
+        ttmGuide={ttmAnnotations[editingSample.id] ?? UNTRANSCRIBED}
+        ttmGuideIsExplicit={Object.hasOwn(ttmAnnotations, editingSample.id)}
+        onDraftChange={onDraftChange}
+        onTtmGuideChange={(selection) => { if (ttmDebugEnabled) onTtmGuideChange(editingSample.id, selection) }}
+        onSave={onSaveEdit}
+        onCancel={onCancelEdit}
+      />}
       {saveError && <p className="inline-error" role="alert">{saveError}</p>}
       <div
         className="sample-table-scroll"
@@ -548,14 +787,24 @@ function SampleTable({
 }
 
 export default function App() {
+  const ttmDebugEnabled = import.meta.env.DEV
   const [transport] = useState(() => new AudioTransport())
   const transportSnapshot = useSyncExternalStore(transport.subscribe, transport.getSnapshot, transport.getSnapshot)
+  const isPlaybackLocked = transportSnapshot.status === 'loading' || transportSnapshot.status === 'playing'
+  const isPlaybackLockedNow = () => {
+    const status = transport.getSnapshot().status
+    return status === 'loading' || status === 'playing'
+  }
   const [preset, setPreset] = useState<Preset>(DEMO_PRESET)
   const [fixture, setFixture] = useState<Fixture | null>(null)
   const [timebase, setTimebase] = useState<'demo' | 'legacy'>('demo')
+  const [timelineView, setTimelineView] = useState<TimelineView>('waveform')
+  const [ttmAnnotations, setTtmAnnotations] = useState<Record<string, TtmSampleGuideSelection>>({})
   const [comboBeats, setComboBeats] = useState<number>(DEFAULT_COMBO_BEATS)
   const [practiceMode, setPracticeMode] = useState<PracticeMode>('qa')
   const [largePause, setLargePause] = useState(false)
+  const [autoGenerate, setAutoGenerate] = useState(false)
+  const [autoGenerateRounds, setAutoGenerateRounds] = useState<number>(2)
   const [omittedZeroDurationCount, setOmittedZeroDurationCount] = useState(0)
   const [presetFileName, setPresetFileName] = useState<string | null>(null)
   const [sourceIniText, setSourceIniText] = useState<string | null>(null)
@@ -593,6 +842,7 @@ export default function App() {
   const builtInCatalogRef = useRef<BuiltInPresetCatalog | undefined>(undefined)
   const customWavFilesRef = useRef<File[]>([])
   const lifecycleGeneration = useRef(0)
+  const autoGenerateGeneration = useRef(0)
   const sourceControlDefaultsRef = useRef({
     bpm: DEMO_PRESET.bpm,
     sampleVolume: DEMO_PRESET.sampleVolume,
@@ -602,11 +852,39 @@ export default function App() {
   const selectedBeatResolution = selectedBeatIndex === 'none' ? undefined : assetResolution?.beats[Number(selectedBeatIndex)]
   const selectedBeatFile = selectedBeatResolution?.status === 'resolved' ? selectedBeatResolution.file : undefined
   const diagnostics = assetResolution?.diagnostics ?? []
+  const autoGenerateSampleIds = preset.samples
+    .filter((sample) => sample.enabled && !sample.silent && sample.weight > 0)
+    .map((sample) => sample.id)
+  const autoGenerateMissingSampleNames = autoGenerateSampleIds
+    .filter((sampleId) => !sampleAssets.has(sampleId))
+    .map((sampleId) => preset.samples.find((sample) => sample.id === sampleId)?.name ?? sampleId)
+  const autoGenerateBlocked = autoGenerate && autoGenerateMissingSampleNames.length > 0
+  const practiceRoundDescription = practiceMode === 'loop'
+    ? 'One round is one complete Loop pass.'
+    : 'One round is the question plus its full answer window (' + (largePause ? '3 silent cycles' : '1 silent cycle') + ').'
+  const autoGenerateHint = !autoGenerate
+    ? 'Off. ' + practiceRoundDescription + ' Turn it on to prepare a new combo after ' + autoGenerateRounds + ' ' + (autoGenerateRounds === 1 ? 'round.' : 'rounds.')
+    : autoGenerateMissingSampleNames.length > 0
+      ? 'Resolve local WAV files for every enabled, non-silent sample with positive weight: ' + autoGenerateMissingSampleNames.join(', ') + '.'
+      : autoGenerateSampleIds.length === 0
+        ? practiceRoundDescription + ' No audible samples need preloading; the preset’s silent-sample rules still apply.'
+        : practiceRoundDescription + ' The next combo starts after ' + autoGenerateRounds + ' ' + (autoGenerateRounds === 1 ? 'round.' : 'rounds.')
   const cycleSlotCount = playbackTarget?.kind === 'sequence' && presetFileName
     ? practiceMode === 'loop' ? 1 : largePause ? 4 : 2
     : 1
 
+  const invalidateAutoGeneration = () => {
+    autoGenerateGeneration.current += 1
+  }
+
+  const resetAutoGeneration = () => {
+    invalidateAutoGeneration()
+    setAutoGenerate(false)
+  }
+
   const startBuiltInPresetLoad = (presetId: string) => {
+    resetAutoGeneration()
+    setTtmAnnotations({})
     const generation = ++presetImportGeneration.current
     activePresetLoadRef.current?.abort()
     const controller = new AbortController()
@@ -707,6 +985,8 @@ export default function App() {
   }
 
   const selectDemoPreset = () => {
+    resetAutoGeneration()
+    setTtmAnnotations({})
     ++presetImportGeneration.current
     activePresetLoadRef.current?.abort()
     activePresetLoadRef.current = undefined
@@ -750,6 +1030,8 @@ export default function App() {
   }
 
   const selectCustomFiles = () => {
+    resetAutoGeneration()
+    setTtmAnnotations({})
     ++presetImportGeneration.current
     activePresetLoadRef.current?.abort()
     activePresetLoadRef.current = undefined
@@ -789,6 +1071,7 @@ export default function App() {
   useEffect(() => {
     const generation = ++lifecycleGeneration.current
     const stopOnPageHide = (event: PageTransitionEvent) => {
+      autoGenerateGeneration.current += 1
       if (event.persisted) transport.stop()
       else transport.dispose()
     }
@@ -864,12 +1147,15 @@ export default function App() {
         const iteration = transportSnapshot.cycleIteration ?? 1
         const slotIndex = transportSnapshot.cycleSlotIndex ?? 0
         const cycleNumber = ((iteration - 1) * cycleSlotCount) + slotIndex + 1
+        const planPrefix = transportSnapshot.cyclePlanIndex === undefined
+          ? ''
+          : 'Auto-generate · combo ' + transportSnapshot.cyclePlanIndex + ' · '
         if (practiceMode === 'loop') {
-          setTransportNote('Loop · combo cycle ' + cycleNumber + '.')
+          setTransportNote(planPrefix + 'Loop · combo cycle ' + cycleNumber + '.')
         } else {
-          setTransportNote(transportSnapshot.cycleSlotKind === 'fixture'
+          setTransportNote(planPrefix + (transportSnapshot.cycleSlotKind === 'fixture'
             ? 'Q&A · question playback · cycle ' + cycleNumber + '.'
-            : 'Q&A · answer pause · cycle ' + cycleNumber + '.')
+            : 'Q&A · answer pause · cycle ' + cycleNumber + '.'))
         }
       } else {
         setTransportNote('Playing sequence.')
@@ -880,14 +1166,16 @@ export default function App() {
       setPlaybackTarget(null)
     }
     if (transportSnapshot.status === 'error') setTransportNote(transportSnapshot.error ?? 'Playback could not start.')
-  }, [transportSnapshot.status, transportSnapshot.error, transportSnapshot.cycleSlotKind, transportSnapshot.cycleSlotIndex, transportSnapshot.cycleIteration, playbackTarget, practiceMode, cycleSlotCount])
+  }, [transportSnapshot.status, transportSnapshot.error, transportSnapshot.cycleSlotKind, transportSnapshot.cycleSlotIndex, transportSnapshot.cycleIteration, transportSnapshot.cyclePlanIndex, playbackTarget, practiceMode, cycleSlotCount])
 
   const handlePresetChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0]
     event.currentTarget.value = ''
-    if (!file) return
+    if (!file || isPlaybackLockedNow()) return
 
     const generation = ++presetImportGeneration.current
+    resetAutoGeneration()
+    setTtmAnnotations({})
     activePresetLoadRef.current?.abort()
     activePresetLoadRef.current = undefined
     presetSourceRef.current = 'custom'
@@ -968,7 +1256,7 @@ export default function App() {
     const input = event.currentTarget
     const chosenFiles = Array.from(input.files ?? [])
     input.value = ''
-    if (chosenFiles.length === 0) return
+    if (chosenFiles.length === 0 || isPlaybackLockedNow()) return
 
     const wavFiles = chosenFiles.filter((file) => file.name.toLowerCase().endsWith('.wav'))
     const ignoredCount = chosenFiles.length - wavFiles.length
@@ -988,6 +1276,7 @@ export default function App() {
       setAssetIndex(nextIndex)
       transport.resetAssets()
       transport.stop()
+      invalidateAutoGeneration()
       setPlaybackTarget(null)
       setFixture(null)
       setOmittedZeroDurationCount(0)
@@ -1011,6 +1300,7 @@ export default function App() {
   }
 
   const handleBuiltInPresetChange = (presetId: string) => {
+    if (isPlaybackLockedNow()) return
     if (presetId === 'demo') {
       selectDemoPreset()
       return
@@ -1023,6 +1313,7 @@ export default function App() {
   }
 
   const handleRetryBuiltIn = () => {
+    if (isPlaybackLockedNow()) return
     startBuiltInPresetLoad(selectedPresetId === 'demo' || selectedPresetId === 'custom'
       ? DEFAULT_BUILTIN_PRESET_ID
       : selectedPresetId)
@@ -1070,17 +1361,21 @@ export default function App() {
   }
 
   const handleBeatSelectionChange = (value: string) => {
-    if (value === selectedBeatIndex) return
-    if (transportSnapshot.status === 'playing' || transportSnapshot.status === 'loading') {
-      transport.stop()
-      setPlaybackTarget(null)
-      setTransportNote('Playback stopped. Beat selection changed; play again to hear it.')
-    }
+    if (isPlaybackLockedNow() || value === selectedBeatIndex) return
     setSelectedBeatIndex(value)
   }
 
+  const handleTtmGuideChange = (sampleId: string, selection: string) => {
+    if (!import.meta.env.DEV || isPlaybackLockedNow()) return
+    const nextSelection: TtmSampleGuideSelection = selection === UNTRANSCRIBED.kind
+      ? UNTRANSCRIBED
+      : getTtmGuide(selection)?.id ?? UNTRANSCRIBED
+    setTtmAnnotations((current) => ({ ...current, [sampleId]: nextSelection }))
+  }
+
   const handleToggle = (sample: SampleDefinition, enabled: boolean) => {
-    if (sample.silent) return
+    if (sample.silent || isPlaybackLockedNow()) return
+    invalidateAutoGeneration()
     transport.stop()
     setPlaybackTarget(null)
     setFixture(null)
@@ -1094,16 +1389,18 @@ export default function App() {
   }
 
   const handleEditSample = (sample: SampleDefinition) => {
+    if (isPlaybackLockedNow()) return
     setSaveIniError(null)
     setEditingSample({ ...sample })
   }
 
   const handleSampleDraftChange = (sample: SampleDefinition) => {
+    if (isPlaybackLockedNow()) return
     setEditingSample(sample)
   }
 
   const handleSaveSampleEdit = () => {
-    if (!sourceIniText || !editingSample) return
+    if (!sourceIniText || !editingSample || isPlaybackLockedNow()) return
     try {
       const nextPreset: Preset = {
         ...preset,
@@ -1112,6 +1409,7 @@ export default function App() {
         samples: preset.samples.map((sample) => sample.id === editingSample.id ? editingSample : sample),
       }
       const checked = patchLegacyIniText(sourceIniText, nextPreset)
+      invalidateAutoGeneration()
       transport.stop()
       setPlaybackTarget(null)
       setPreset({ ...checked.preset, sampleVolume: sourceControlDefaultsRef.current.sampleVolume, beatVolume: sourceControlDefaultsRef.current.beatVolume })
@@ -1127,7 +1425,7 @@ export default function App() {
   }
 
   const handleSaveSampleData = async () => {
-    if (!sourceIniText || isSavingIni || editingSample) return
+    if (!sourceIniText || isSavingIni || editingSample || isPlaybackLockedNow()) return
     const saveGeneration = presetImportGeneration.current
     setIsSavingIni(true)
     setSaveIniError(null)
@@ -1188,7 +1486,8 @@ export default function App() {
   }
 
   const handleBuildPreview = () => {
-    if (!isPresetReady || isReadingPreset || isGenerating) return
+    if (!isPresetReady || isReadingPreset || isGenerating || isPlaybackLockedNow()) return
+    invalidateAutoGeneration()
     transport.stop()
     setPlaybackTarget(null)
     setActionError(null)
@@ -1223,7 +1522,8 @@ export default function App() {
 
   const handleComboLengthChange = (value: string) => {
     const nextBeats = Number(value)
-    if (!COMBO_BEAT_OPTIONS.includes(nextBeats as (typeof COMBO_BEAT_OPTIONS)[number])) return
+    if (isPlaybackLockedNow() || !COMBO_BEAT_OPTIONS.includes(nextBeats as (typeof COMBO_BEAT_OPTIONS)[number])) return
+    invalidateAutoGeneration()
     transport.stop()
     setPlaybackTarget(null)
     setFixture(null)
@@ -1234,7 +1534,8 @@ export default function App() {
   }
 
   const handlePracticeModeChange = (mode: PracticeMode) => {
-    if (mode === practiceMode) return
+    if (isPlaybackLockedNow() || mode === practiceMode) return
+    invalidateAutoGeneration()
     transport.stop()
     setPlaybackTarget(null)
     setActionError(null)
@@ -1243,7 +1544,8 @@ export default function App() {
   }
 
   const handleLargePauseChange = (enabled: boolean) => {
-    if (enabled === largePause) return
+    if (isPlaybackLockedNow() || enabled === largePause) return
+    invalidateAutoGeneration()
     transport.stop()
     setPlaybackTarget(null)
     setActionError(null)
@@ -1251,8 +1553,29 @@ export default function App() {
     setTransportNote(enabled ? 'Large pause enabled. One audio cycle is followed by three silent cycles.' : 'Large pause disabled. One audio cycle is followed by one silent cycle.')
   }
 
+  const handleAutoGenerateChange = (enabled: boolean) => {
+    if (isPlaybackLockedNow() || enabled === autoGenerate) return
+    invalidateAutoGeneration()
+    transport.stop()
+    setPlaybackTarget(null)
+    setActionError(null)
+    setAutoGenerate(enabled)
+    setTransportNote(enabled ? 'Auto-generate enabled. Play the sequence to start.' : 'Auto-generate disabled. The current combo will keep repeating until stopped.')
+  }
+
+  const handleAutoGenerateRoundsChange = (rounds: number) => {
+    if (isPlaybackLockedNow() || !AUTO_GENERATE_ROUND_OPTIONS.includes(rounds as (typeof AUTO_GENERATE_ROUND_OPTIONS)[number])) return
+    if (rounds === autoGenerateRounds) return
+    invalidateAutoGeneration()
+    transport.stop()
+    setPlaybackTarget(null)
+    setActionError(null)
+    setAutoGenerateRounds(rounds)
+    setTransportNote('Auto-generate will prepare a new combo after ' + rounds + ' complete practice ' + (rounds === 1 ? 'round.' : 'rounds.'))
+  }
+
   const startPlayback = (playFixture: Fixture, target: PlaybackTarget, includeBeat: boolean) => {
-    if (!isPresetReady || isReadingPreset || isGenerating) return
+    if (!isPresetReady || isReadingPreset || isGenerating || isPlaybackLockedNow()) return
     const bpmValue = Number(bpm)
     const minBpm = Math.max(1, preset.bpm * 0.5)
     const maxBpm = Math.max(minBpm, preset.bpm * 2)
@@ -1261,6 +1584,7 @@ export default function App() {
       setTransportNote('Playback needs a valid BPM value.')
       return
     }
+    invalidateAutoGeneration()
     setActionError(null)
     setPlaybackTarget(target)
     const options = {
@@ -1274,6 +1598,39 @@ export default function App() {
       ...(includeBeat && selectedBeatFile ? { beatFile: selectedBeatFile } : {}),
     }
     if (target?.kind === 'sequence' && presetFileName) {
+      if (autoGenerate) {
+        const generation = autoGenerateGeneration.current
+        const generatedByPlan = new Map<number, ReturnType<typeof legacyFixtureFor>>()
+        const nextPlan: NonNullable<CyclePlanOptions['nextPlan']> = ({ nextPlanIndex }) => {
+          if (autoGenerateGeneration.current !== generation) {
+            throw new Error('This Auto-generate run was replaced before the next combo was ready.')
+          }
+          const generated = legacyFixtureFor(preset, comboBeats * LEGACY_TICKS_PER_BEAT)
+          generatedByPlan.set(nextPlanIndex, generated)
+          return { slots: cycleSlotsFor(generated.fixture, practiceMode, largePause) }
+        }
+        const onPlanBoundary: NonNullable<CyclePlanOptions['onPlanBoundary']> = (boundary) => {
+          if (autoGenerateGeneration.current !== generation) return
+          const activeFixture = boundary.plan.slots.find((slot) => slot.kind === 'fixture')
+          if (!activeFixture || activeFixture.kind !== 'fixture') return
+          setFixture(activeFixture.fixture)
+          const generated = generatedByPlan.get(boundary.planIndex)
+          if (generated) {
+            setOmittedZeroDurationCount(generated.zeroDurationCount)
+            generatedByPlan.delete(boundary.planIndex)
+          }
+        }
+        const cyclePlanOptions: CyclePlanOptions = {
+          ...options,
+          slots: cycleSlotsFor(playFixture, practiceMode, largePause),
+          cyclesPerPlan: autoGenerateRounds,
+          nextPlan,
+          onPlanBoundary,
+          preloadSampleIds: autoGenerateSampleIds,
+        }
+        void transport.playCyclePlan(cyclePlanOptions)
+        return
+      }
       void transport.playCyclePlan({
         ...options,
         slots: cycleSlotsFor(playFixture, practiceMode, largePause),
@@ -1285,7 +1642,7 @@ export default function App() {
   }
 
   const handleSamplePreview = (sample: SampleDefinition) => {
-    if (!isPresetReady || isReadingPreset || isGenerating) return
+    if (!isPresetReady || isReadingPreset || isGenerating || isPlaybackLockedNow()) return
     if (sample.silent) {
       setActionError(sample.name + ' is marked silent and has no audio preview.')
       return
@@ -1305,7 +1662,13 @@ export default function App() {
   }
 
   const handlePlaySequence = () => {
-    if (!fixture || !isPresetReady) return
+    if (!fixture || !isPresetReady || isPlaybackLockedNow()) return
+    if (autoGenerateBlocked) {
+      const message = 'Auto-generate needs local WAV files for: ' + autoGenerateMissingSampleNames.join(', ') + '.'
+      setActionError(message)
+      setTransportNote('Auto-generate cannot preload every eligible sample yet.')
+      return
+    }
     if (presetFileName) {
       const unresolvedNames = [...new Set(fixture.events
         .filter((item) => !item.silent && !SYNTHETIC_SAMPLE_IDS.has(item.sampleId))
@@ -1324,13 +1687,14 @@ export default function App() {
     startPlayback(fixture, { kind: 'sequence' }, true)
   }
   const handleStop = () => {
+    invalidateAutoGeneration()
     transport.stop()
     setPlaybackTarget(null)
     setActionError(null)
     setTransportNote('Playback stopped.')
   }
 
-  const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating
+  const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating || isPlaybackLocked || autoGenerateBlocked
   const stopDisabled = transportSnapshot.status !== 'playing' && transportSnapshot.status !== 'loading'
   const isSequencePlaying = playbackTarget?.kind === 'sequence' && transportSnapshot.status === 'playing'
   const progressPercent = transportSnapshot.status === 'completed' ? 1 : Math.max(0, Math.min(1, transportSnapshot.progress))
@@ -1369,12 +1733,12 @@ export default function App() {
               {isImportedPreset && (
                 <label className="combo-length-control" htmlFor="combo-length">
                   <span>Combo length</span>
-                  <select id="combo-length" value={comboBeats} onChange={(event) => handleComboLengthChange(event.currentTarget.value)} disabled={!isPresetReady || isReadingPreset || isGenerating}>
+                  <select id="combo-length" value={comboBeats} onChange={(event) => handleComboLengthChange(event.currentTarget.value)} disabled={!isPresetReady || isReadingPreset || isGenerating || isPlaybackLocked}>
                     {COMBO_BEAT_OPTIONS.map((beats) => <option key={beats} value={beats}>{beats} Beats</option>)}
                   </select>
                 </label>
               )}
-              <button className="button button--primary" type="button" onClick={handleBuildPreview} disabled={!isPresetReady || isReadingPreset || isGenerating}>
+              <button className="button button--primary" type="button" onClick={handleBuildPreview} disabled={!isPresetReady || isReadingPreset || isGenerating || isPlaybackLocked}>
                 {isGenerating ? 'Generating…' : isImportedPreset ? 'Generate combo' : 'Build preview'}
               </button>
             </div>
@@ -1383,19 +1747,30 @@ export default function App() {
             <PracticeCycleControls
               mode={practiceMode}
               largePause={largePause}
-              disabled={isReadingPreset || isGenerating}
+              disabled={isReadingPreset || isGenerating || isPlaybackLocked}
+              autoGenerate={autoGenerate}
+              autoGenerateRounds={autoGenerateRounds}
+              autoGenerateHint={autoGenerateHint}
               onModeChange={handlePracticeModeChange}
               onLargePauseChange={handleLargePauseChange}
+              onAutoGenerateChange={handleAutoGenerateChange}
+              onAutoGenerateRoundsChange={handleAutoGenerateRoundsChange}
             />
           )}
+          {isPlaybackLocked && <p className="playback-lock-note" role="status">Stop playback to change combo options or sample settings.</p>}
           {fixture
             ? <SequenceTimeline
                 fixture={fixture}
                 preset={preset}
+                assets={sampleAssets}
                 progress={timelineProgressPercent}
                 isPlaying={isSequencePlaying}
                 auditionedSampleId={playbackTarget?.kind === 'sample' ? playbackTarget.sampleId : null}
                 timebase={timebase}
+                view={timelineView}
+                ttmDebugEnabled={ttmDebugEnabled}
+                ttmAnnotations={ttmAnnotations}
+                onViewChange={setTimelineView}
               />
             : <div className="sequence-empty" role="status" aria-live="polite">
                 <strong>{isBootstrapLoading ? 'Loading built-in preset' : isReadingPreset ? 'Reading preset' : !isPresetReady ? 'Preset is not ready' : isImportedPreset ? 'Generate a combo to preview the sequence' : 'Build a preview to see the sequence'}</strong>
@@ -1426,6 +1801,7 @@ export default function App() {
         </section>
 
         <LocalImportPanel
+          locked={isPlaybackLocked}
           presetFileName={presetFileName}
           localFileCount={activeWavCount}
           importMessage={importMessage}
@@ -1454,6 +1830,7 @@ export default function App() {
           beatResolutions={assetResolution?.beats}
           selectedBeatIndex={selectedBeatIndex}
           disabled={!isPresetReady || isReadingPreset || isGenerating || isSavingIni}
+          beatSelectionDisabled={isPlaybackLocked}
           onBpmChange={handleBpmChange}
           onPitchChange={handlePitchChange}
           onSampleVolumeChange={handleSampleVolumeChange}
@@ -1466,18 +1843,21 @@ export default function App() {
           ? <SampleTable
               preset={preset}
               resolution={assetResolution}
-              actionsDisabled={isReadingPreset || isGenerating || isSavingIni}
+              actionsDisabled={isReadingPreset || isGenerating || isSavingIni || isPlaybackLocked}
               legacyMode={isImportedPreset}
               sourceAvailable={sourceIniText !== null}
               editingSample={editingSample}
+              ttmDebugEnabled={ttmDebugEnabled}
+              ttmAnnotations={ttmAnnotations}
               saveError={saveIniError}
               isSavingData={isSavingIni}
               onToggle={handleToggle}
+              onTtmGuideChange={handleTtmGuideChange}
               onPreview={handleSamplePreview}
               onEdit={handleEditSample}
               onDraftChange={handleSampleDraftChange}
               onSaveEdit={handleSaveSampleEdit}
-              onCancelEdit={() => { setEditingSample(null); setSaveIniError(null) }}
+              onCancelEdit={() => { if (!isPlaybackLockedNow()) { setEditingSample(null); setSaveIniError(null) } }}
               onSaveData={() => { void handleSaveSampleData() }}
             />
           : <section id="sample-section" className="workspace-section sample-section" aria-labelledby="samples-heading"><div className="section-heading"><div><h2 id="samples-heading">Sample settings</h2><p>Sample rows appear after the selected preset and its files are ready.</p></div></div></section>}

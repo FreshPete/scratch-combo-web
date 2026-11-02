@@ -1,7 +1,12 @@
 export { AudioTransport } from "./AudioTransport";
 export type {
   AudioTransportOptions,
+  CyclePlanBoundary,
+  CyclePlanBoundaryHandler,
+  CyclePlanDefinition,
   CyclePlanOptions,
+  CyclePlanProvider,
+  CyclePlanRequest,
   PlayOptions,
   TransportSnapshot,
   TransportStatus,

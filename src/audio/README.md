@@ -13,3 +13,11 @@ SoundTouch uses 128-frame render blocks and WSOLA windows that default to 50–1
 ## Browser verification
 
 `e2e/audio-processing.spec.ts` renders tones through the real bundled AudioWorklet in Edge. It verifies an 85→100 BPM rate change while pitch stays at 440 Hz, a later +3 semitone change to approximately 523 Hz, separate sample/beat gain levels, continuous output around both parameter transitions, and the expected 1.7/(100/85) second processed duration. A short finite source also ends at its expected rate-scaled duration in that browser render; this supports the transport's current finite completion point without claiming a universal worklet latency. Run it with `npm run test:e2e -- --grep "browser worklet"`.
+
+## Auto-generate cycle plans
+
+`playCyclePlan()` stays on its initial ordered slot plan unless given both `cyclesPerPlan` and a synchronous `nextPlan({ completedRounds, nextPlanIndex })` provider. The provider may return a new `{ slots }` plan after each full plan has played for the selected 1, 2, 4, or 8 complete rounds. The scheduler requests it as the last round approaches, but updates `cyclePlanIndex` and calls `onPlanBoundary` only when the new plan activates at the boundary. A provider failure lets the current full rounds finish, then stops with an error. The beat source and tempo/pitch settings remain active across plan changes.
+
+If an Auto-generate scheduler tick wakes too far behind to catch up safely, it stops after at most 64 cycle advances in that tick and reports an error. Press Play to restart from the current combo; it does not attempt an unbounded burst of generated plans or sample events.
+
+Pass eligible future sample ids in `preloadSampleIds`; those files are decoded before playback with a four-file concurrency limit. A generated plan that references an id that was not already loaded or preloaded fails at its boundary. With no provider, existing cycle-plan playback keeps repeating the same plan until Stop.

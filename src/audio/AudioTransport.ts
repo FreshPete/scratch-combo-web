@@ -22,6 +22,8 @@ export interface TransportSnapshot {
   readonly cycleIteration?: number;
   /** Current slot type, present only during cycle-plan playback. */
   readonly cycleSlotKind?: CycleSlot["kind"];
+  /** One-based generated cycle-plan index, present only when Auto-generate is enabled. */
+  readonly cyclePlanIndex?: number;
 }
 
 export interface PlayOptions {
@@ -43,10 +45,45 @@ export interface PlayOptions {
   readonly sampleVolume?: number;
 }
 
-export interface CyclePlanOptions extends Omit<PlayOptions, "fixture"> {
-  /** Ordered slots repeat indefinitely until Stop, replacement Play, or disposal. */
+export interface CyclePlanDefinition {
   readonly slots: readonly CycleSlot[];
 }
+
+export interface CyclePlanRequest {
+  /** Full plan rounds that precede the next plan; requested as its final configured round approaches. */
+  readonly completedRounds: number;
+  /** One-based index of the plan the provider should return. */
+  readonly nextPlanIndex: number;
+}
+
+export interface CyclePlanBoundary {
+  /** One-based index of the plan that has just become active. */
+  readonly planIndex: number;
+  /** Cumulative full practice rounds completed before this plan starts. */
+  readonly completedRounds: number;
+  readonly plan: CyclePlanDefinition;
+}
+
+export type CyclePlanProvider = (request: CyclePlanRequest) => CyclePlanDefinition;
+export type CyclePlanBoundaryHandler = (boundary: CyclePlanBoundary) => void;
+
+export interface CyclePlanOptions extends Omit<PlayOptions, "fixture"> {
+  /** Initial ordered slot plan; repeats until Stop or, with Auto-generate, until its next plan boundary. */
+  readonly slots: readonly CycleSlot[];
+  /** Full cycles of this slot sequence per generated fixture. Required with nextPlan. */
+  readonly cyclesPerPlan?: number;
+  /** Synchronous, warmed provider for the next generated fixture plan. */
+  readonly nextPlan?: CyclePlanProvider;
+  /** Called when a generated plan becomes active at a full cycle boundary. */
+  readonly onPlanBoundary?: CyclePlanBoundaryHandler;
+  /** Additional sample ids eligible in future generated plans; decoded before playback. */
+  readonly preloadSampleIds?: readonly string[];
+}
+
+type InternalPlaybackOptions = Omit<PlayOptions, "fixture"> & Pick<
+  CyclePlanOptions,
+  "cyclesPerPlan" | "nextPlan" | "onPlanBoundary" | "preloadSampleIds"
+>;
 
 export interface AudioTransportOptions {
   /** Injection seam for deterministic scheduler tests. Production uses one browser AudioContext. */
@@ -77,19 +114,46 @@ interface ActivePlayback {
   tempoRatio: number;
   pitchSemitones: number;
   cycleIterationBase: number;
+  dynamicCycle?: DynamicCyclePlayback;
   maxSampleDuration: number;
   nextEventIndex: number;
   nextCycleStartAt: number;
+}
+
+interface DynamicCyclePlayback {
+  readonly cyclesPerPlan: number;
+  readonly nextPlan: CyclePlanProvider;
+  readonly onPlanBoundary?: CyclePlanBoundaryHandler;
+  planIndex: number;
+  completedRounds: number;
+  cyclesScheduledInPlan: number;
+  planStartCycleGlobal: number;
+  providerRequested: boolean;
+  awaitingBoundaryAt?: number;
+  preparedPlan?: CyclePlanDefinition;
+  preparedTimeline?: CyclePlanTimeline;
+  preparedEventIndex?: number;
+  providerError?: string;
 }
 
 interface SampleSourceState {
   readonly startedAt: number;
 }
 
+type AudioDecodeJob =
+  | { readonly kind: "sample"; readonly sampleId: string }
+  | { readonly kind: "beat"; readonly file: File };
+
+type AudioDecodeResult =
+  | { readonly kind: "sample"; readonly sampleId: string; readonly buffer: AudioBuffer }
+  | { readonly kind: "beat"; readonly buffer: AudioBuffer };
+
 const SYNTHETIC_SAMPLE_IDS = new Set(["synthPulse", "synthBrush", "synthSilence"]);
 const DEFAULT_LOOK_AHEAD_SECONDS = 0.1;
 const DEFAULT_SCHEDULER_INTERVAL_MS = 25;
 const DEFAULT_START_DELAY_SECONDS = 0.05;
+const MAX_PARALLEL_AUDIO_DECODES = 4;
+const MAX_DYNAMIC_CYCLE_ADVANCES_PER_TICK = 64;
 
 /**
  * Web Audio transport for finite fixtures and repeating cycle plans. One context is retained
@@ -214,7 +278,14 @@ export class AudioTransport {
 
     const tempoRatio = this.validateTempoRatio(bpm, playback.referenceBpm);
     this.selectedBpm = bpm;
-    this.retimePlayback(playback, bpm, tempoRatio);
+    try {
+      this.retimePlayback(playback, bpm, tempoRatio);
+    } catch (error) {
+      if (this.activePlayback === playback && this.isCurrent(playback.generation)) {
+        this.cancelRun();
+        this.publish({ status: "error", progress: 0, error: describeError(error) });
+      }
+    }
   };
 
   /** Change pitch independently from tempo on the live AudioWorklet processor. */
@@ -241,7 +312,7 @@ export class AudioTransport {
   };
 
   private startPlayback = async (
-    options: Omit<PlayOptions, "fixture">,
+    options: InternalPlaybackOptions,
     createSchedule: () => { readonly timeline: FixtureTimeline; readonly cyclePlan?: CyclePlanTimeline },
   ): Promise<void> => {
     if (this.disposed) return;
@@ -260,6 +331,10 @@ export class AudioTransport {
       const playbackReferenceBpm = referenceBpm ?? bpm;
       this.validateTempoRatio(bpm, playbackReferenceBpm);
       const initialPitch = pitchValue(options.pitchSemitones ?? this.selectedPitchSemitones);
+      const dynamicCycleConfig = createDynamicCycleConfig(options);
+      if (dynamicCycleConfig && !cyclePlan) {
+        throw new Error("Auto-generate requires a cycle plan.");
+      }
       this.selectedBpm = bpm;
       this.selectedReferenceBpm = referenceBpm;
       this.selectedPitchSemitones = initialPitch;
@@ -267,6 +342,12 @@ export class AudioTransport {
       this.selectedBeatVolume = volumeValue(options.beatVolume, "Beat volume");
       const assets = options.assets ?? new Map<string, File>();
       const sampleIds = new Set(timeline.events.filter((event) => !event.silent).map((event) => event.sampleId));
+      for (const sampleId of options.preloadSampleIds ?? []) {
+        if (typeof sampleId !== "string" || sampleId.trim() === "") {
+          throw new Error("Auto-generate has an invalid sample preload id.");
+        }
+        sampleIds.add(sampleId);
+      }
 
       for (const sampleId of sampleIds) {
         if (!assets.has(sampleId) && !SYNTHETIC_SAMPLE_IDS.has(sampleId)) {
@@ -288,26 +369,37 @@ export class AudioTransport {
           return processor;
         })
         : Promise.resolve(undefined);
-      const decodedSamples = new Map<string, Promise<AudioBuffer>>();
-      for (const sampleId of sampleIds) {
-        const file = assets.get(sampleId);
-        decodedSamples.set(sampleId, file
-          ? this.decodeFile(context, file)
-          : Promise.resolve(this.getSyntheticBuffer(context, sampleId)));
-      }
-      const beatPromise = options.beatFile ? this.decodeFile(context, options.beatFile) : undefined;
+      const decodeJobs: AudioDecodeJob[] = [
+        ...[...sampleIds].map((sampleId) => ({ kind: "sample" as const, sampleId })),
+        ...(options.beatFile ? [{ kind: "beat" as const, file: options.beatFile }] : []),
+      ];
+      const audioDecodePromise = mapWithConcurrency(decodeJobs, MAX_PARALLEL_AUDIO_DECODES, async (job): Promise<AudioDecodeResult> => {
+        if (!this.isCurrent(generation)) throw new StalePlaybackError();
+        if (job.kind === "beat") {
+          return { kind: "beat", buffer: await this.decodeFile(context, job.file) };
+        }
+        const file = assets.get(job.sampleId);
+        const buffer = file
+          ? await this.decodeFile(context, file)
+          : this.getSyntheticBuffer(context, job.sampleId);
+        return { kind: "sample", sampleId: job.sampleId, buffer };
+      }, () => this.isCurrent(generation));
 
-      const [sampleEntries, beatBuffer, processor] = await Promise.all([
-        Promise.all([...decodedSamples].map(async ([sampleId, bufferPromise]) => [sampleId, await bufferPromise] as const)),
-        beatPromise ?? Promise.resolve(undefined),
+      const [decodedItems, processor] = await Promise.all([
+        audioDecodePromise,
         resumePromise,
         processorPromise,
-      ]).then(([entries, beat, , worklet]) => [entries, beat, worklet] as const);
+      ]).then(([items, , worklet]) => [items, worklet] as const);
 
       if (!this.isCurrent(generation)) {
         if (processor) disconnectNode(processor);
         return;
       }
+
+      const sampleEntries = decodedItems.flatMap((item) => item.kind === "sample"
+        ? [[item.sampleId, item.buffer] as const]
+        : []);
+      const beatBuffer = decodedItems.find((item) => item.kind === "beat")?.buffer;
 
       const currentBpm = this.selectedBpm ?? bpm;
       const tempoRatio = this.validateTempoRatio(currentBpm, playbackReferenceBpm);
@@ -363,6 +455,16 @@ export class AudioTransport {
         tempoRatio,
         pitchSemitones: currentPitch,
         cycleIterationBase: 0,
+        ...(dynamicCycleConfig ? {
+          dynamicCycle: {
+            ...dynamicCycleConfig,
+            planIndex: 1,
+            completedRounds: 0,
+            cyclesScheduledInPlan: 0,
+            planStartCycleGlobal: 0,
+            providerRequested: false,
+          },
+        } : {}),
         maxSampleDuration,
         nextEventIndex: 0,
         nextCycleStartAt: startAt,
@@ -370,7 +472,14 @@ export class AudioTransport {
       this.activePlayback = playback;
 
       this.publish(cyclePlan
-        ? { status: "playing", progress: 0, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: cyclePlan.slots[0]!.kind }
+        ? {
+          status: "playing",
+          progress: 0,
+          cycleSlotIndex: 0,
+          cycleIteration: 1,
+          cycleSlotKind: cyclePlan.slots[0]!.kind,
+          ...(dynamicCycleConfig ? { cyclePlanIndex: 1 } : {}),
+        }
         : { status: "playing", progress: 0 });
       this.intervalHandle = this.scheduleInterval(() => this.tick(generation), this.schedulerIntervalMs);
       this.tick(generation);
@@ -433,6 +542,8 @@ export class AudioTransport {
       return;
     }
 
+    if (!this.isCurrent(generation) || this.activePlayback !== playback) return;
+
     if (!playback.cyclePlan && now >= playback.finishAt) {
       this.cancelRun();
       this.publish({ status: "completed", progress: 1 });
@@ -447,6 +558,7 @@ export class AudioTransport {
         cycleSlotIndex: phase.slotIndex,
         cycleIteration: phase.iteration,
         cycleSlotKind: phase.kind,
+        ...(playback.dynamicCycle ? { cyclePlanIndex: playback.dynamicCycle.planIndex } : {}),
       });
       return;
     }
@@ -467,17 +579,81 @@ export class AudioTransport {
   }
 
   private scheduleCycleEvents(playback: ActivePlayback, now: number, schedulingHorizon: number): void {
-    const cyclePlan = playback.cyclePlan;
-    if (!cyclePlan || !cyclePlan.events.some((event) => !event.silent)) return;
+    let cyclePlan = playback.cyclePlan;
+    const dynamic = playback.dynamicCycle;
+    if (!cyclePlan || (!dynamic && cyclePlan.events.length === 0)) return;
 
-    if (playback.nextEventIndex >= cyclePlan.events.length) {
-      playback.nextEventIndex = 0;
-      playback.nextCycleStartAt += cyclePlan.totalSeconds;
+    if (dynamic?.awaitingBoundaryAt !== undefined) {
+      if (now >= dynamic.awaitingBoundaryAt) {
+        this.activateNextCyclePlan(playback);
+        if (this.activePlayback !== playback || !this.isCurrent(playback.generation)) return;
+        cyclePlan = playback.cyclePlan;
+        if (!cyclePlan) return;
+      } else {
+        this.schedulePreparedCyclePlan(playback, dynamic, now, schedulingHorizon);
+        return;
+      }
     }
-    this.skipExpiredCycles(playback, now);
 
+    if (!dynamic && playback.nextEventIndex >= cyclePlan.events.length) {
+      this.completeScheduledCycle(playback);
+    }
+    if (!dynamic) this.skipExpiredCycles(playback, now);
+
+    let advancedCycles = 0;
     while (true) {
-      const event = cyclePlan.events[playback.nextEventIndex];
+      const activePlan = playback.cyclePlan;
+      const activeDynamic = playback.dynamicCycle;
+      if (!activePlan) return;
+
+      if (activeDynamic
+        && !activeDynamic.providerRequested
+        && activeDynamic.cyclesScheduledInPlan === activeDynamic.cyclesPerPlan - 1
+        && playback.nextCycleStartAt <= schedulingHorizon) {
+        this.prepareNextCyclePlan(playback, activeDynamic);
+        if (!this.isCurrent(playback.generation)) return;
+      }
+
+      if (playback.nextEventIndex >= activePlan.events.length) {
+        if (activePlan.events.length === 0) {
+          if (playback.nextCycleStartAt + activePlan.totalSeconds > schedulingHorizon) break;
+          this.completeScheduledCycle(playback);
+          advancedCycles += 1;
+          if (activeDynamic?.awaitingBoundaryAt !== undefined) {
+            if (now >= activeDynamic.awaitingBoundaryAt) {
+              this.assertDynamicCatchUpCapacity(advancedCycles);
+              this.activateNextCyclePlan(playback);
+              if (this.activePlayback !== playback || !this.isCurrent(playback.generation)) return;
+              continue;
+            }
+            this.schedulePreparedCyclePlan(playback, activeDynamic, now, schedulingHorizon);
+            break;
+          }
+          if (activeDynamic && advancedCycles >= MAX_DYNAMIC_CYCLE_ADVANCES_PER_TICK) {
+            this.assertDynamicCatchUpCapacity(advancedCycles);
+          }
+          continue;
+        }
+        this.completeScheduledCycle(playback);
+        advancedCycles += 1;
+        if (activeDynamic?.awaitingBoundaryAt !== undefined) {
+          if (now >= activeDynamic.awaitingBoundaryAt) {
+            this.assertDynamicCatchUpCapacity(advancedCycles);
+            this.activateNextCyclePlan(playback);
+            if (this.activePlayback !== playback || !this.isCurrent(playback.generation)) return;
+            continue;
+          }
+          this.schedulePreparedCyclePlan(playback, activeDynamic, now, schedulingHorizon);
+          break;
+        }
+        if (!activeDynamic) this.skipExpiredCycles(playback, now);
+        if (activeDynamic && advancedCycles >= MAX_DYNAMIC_CYCLE_ADVANCES_PER_TICK) {
+          this.assertDynamicCatchUpCapacity(advancedCycles);
+        }
+        continue;
+      }
+
+      const event = activePlan.events[playback.nextEventIndex];
       if (!event) break;
       const when = playback.nextCycleStartAt + event.offsetSeconds;
       if (when > schedulingHorizon) break;
@@ -485,11 +661,144 @@ export class AudioTransport {
       playback.nextEventIndex += 1;
       this.scheduleEvent(playback, event, when, now);
 
-      if (playback.nextEventIndex >= cyclePlan.events.length) {
-        playback.nextEventIndex = 0;
-        playback.nextCycleStartAt += cyclePlan.totalSeconds;
-        this.skipExpiredCycles(playback, now);
+      if (playback.nextEventIndex >= activePlan.events.length) {
+        this.completeScheduledCycle(playback);
+        advancedCycles += 1;
+        if (playback.dynamicCycle?.awaitingBoundaryAt !== undefined) {
+          if (now >= playback.dynamicCycle.awaitingBoundaryAt) {
+            this.assertDynamicCatchUpCapacity(advancedCycles);
+            this.activateNextCyclePlan(playback);
+            if (this.activePlayback !== playback || !this.isCurrent(playback.generation)) return;
+            continue;
+          }
+          this.schedulePreparedCyclePlan(playback, playback.dynamicCycle, now, schedulingHorizon);
+          break;
+        }
+        if (!playback.dynamicCycle) this.skipExpiredCycles(playback, now);
+        if (playback.dynamicCycle && advancedCycles >= MAX_DYNAMIC_CYCLE_ADVANCES_PER_TICK) {
+          this.assertDynamicCatchUpCapacity(advancedCycles);
+        }
       }
+    }
+  }
+
+  private assertDynamicCatchUpCapacity(advancedCycles: number): void {
+    if (advancedCycles >= MAX_DYNAMIC_CYCLE_ADVANCES_PER_TICK) {
+      throw new Error("Auto-generate fell too far behind the audio clock. Playback stopped; press Play to restart from the current combo.");
+    }
+  }
+
+  private completeScheduledCycle(playback: ActivePlayback): void {
+    const cyclePlan = playback.cyclePlan;
+    if (!cyclePlan) return;
+    playback.nextEventIndex = 0;
+    playback.nextCycleStartAt += cyclePlan.totalSeconds;
+    const dynamic = playback.dynamicCycle;
+    if (!dynamic) return;
+    dynamic.cyclesScheduledInPlan += 1;
+    if (dynamic.cyclesScheduledInPlan >= dynamic.cyclesPerPlan) {
+      dynamic.awaitingBoundaryAt = playback.nextCycleStartAt;
+    }
+  }
+
+  private schedulePreparedCyclePlan(
+    playback: ActivePlayback,
+    dynamic: DynamicCyclePlayback,
+    now: number,
+    schedulingHorizon: number,
+  ): void {
+    const boundaryAt = dynamic.awaitingBoundaryAt;
+    const timeline = dynamic.preparedTimeline;
+    if (boundaryAt === undefined || !timeline || dynamic.providerError) return;
+
+    let eventIndex = dynamic.preparedEventIndex ?? 0;
+    while (eventIndex < timeline.events.length) {
+      const event = timeline.events[eventIndex];
+      if (!event) break;
+      const when = boundaryAt + event.offsetSeconds;
+      if (when > schedulingHorizon) break;
+      eventIndex += 1;
+      this.scheduleEvent(playback, event, when, now);
+    }
+    dynamic.preparedEventIndex = eventIndex;
+  }
+
+  private prepareNextCyclePlan(playback: ActivePlayback, dynamic: DynamicCyclePlayback): void {
+    dynamic.providerRequested = true;
+    const request: CyclePlanRequest = {
+      completedRounds: boundedCount(dynamic.completedRounds + dynamic.cyclesScheduledInPlan),
+      nextPlanIndex: boundedCount(dynamic.planIndex + 1),
+    };
+
+    try {
+      const definition = dynamic.nextPlan(request);
+      if (!this.isCurrent(playback.generation) || this.activePlayback !== playback) return;
+      if (isPromiseLike(definition)) {
+        void Promise.resolve(definition).catch(() => undefined);
+        throw new Error("The nextPlan provider must return synchronously; candidate sample files are preloaded before playback.");
+      }
+      if (!definition || !Array.isArray(definition.slots)) {
+        throw new Error("The nextPlan provider must synchronously return a plan with a slots array.");
+      }
+      const timeline = createCyclePlanTimeline(
+        definition.slots,
+        playback.timeline.bpm,
+        playback.timeline.unitsPerBeat,
+      );
+      if (timeline.totalUnits !== playback.cyclePlan?.totalUnits) {
+        throw new Error("The next combo plan must keep the current total length in raw ticks.");
+      }
+      for (const event of timeline.events) {
+        if (!event.silent && !playback.buffers.has(event.sampleId)) {
+          throw new Error(`Auto-generated sample “${event.sampleId}” was not preloaded. Add it to preloadSampleIds and try again.`);
+        }
+      }
+      dynamic.preparedPlan = definition;
+      dynamic.preparedTimeline = timeline;
+    } catch (error) {
+      dynamic.providerError = `Auto-generate could not prepare the next combo. ${describeError(error)}`;
+    }
+  }
+
+  private activateNextCyclePlan(playback: ActivePlayback): void {
+    const dynamic = playback.dynamicCycle;
+    const currentPlan = playback.cyclePlan;
+    if (!dynamic || !currentPlan || dynamic.awaitingBoundaryAt === undefined) return;
+    if (!dynamic.providerRequested) this.prepareNextCyclePlan(playback, dynamic);
+    if (dynamic.providerError) throw new Error(dynamic.providerError);
+    const definition = dynamic.preparedPlan;
+    const nextPlan = dynamic.preparedTimeline;
+    if (!definition || !nextPlan) {
+      throw new Error("Auto-generate did not prepare a next combo at the plan boundary.");
+    }
+
+    const boundaryAt = dynamic.awaitingBoundaryAt;
+    playback.cycleIterationBase = boundedCount(dynamic.planStartCycleGlobal + dynamic.cyclesPerPlan);
+    playback.startAt = boundaryAt;
+    playback.fixtureEndAt = boundaryAt + nextPlan.totalSeconds;
+    playback.timeline = nextPlan;
+    playback.cyclePlan = nextPlan;
+    playback.nextCycleStartAt = boundaryAt;
+    playback.nextEventIndex = dynamic.preparedEventIndex ?? 0;
+    dynamic.completedRounds = boundedCount(dynamic.completedRounds + dynamic.cyclesPerPlan);
+    dynamic.planIndex = boundedCount(dynamic.planIndex + 1);
+    dynamic.planStartCycleGlobal = playback.cycleIterationBase;
+    dynamic.cyclesScheduledInPlan = 0;
+    dynamic.providerRequested = false;
+    delete dynamic.awaitingBoundaryAt;
+    delete dynamic.preparedPlan;
+    delete dynamic.preparedTimeline;
+    delete dynamic.preparedEventIndex;
+    delete dynamic.providerError;
+
+    try {
+      dynamic.onPlanBoundary?.({
+        planIndex: dynamic.planIndex,
+        completedRounds: dynamic.completedRounds,
+        plan: definition,
+      });
+    } catch {
+      // The UI notification must not interrupt the audio clock.
     }
   }
 
@@ -692,8 +1001,16 @@ export class AudioTransport {
     }
 
     const now = playback.context.currentTime;
+    let activatedPlanAtBoundary = false;
+    const dynamic = playback.dynamicCycle;
+    if (dynamic?.awaitingBoundaryAt !== undefined && now >= dynamic.awaitingBoundaryAt) {
+      this.activateNextCyclePlan(playback);
+      if (this.activePlayback !== playback || !this.isCurrent(playback.generation)) return;
+      activatedPlanAtBoundary = true;
+    }
+    const scheduledAtBoundaryIndex = activatedPlanAtBoundary ? playback.nextEventIndex : undefined;
     // Flush events due under the old tempo before invalidating only its future lookahead.
-    this.scheduleDueEvents(playback, now, now + this.lookAheadSeconds);
+    if (!activatedPlanAtBoundary) this.scheduleDueEvents(playback, now, now + this.lookAheadSeconds);
     for (const [source, state] of this.sampleSources) {
       if (state.startedAt > now) {
         this.releaseSource(source);
@@ -729,11 +1046,24 @@ export class AudioTransport {
     if (playback.cyclePlan) {
       playback.nextCycleStartAt = playback.startAt;
       playback.cycleIterationBase = previousIteration;
+      if (dynamic) {
+        dynamic.cyclesScheduledInPlan = Math.max(0, Math.min(
+          dynamic.cyclesPerPlan - 1,
+          previousIteration - dynamic.planStartCycleGlobal,
+        ));
+        delete dynamic.awaitingBoundaryAt;
+        delete dynamic.preparedEventIndex;
+        if (dynamic.preparedTimeline) {
+          dynamic.preparedTimeline = rescaleCyclePlanTimeline(dynamic.preparedTimeline, bpm);
+        }
+      }
     }
 
-    playback.nextEventIndex = !hadStarted
-      ? 0
-      : playback.timeline.events.findIndex((event) => event.startUnits > positionUnits);
+    playback.nextEventIndex = activatedPlanAtBoundary
+      ? scheduledPrefixCursorAtPosition(playback.timeline.events, scheduledAtBoundaryIndex ?? 0, positionUnits)
+      : !hadStarted
+        ? 0
+        : playback.timeline.events.findIndex((event) => event.startUnits > positionUnits);
     if (playback.nextEventIndex < 0) playback.nextEventIndex = playback.timeline.events.length;
 
     playback.maxSampleDuration = 0;
@@ -802,6 +1132,72 @@ function createBrowserAudioContext(): AudioContext {
 
 function positiveOption(value: number | undefined, fallback: number): number {
   return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function createDynamicCycleConfig(options: InternalPlaybackOptions): Omit<
+  DynamicCyclePlayback,
+  | "planIndex"
+  | "completedRounds"
+  | "cyclesScheduledInPlan"
+  | "planStartCycleGlobal"
+  | "providerRequested"
+  | "awaitingBoundaryAt"
+  | "preparedPlan"
+  | "preparedTimeline"
+  | "preparedEventIndex"
+  | "providerError"
+> | undefined {
+  if (!options.nextPlan) {
+    if (options.cyclesPerPlan !== undefined || options.onPlanBoundary !== undefined || options.preloadSampleIds !== undefined) {
+      throw new Error("cyclesPerPlan, onPlanBoundary, and preloadSampleIds require a nextPlan provider.");
+    }
+    return undefined;
+  }
+  if (typeof options.nextPlan !== "function") {
+    throw new Error("nextPlan must be a synchronous function when Auto-generate is enabled.");
+  }
+  if (![1, 2, 4, 8].includes(options.cyclesPerPlan ?? 0)) {
+    throw new Error("cyclesPerPlan must be 1, 2, 4, or 8 when Auto-generate is enabled.");
+  }
+  return {
+    cyclesPerPlan: options.cyclesPerPlan!,
+    nextPlan: options.nextPlan,
+    ...(options.onPlanBoundary ? { onPlanBoundary: options.onPlanBoundary } : {}),
+  };
+}
+
+class StalePlaybackError extends Error {}
+
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<R>,
+  shouldContinue: () => boolean = () => true,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+  const runWorker = async (): Promise<void> => {
+    while (shouldContinue()) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= values.length) return;
+      if (!shouldContinue()) return;
+      results[index] = await mapper(values[index]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, runWorker));
+  return results;
+}
+
+function boundedCount(value: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(value)));
+}
+
+function isPromiseLike(value: unknown): value is Promise<unknown> {
+  return typeof value === "object"
+    && value !== null
+    && "then" in value
+    && typeof value.then === "function";
 }
 
 function volumeValue(value: number | undefined, label: string): number {
@@ -880,6 +1276,17 @@ function cyclePhaseAt(
   const resolvedSlotIndex = slotIndex < 0 ? cyclePlan.slots.length - 1 : slotIndex;
   const slot = cyclePlan.slots[resolvedSlotIndex]!;
   return { slotIndex: resolvedSlotIndex, iteration, kind: slot.kind };
+}
+
+function scheduledPrefixCursorAtPosition(
+  events: FixtureTimeline["events"],
+  scheduledPrefixLength: number,
+  positionUnits: number,
+): number {
+  const scheduledLimit = Math.min(events.length, Math.max(0, scheduledPrefixLength));
+  let cursor = 0;
+  while (cursor < scheduledLimit && events[cursor]!.startUnits <= positionUnits) cursor += 1;
+  return cursor;
 }
 
 function describeError(error: unknown): string {

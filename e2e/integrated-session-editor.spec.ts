@@ -186,6 +186,13 @@ test("live BPM, pitch, and levels stay independent; reset preserves the playing 
   await page.getByRole("button", { name: "Play sequence" }).click();
   const status = page.locator(".transport-status");
   await expect(status).toHaveText("Q&A · question playback · cycle 1.");
+  const readQaCycle = () => page.evaluate(() => {
+    const match = /^Q&A · (?:question playback|answer pause) · cycle (\d+)\.$/.exec(
+      document.querySelector(".transport-status")?.textContent?.trim() ?? "",
+    );
+    return match ? Number(match[1]) : null;
+  });
+  const initialCycle = (await readQaCycle())!;
   await expect.poll(() => page.evaluate(() => window.__liveAudioQa?.sources.filter((source) => source.loop).length ?? 0))
     .toBe(1);
 
@@ -215,7 +222,9 @@ test("live BPM, pitch, and levels stay independent; reset preserves the playing 
   await expect(pitch).toHaveValue("3");
   await expect(sampleLevel).toHaveValue("100");
   await expect(beatLevel).toHaveValue("0");
-  await expect(status).toHaveText("Q&A · question playback · cycle 1.");
+  await expect.poll(readQaCycle).not.toBeNull();
+  const cycleAfterLiveChanges = (await readQaCycle())!;
+  expect(cycleAfterLiveChanges).toBeGreaterThanOrEqual(initialCycle);
   await expect.poll(async () => Number(await progress.getAttribute("value")))
     .toBeGreaterThan(initialProgress);
   expect(await page.evaluate(() => window.__liveAudioQa?.sources.filter((source) => source.loop).length ?? 0)).toBe(1);
@@ -227,7 +236,10 @@ test("live BPM, pitch, and levels stay independent; reset preserves the playing 
   await expect(pitch).toHaveValue("0");
   await expect(sampleLevel).toHaveValue("80");
   await expect(beatLevel).toHaveValue("100");
-  await expect(status).toContainText("Playback continues.");
+  await expect.poll(readQaCycle).not.toBeNull();
+  const cycleAfterReset = (await readQaCycle())!;
+  expect(cycleAfterReset).toBeGreaterThanOrEqual(cycleAfterLiveChanges);
+  await expect(page.getByRole("button", { name: "Stop" })).toBeEnabled();
   await expect(page.getByLabel("Beat bed")).toHaveValue("1");
   await expect(page.getByRole("radio", { name: "Q&A" })).toBeChecked();
   await expect(page.getByLabel("Large pause")).toBeChecked();

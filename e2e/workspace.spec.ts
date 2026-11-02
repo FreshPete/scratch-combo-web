@@ -639,10 +639,26 @@ test("private 85 BPM preset reaches its Q&A answer slot and stops without upload
   expect(Number(timelineLabel?.match(/, (\d+) events$/)?.[1] ?? 0)).toBeGreaterThan(0);
   const eventList = page.getByRole("list", { name: "Sequence events" });
   await expect(eventList.locator("li").first()).toContainText(/starts at legacy tick 1, lasts \d+ legacy ticks/);
+  const readTimelineColors = async () => page.locator(".timeline-lane").evaluateAll((lanes) => lanes.flatMap((lane) => {
+    const label = lane.querySelector<HTMLElement>(".timeline-lane-label");
+    const name = label?.querySelector(".timeline-lane-name-text")?.textContent?.trim() ?? "";
+    const laneColor = label?.style.getPropertyValue("--sample-color").trim() ?? "";
+    return Array.from(lane.querySelectorAll<HTMLElement>(".sequence-event--colored")).map((event) => ({
+      name,
+      laneColor,
+      eventColor: event.style.getPropertyValue("--sample-color").trim(),
+    }));
+  }).filter((entry) => entry.name && entry.laneColor && entry.eventColor));
+  const initialColors = await readTimelineColors();
+  expect(initialColors.length).toBeGreaterThan(0);
+  expect(new Set(initialColors.map((entry) => entry.eventColor)).size).toBeGreaterThanOrEqual(2);
+  expect(initialColors.every((entry) => entry.eventColor === entry.laneColor)).toBe(true);
 
   mkdirSync(path.resolve(process.cwd(), "test-results"), { recursive: true });
   await page.setViewportSize({ width: 844, height: 900 });
   await page.evaluate(() => window.scrollTo(0, 0));
+  const narrowOverflow = await page.evaluate(() => ({ width: window.innerWidth, document: document.documentElement.scrollWidth, body: document.body.scrollWidth }));
+  expect(Math.max(narrowOverflow.document, narrowOverflow.body)).toBeLessThanOrEqual(narrowOverflow.width);
   await page.screenshot({ path: path.resolve(process.cwd(), "test-results", "qa-loop-private-844.png"), fullPage: false });
   await verifySamplePanel(page, 64);
   await page.screenshot({ path: path.resolve(process.cwd(), "test-results", "qa-loop-samples-bottom-844.png"), fullPage: false });
@@ -650,10 +666,33 @@ test("private 85 BPM preset reaches its Q&A answer slot and stops without upload
 
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.evaluate(() => window.scrollTo(0, 0));
-  await page.screenshot({ path: path.resolve(process.cwd(), "test-results", "legacy-generator-final.png"), fullPage: false });
+  const desktopOverflow = await page.evaluate(() => ({ width: window.innerWidth, document: document.documentElement.scrollWidth, body: document.body.scrollWidth }));
+  expect(Math.max(desktopOverflow.document, desktopOverflow.body)).toBeLessThanOrEqual(desktopOverflow.width);
+  await page.screenshot({ path: path.resolve(process.cwd(), "test-results", "waveform-grid-final.png"), fullPage: false });
   await expect(generate).toBeInViewport();
   await expect(page.getByRole("button", { name: "Play sequence" })).toBeInViewport();
   await expect(page.getByRole("button", { name: "Stop" })).toBeInViewport();
+
+  await page.getByRole("radio", { name: "TTM practice guides" }).check();
+  await expect(page.locator(".sequence-ttm-motion path").first()).toBeVisible();
+  await expect.poll(() => page.locator(".timeline-lane-label--ttm").evaluateAll((labels) => labels.some((label) =>
+    label.querySelector<HTMLElement>(":scope > span")?.textContent?.trim() === "Baby"
+    && label.querySelector<HTMLElement>(":scope > small")?.textContent?.trim() === "Suggested: Baby / rub",
+  ))).toBe(true);
+  await expect(page.locator('.sequence-event[title*="Suggested illustrative TTM guide: Baby / rub"]')).not.toHaveCount(0);
+  await page.screenshot({ path: path.resolve(process.cwd(), "test-results", "ttm-grid-final.png"), fullPage: false });
+  await page.getByRole("radio", { name: "Waveform" }).check();
+  await page.locator("#sequence-section").evaluate((section) => section.scrollIntoView({ block: "start" }));
+
+  await generate.click();
+  const regeneratedColors = await readTimelineColors();
+  expect(regeneratedColors.length).toBeGreaterThan(0);
+  expect(new Set(regeneratedColors.map((entry) => entry.eventColor)).size).toBeGreaterThanOrEqual(2);
+  expect(regeneratedColors.every((entry) => entry.eventColor === entry.laneColor)).toBe(true);
+  const initialByName = new Map(initialColors.map((entry) => [entry.name, entry.eventColor]));
+  const matchingRegenerated = regeneratedColors.filter((entry) => initialByName.has(entry.name));
+  expect(matchingRegenerated.length).toBeGreaterThan(0);
+  expect(matchingRegenerated.every((entry) => entry.eventColor === initialByName.get(entry.name))).toBe(true);
 
   await page.getByRole("button", { name: "Play sequence" }).click();
   await expect(page.locator(".transport-status")).toHaveText("Q&A · question playback · cycle 1.");

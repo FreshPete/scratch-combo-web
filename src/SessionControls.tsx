@@ -11,6 +11,7 @@ export type SessionControlsProps = {
   beatResolutions: AssetResolution[] | undefined
   selectedBeatIndex: string
   disabled: boolean
+  beatSelectionDisabled?: boolean
   onBpmChange: (value: string) => void
   onPitchChange: (value: number) => void
   onSampleVolumeChange: (value: number) => void
@@ -29,6 +30,7 @@ export function SessionControls({
   beatResolutions,
   selectedBeatIndex,
   disabled,
+  beatSelectionDisabled = false,
   onBpmChange,
   onPitchChange,
   onSampleVolumeChange,
@@ -73,7 +75,7 @@ export function SessionControls({
             />
             <span aria-hidden="true">BPM</span>
           </label>
-          <label className="session-controls__range" htmlFor="bpm-range">
+          <label className="session-controls__range session-controls__range--tempo" htmlFor="bpm-range">
             <input
               id="bpm-range"
               aria-label="BPM range"
@@ -95,7 +97,7 @@ export function SessionControls({
             {pitchSemitones > 0 ? '+' : ''}{pitchSemitones} st
           </output>
           <input
-            className="session-controls__slider"
+            className="session-controls__slider session-controls__slider--pitch"
             id="pitch-shift"
             aria-label="Pitch shift in semitones"
             type="range"
@@ -112,7 +114,7 @@ export function SessionControls({
           <label className="session-controls__label" htmlFor="sample-volume">Sample level</label>
           <output className="session-controls__readout">{sampleVolume}%</output>
           <input
-            className="session-controls__slider"
+            className="session-controls__slider session-controls__slider--sample"
             id="sample-volume"
             type="range"
             min="0"
@@ -128,7 +130,7 @@ export function SessionControls({
           <label className="session-controls__label" htmlFor="beat-volume">Beat level</label>
           <output className="session-controls__readout">{beatVolume}%</output>
           <input
-            className="session-controls__slider"
+            className="session-controls__slider session-controls__slider--beat"
             id="beat-volume"
             type="range"
             min="0"
@@ -147,7 +149,7 @@ export function SessionControls({
           <select
             id="beat-selection"
             value={selectedBeatIndex}
-            disabled={disabled}
+            disabled={disabled || beatSelectionDisabled}
             onChange={(event) => onBeatSelectionChange(event.currentTarget.value)}
           >
             <option value="none">No beat bed</option>
