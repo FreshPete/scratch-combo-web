@@ -3,8 +3,11 @@ import { expect, test } from '@playwright/test'
 test('production preview loads built-in media and its AudioWorklet beneath the GitHub Pages project path', async ({ page }) => {
   test.setTimeout(120_000)
   const presetRequests: string[] = []
+  const assetRequests: string[] = []
   page.on('request', (request) => {
-    if (new URL(request.url()).pathname.includes('/private-presets/')) presetRequests.push(request.url())
+    const pathname = new URL(request.url()).pathname
+    if (pathname.includes('/private-presets/')) presetRequests.push(request.url())
+    if (pathname.includes('/assets/')) assetRequests.push(pathname)
   })
 
   await page.goto('/scratch-combo-web/')
@@ -25,5 +28,10 @@ test('production preview loads built-in media and its AudioWorklet beneath the G
 
   await page.getByRole('button', { name: 'Play sequence' }).click()
   await expect(page.locator('.transport-status')).toContainText('Q&A · question playback', { timeout: 30_000 })
+  expect(assetRequests.some((path) => /^\/scratch-combo-web\/assets\/chunk-[^/]+\.js$/.test(path))).toBe(true)
+  expect(assetRequests.every((path) => {
+    const filename = path.slice(path.lastIndexOf('/') + 1)
+    return path.startsWith('/scratch-combo-web/assets/') && !filename.startsWith('.')
+  })).toBe(true)
   await page.getByRole('button', { name: 'Stop' }).click()
 })

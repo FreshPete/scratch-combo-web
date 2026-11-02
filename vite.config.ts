@@ -11,6 +11,13 @@ if (!base.startsWith('/') || !base.endsWith('/')) {
 export default defineConfig({
   base,
   plugins: [react()],
+  build: {
+    rollupOptions: {
+      output: {
+        chunkFileNames: 'assets/chunk-[hash].js',
+      },
+    },
+  },
   test: {
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
