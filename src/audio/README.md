@@ -12,6 +12,12 @@ Imported preset playback uses the preset BPM as its `referenceBpm`. A local beat
 
 The detector needs at least 8 seconds of usable audio and estimates 50–200 BPM. It uses periodic onset-strength autocorrelation; its `confidence` is a normalized score, not a probability. When near-equal half-time or double-time candidates remain, it reports `ambiguous` with BPM candidates. Silence, short clips, invalid PCM, and material without a clear periodic pulse report `insufficient`. Syncopation, sparse percussion, rubato, long intros, and strong subdivisions can still produce an incorrect or ambiguous estimate, so the estimate should remain user-correctable.
 
+## Manual beat start and loop region
+
+The transport accepts an optional `beatPlaybackRegion` in `PlayOptions`: `{ startOffsetSeconds, loopEndSeconds }`. The start cue is measured from the decoded source, is used as the first downbeat position at transport start, and is also the start of each repeated loop. The loop end is an exclusive source position; `null` means the decoded buffer end. The region must contain at least one decoded frame and stay within the actual decoded duration. Values are rounded to the nearest source frame before playback. No automatic downbeat is claimed or inferred.
+
+The beat source starts at that cue and repeats the selected `[start, end)` region continuously, including across silent Q&A cycles and Auto-generate plan changes. When the option is omitted, the source starts at zero and the full decoded buffer loops as before. The transport sets source-node offsets and loop bounds without copying or modifying the uploaded file or decoded PCM. Trimming does not change the beat's recorded reference BPM or the selected practice tempo ratio; tempo and pitch remain live controls. The manual region affects beat audio only, not scheduler units or the estimated output-clock presentation position. The UI applies edits on the next Play.
+
 ## Referenced WAV snapshots
 
 The Files import boundary passes only uniquely resolved, referenced WAV `File` objects to `snapshotReferencedWavFiles()`. The helper reads each selected file once and creates a distinct session-memory `File` with the same name, media type, and modification time. It returns an import-time source-identity map so the UI can replace every resolved reference while retaining relative-path metadata on its own resolution records; discard that map after conversion so session state retains snapshot Files only. No selected folder scan, filesystem path read, upload, or source-file mutation occurs.

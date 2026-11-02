@@ -1,6 +1,12 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SessionControls, type SessionControlsProps } from './SessionControls'
+import { loadWaveform } from './waveforms/waveform'
+
+vi.mock('./waveforms/waveform', async (importOriginal) => {
+  const original = await importOriginal<typeof import('./waveforms/waveform')>()
+  return { ...original, loadWaveform: vi.fn() }
+})
 
 function props(overrides: Partial<SessionControlsProps> = {}): SessionControlsProps {
   return {
@@ -26,6 +32,12 @@ function props(overrides: Partial<SessionControlsProps> = {}): SessionControlsPr
     customBeatCandidateBpm: '',
     customBeatCandidateMessage: '',
     customBeatCandidateReady: false,
+    beatTrimSourceKey: null,
+    beatTrimSourceName: null,
+    beatTrimSourceReferenceBpm: null,
+    beatTrimSourceFile: null,
+    beatTrimSourceBuffer: null,
+    beatTrim: null,
     disabled: false,
     onBpmChange: vi.fn(),
     onPitchChange: vi.fn(),
@@ -36,13 +48,18 @@ function props(overrides: Partial<SessionControlsProps> = {}): SessionControlsPr
     onCustomBeatCandidateBpmChange: vi.fn(),
     onUseCustomBeat: vi.fn(),
     onCustomBeatReferenceBpmChange: vi.fn(),
+    onApplyBeatTrim: vi.fn(),
+    onResetBeatTrim: vi.fn(),
     onReset: vi.fn(),
     ...overrides,
   }
 }
 
 describe('SessionControls', () => {
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    vi.mocked(loadWaveform).mockReset()
+  })
 
   it('keeps numeric tempo and its range connected to the same change handler', () => {
     const onBpmChange = vi.fn()
@@ -160,5 +177,48 @@ describe('SessionControls', () => {
 
     expect(screen.getByRole('spinbutton', { name: 'BPM' })).toBeDisabled()
     expect(screen.getByText(/no shared playback range/)).toHaveAttribute('role', 'status')
+  })
+
+  it('keeps manual trim collapsed, validates decoded bounds, and applies or resets explicitly', async () => {
+    vi.mocked(loadWaveform).mockResolvedValue({
+      durationSeconds: 4,
+      peaks: new Float32Array([0.2, 0.8, 0.3, 1]),
+      path: 'M0 10 L1 4 L2 9 L3 1 Z',
+    })
+    const onApplyBeatTrim = vi.fn()
+    const onResetBeatTrim = vi.fn()
+    const selectedFile = new File(['beat'], 'practice-loop.wav', { type: 'audio/wav' })
+    const controlProps = props({
+      beatTrimSourceKey: 'preset:abc:0',
+      beatTrimSourceName: 'Practice loop.wav',
+      beatTrimSourceReferenceBpm: 92,
+      beatTrimSourceFile: selectedFile,
+      onApplyBeatTrim,
+      onResetBeatTrim,
+    })
+    const { rerender } = render(<SessionControls {...controlProps} />)
+
+    const details = screen.getByText('Manual beat trim').closest('details')
+    expect(details).not.toHaveAttribute('open')
+    fireEvent.click(screen.getByText('Manual beat trim'))
+    await waitFor(() => expect(loadWaveform).toHaveBeenCalledWith(selectedFile))
+    expect(screen.getByRole('img', { name: /Waveform of Practice loop\.wav/ })).toBeInTheDocument()
+    expect(screen.getByLabelText('First downbeat / loop start (seconds)')).toHaveValue(0)
+    expect(screen.getByLabelText('Loop end (seconds)')).toHaveValue(null)
+    expect(screen.getByText(/source BPM 92/)).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('First downbeat / loop start (seconds)'), { target: { value: '1.25' } })
+    fireEvent.change(screen.getByLabelText('Loop end (seconds)'), { target: { value: '1' } })
+    expect(screen.getByRole('alert')).toHaveTextContent(/Loop end must be after the first downbeat/)
+    expect(screen.getByRole('button', { name: 'Apply beat trim' })).toBeDisabled()
+
+    fireEvent.change(screen.getByLabelText('Loop end (seconds)'), { target: { value: '3.5' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply beat trim' }))
+    expect(onApplyBeatTrim).toHaveBeenCalledWith({ startOffsetSeconds: 1.25, loopEndSeconds: 3.5 }, 4)
+
+    rerender(<SessionControls {...props({ ...controlProps, beatTrim: { startOffsetSeconds: 1.25, loopEndSeconds: 3.5 } })} />)
+    expect(screen.getByText(/Applied: cue 1\.250s · loop end 3\.500s/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Reset beat trim' }))
+    expect(onResetBeatTrim).toHaveBeenCalledOnce()
   })
 })

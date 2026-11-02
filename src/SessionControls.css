@@ -364,6 +364,141 @@
   grid-column: 1 / -1;
 }
 
+.session-controls__beat-trim {
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.session-controls__beat-trim > summary {
+  min-height: 42px;
+  padding: 12px 2px 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 20px;
+  cursor: pointer;
+}
+
+.session-controls__beat-trim > summary::marker {
+  color: var(--accent);
+}
+
+.session-controls__beat-trim > summary:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.session-controls__beat-trim-body {
+  display: grid;
+  gap: 10px;
+  max-width: 760px;
+  padding: 2px 0 2px;
+}
+
+.session-controls__beat-trim-context,
+.session-controls__trim-status {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.session-controls__trim-waveform {
+  display: block;
+  width: 100%;
+  height: 42px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-inset);
+}
+
+.session-controls__trim-waveform-track {
+  fill: var(--surface-inset);
+}
+
+.session-controls__trim-waveform-region {
+  fill: #d5ff30;
+  opacity: .12;
+}
+
+.session-controls__trim-waveform-path {
+  fill: #17d9ff;
+  opacity: .78;
+}
+
+.session-controls__trim-waveform-cue {
+  stroke: var(--accent);
+  stroke-width: 1.2;
+}
+
+.session-controls__trim-waveform-end {
+  stroke: #ff9f1c;
+  stroke-dasharray: 3 2;
+  stroke-width: 1.2;
+}
+
+.session-controls__trim-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 240px));
+  gap: 12px 16px;
+}
+
+.session-controls__trim-field {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.session-controls__trim-field input {
+  width: 100%;
+  min-width: 0;
+  height: 40px;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  background: var(--surface-inset);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.session-controls__trim-field input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.session-controls__trim-field input[aria-invalid='true'] {
+  border-color: var(--error);
+}
+
+.session-controls__trim-field input:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.session-controls__trim-error {
+  margin: 0;
+  color: var(--warning);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.session-controls__trim-status {
+  color: var(--text-muted);
+}
+
+.session-controls__beat-trim-body .session-controls__hint {
+  font-size: 11px;
+}
+
+.session-controls__trim-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 @media (max-width: 1050px) {
   .session-controls__grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -389,6 +524,11 @@
   .session-controls__custom-beat-upload {
     grid-template-columns: minmax(0, 1fr);
     gap: 8px;
+  }
+
+  .session-controls__trim-fields {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
   }
 
   .session-controls__candidate,

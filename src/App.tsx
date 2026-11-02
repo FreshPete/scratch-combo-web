@@ -29,8 +29,9 @@ import {
 } from './waveforms/waveform'
 import { sampleColorForName } from './waveforms/sample-color'
 import {
-  deleteSavedRecord, listSavedRecords, loadSavedRecord, saveSavedRecord, SessionLibraryError,
-  type SavedLibraryIndex, type SavedMedia, type SavedRecordSummary, type SavedSessionData,
+  customBeatTrimKey, deleteSavedRecord, listSavedRecords, loadSavedRecord, presetBeatTrimKey,
+  saveSavedRecord, SessionLibraryError,
+  type SavedBeatTrimRegion, type SavedLibraryIndex, type SavedMedia, type SavedRecordSummary, type SavedSessionData,
 } from './session-library/storage'
 
 const TARGET_UNITS = 32
@@ -284,6 +285,23 @@ function initialPracticeTempo(scratchReferenceBpm: number, beatReferenceBpm?: nu
   if (!range) return scratchReferenceBpm
   const preferred = beatReferenceBpm ?? scratchReferenceBpm
   return Math.min(range.max, Math.max(range.min, preferred))
+}
+
+function createBeatTrimId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  return 'trim-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2)
+}
+
+function retainedBeatTrimsForPreset(
+  trims: SavedSessionData['beatTrims'],
+  presetTrimId: string,
+  customTrimId: string | null,
+): SavedSessionData['beatTrims'] {
+  const presetPrefix = presetBeatTrimKey(presetTrimId, 0).slice(0, -1)
+  const customKey = customTrimId ? customBeatTrimKey(customTrimId) : null
+  return Object.fromEntries(Object.entries(trims).filter(([key]) => (
+    key.startsWith(presetPrefix) || key === customKey
+  )))
 }
 
 function assetMapFor(resolution: PresetAssetResolution | undefined): ReadonlyMap<string, File> {
@@ -1406,6 +1424,9 @@ export default function App() {
   const [selectedBeatIndex, setSelectedBeatIndex] = useState('none')
   const [customBeatFile, setCustomBeatFile] = useState<File | null>(null)
   const [customBeatBuffer, setCustomBeatBuffer] = useState<AudioBuffer | null>(null)
+  const [presetBeatTrimId, setPresetBeatTrimId] = useState(() => createBeatTrimId())
+  const [customBeatTrimId, setCustomBeatTrimId] = useState<string | null>(null)
+  const [beatTrims, setBeatTrims] = useState<SavedSessionData['beatTrims']>({})
   const [customBeatSelected, setCustomBeatSelected] = useState(false)
   const [customBeatReferenceBpm, setCustomBeatReferenceBpm] = useState<number | null>(null)
   const [customBeatReferenceBpmInput, setCustomBeatReferenceBpmInput] = useState('')
@@ -1452,6 +1473,17 @@ export default function App() {
   const selectedBeatFile = customBeatSelected
     ? undefined
     : selectedBeatResolution?.status === 'resolved' ? selectedBeatResolution.file : undefined
+  const beatTrimSourceName = customBeatSelected
+    ? customBeatFile?.name ?? null
+    : selectedBeatIndex === 'none'
+      ? null
+      : selectedBeatResolution?.selectedPath ?? selectedBeatResolution?.requested ?? preset.beatFiles[Number(selectedBeatIndex)] ?? null
+  const activeBeatTrimKey = customBeatSelected
+    ? customBeatFile && customBeatTrimId ? customBeatTrimKey(customBeatTrimId) : null
+    : selectedBeatIndex === 'none'
+      ? null
+      : presetBeatTrimKey(presetBeatTrimId, Number(selectedBeatIndex))
+  const activeBeatTrim = activeBeatTrimKey ? beatTrims[activeBeatTrimKey] ?? null : null
   const selectedBeatReferenceBpm = customBeatSelected ? customBeatReferenceBpm : null
   const selectedTempoRange = getTempoRange(preset.bpm, selectedBeatReferenceBpm)
   const isCustomBeatAnalysisBusy = customBeatAnalysisStatus === 'analyzing'
@@ -1565,6 +1597,9 @@ export default function App() {
       customBeatSelected,
       customBeatReferenceBpm,
       customBeatReferenceBpmInput,
+      presetBeatTrimId,
+      customBeatTrimId,
+      beatTrims,
       assets,
     }
   }
@@ -1661,6 +1696,7 @@ export default function App() {
 
       const filesToDecode = new Set<File>()
       const requiredFilesBySampleId = new Map<string, File>()
+      const trimmedPresetBeatFiles = new Map<number, File>()
       let selectedPresetBeatFile: File | null = null
       if (nextResolution) {
         for (const sample of data.preset.samples.filter(requiredImportSample)) {
@@ -1678,6 +1714,16 @@ export default function App() {
           }
           filesToDecode.add(resolution.file)
           selectedPresetBeatFile = resolution.file
+        }
+        for (let beatIndex = 0; beatIndex < data.preset.beatFiles.length; beatIndex += 1) {
+          const trimKey = presetBeatTrimKey(data.presetBeatTrimId, beatIndex)
+          if (!data.beatTrims[trimKey]) continue
+          const resolution = nextResolution.beats[beatIndex]
+          if (resolution?.status !== 'resolved' || !resolution.file) {
+            throw new SessionLibraryError('corrupt', 'The saved trim refers to a missing preset beat. Delete it and save again while that beat is available.')
+          }
+          filesToDecode.add(resolution.file)
+          trimmedPresetBeatFiles.set(beatIndex, resolution.file)
         }
       }
 
@@ -1712,6 +1758,18 @@ export default function App() {
             throw new SessionLibraryError('corrupt', 'Could not decode the saved preset beat. Delete the saved item and check the original audio file.')
           }
         }
+        for (const [beatIndex, originalFile] of trimmedPresetBeatFiles) {
+          const validation = copied?.validationBySource.get(originalFile)
+          const region = data.beatTrims[presetBeatTrimKey(data.presetBeatTrimId, beatIndex)]
+          if (validation?.status !== 'valid' || !region) {
+            throw new SessionLibraryError('corrupt', 'A saved manual trim falls outside the decoded preset beat. Delete it and save a valid trim.')
+          }
+          const loopEndSeconds = region.loopEndSeconds ?? validation.durationSeconds
+          if (region.startOffsetSeconds >= validation.durationSeconds
+            || loopEndSeconds <= region.startOffsetSeconds || loopEndSeconds > validation.durationSeconds) {
+            throw new SessionLibraryError('corrupt', 'A saved manual trim falls outside the decoded preset beat. Delete it and save a valid trim.')
+          }
+        }
       }
 
       let restoredCustomBeatFile: File | null = null
@@ -1727,6 +1785,20 @@ export default function App() {
           throw new SessionLibraryError('corrupt', 'Could not decode the saved custom beat: ' + describeError(error) + ' Delete the saved item and choose a readable audio file.')
         } finally {
           if (context && context.state !== 'closed') await context.close().catch(() => undefined)
+        }
+      }
+
+      if (data.customBeatTrimId) {
+        const customRegion = data.beatTrims[customBeatTrimKey(data.customBeatTrimId)]
+        if (customRegion) {
+          const duration = restoredCustomBeatBuffer?.duration
+          const loopEndSeconds = customRegion.loopEndSeconds ?? duration
+          if (!Number.isFinite(duration) || duration === undefined || duration <= 0
+            || customRegion.startOffsetSeconds >= duration
+            || loopEndSeconds === undefined || loopEndSeconds <= customRegion.startOffsetSeconds
+            || loopEndSeconds > duration) {
+            throw new SessionLibraryError('corrupt', 'The saved manual trim falls outside the decoded custom beat. Delete it and save a valid trim.')
+          }
         }
       }
 
@@ -1767,6 +1839,9 @@ export default function App() {
       setSelectedBeatIndex(data.selectedBeatIndex)
       setCustomBeatFile(restoredCustomBeatFile)
       setCustomBeatBuffer(restoredCustomBeatBuffer)
+      setPresetBeatTrimId(data.presetBeatTrimId)
+      setCustomBeatTrimId(data.customBeatTrimId)
+      setBeatTrims(data.beatTrims)
       setCustomBeatSelected(data.customBeatSelected)
       setCustomBeatReferenceBpm(data.customBeatReferenceBpm)
       setCustomBeatReferenceBpmInput(data.customBeatReferenceBpmInput)
@@ -1940,11 +2015,14 @@ export default function App() {
         }
         const requestedRawTicks = DEFAULT_COMBO_BEATS * LEGACY_TICKS_PER_BEAT
         const generated = legacyFixtureFor(loaded.preset, requestedRawTicks)
+        const nextPresetBeatTrimId = createBeatTrimId()
 
         assetIndexRef.current = nextIndex
         setAssetIndex(nextIndex)
         setAssetResolution(nextResolution)
         setPreset(loaded.preset)
+        setPresetBeatTrimId(nextPresetBeatTrimId)
+        setBeatTrims((current) => retainedBeatTrimsForPreset(current, nextPresetBeatTrimId, customBeatTrimId))
         sourceControlDefaultsRef.current = {
           bpm: loaded.preset.bpm,
           sampleVolume: loaded.preset.sampleVolume,
@@ -1987,6 +2065,7 @@ export default function App() {
   }
 
   const selectDemoPreset = () => {
+    const nextPresetBeatTrimId = createBeatTrimId()
     clearLocalImportDraft()
     resetAutoGeneration()
     setActiveSavedSessionId(null)
@@ -2004,6 +2083,8 @@ export default function App() {
     setIsReadingPreset(false)
     setIsPresetReady(true)
     setPreset(DEMO_PRESET)
+    setPresetBeatTrimId(nextPresetBeatTrimId)
+    setBeatTrims((current) => retainedBeatTrimsForPreset(current, nextPresetBeatTrimId, customBeatTrimId))
     sourceControlDefaultsRef.current = {
       bpm: DEMO_PRESET.bpm,
       sampleVolume: DEMO_PRESET.sampleVolume,
@@ -2358,6 +2439,7 @@ export default function App() {
     }
     const firstReadyBeat = prepared.snapshotResolution.beats.findIndex((asset) => asset.status === 'resolved' && Boolean(asset.file))
     const nextTempo = String(initialPracticeTempo(prepared.preset.bpm, customBeatSelected ? customBeatReferenceBpm : null))
+    const nextPresetBeatTrimId = createBeatTrimId()
 
     resetAutoGeneration()
     setActiveSavedSessionId(null)
@@ -2375,6 +2457,8 @@ export default function App() {
     setIsReadingPreset(false)
     setIsPresetReady(true)
     setPreset(prepared.preset)
+    setPresetBeatTrimId(nextPresetBeatTrimId)
+    setBeatTrims((current) => retainedBeatTrimsForPreset(current, nextPresetBeatTrimId, customBeatTrimId))
     setPresetFileName(prepared.iniFileName)
     setSourceIniText(prepared.iniText)
     setEditingSample(null)
@@ -2490,8 +2574,11 @@ export default function App() {
     if (!Number.isFinite(referenceBpm) || referenceBpm < 1 || !tempoRange) return
 
     const practiceTempo = Math.min(tempoRange.max, Math.max(tempoRange.min, referenceBpm))
+    const nextCustomBeatTrimId = createBeatTrimId()
     setCustomBeatFile(customBeatCandidate.file)
     setCustomBeatBuffer(customBeatCandidate.buffer)
+    setCustomBeatTrimId(nextCustomBeatTrimId)
+    setBeatTrims((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key.startsWith('preset:'))))
     setCustomBeatSelected(true)
     setCustomBeatReferenceBpm(referenceBpm)
     setCustomBeatReferenceBpmInput(String(referenceBpm))
@@ -2606,6 +2693,44 @@ export default function App() {
     setCustomBeatSelected(false)
     setActionError(null)
     setTransportNote(value === 'none' ? 'No beat bed selected.' : 'Built-in beat selected. Playback has not started.')
+  }
+
+  const handleApplyBeatTrim = (region: SavedBeatTrimRegion, decodedDurationSeconds: number) => {
+    if (isPlaybackLockedNow() || savedLibraryBusy || !activeBeatTrimKey) return
+    const { startOffsetSeconds, loopEndSeconds } = region
+    const endSeconds = loopEndSeconds ?? decodedDurationSeconds
+    if (!Number.isFinite(decodedDurationSeconds) || decodedDurationSeconds <= 0 || decodedDurationSeconds > 600
+      || !Number.isFinite(startOffsetSeconds) || startOffsetSeconds < 0
+      || !Number.isFinite(endSeconds) || endSeconds <= startOffsetSeconds || endSeconds > decodedDurationSeconds + 0.000001) return
+
+    const normalizedRegion: SavedBeatTrimRegion = {
+      startOffsetSeconds,
+      loopEndSeconds: loopEndSeconds === null || endSeconds >= decodedDurationSeconds - 0.000001 ? null : endSeconds,
+    }
+    setBeatTrims((current) => {
+      if (normalizedRegion.startOffsetSeconds === 0 && normalizedRegion.loopEndSeconds === null) {
+        const next = { ...current }
+        delete next[activeBeatTrimKey]
+        return next
+      }
+      return { ...current, [activeBeatTrimKey]: normalizedRegion }
+    })
+    setActionError(null)
+    setTransportNote(normalizedRegion.startOffsetSeconds === 0 && normalizedRegion.loopEndSeconds === null
+      ? 'Full-clip playback selected for ' + (beatTrimSourceName ?? 'the selected beat') + '. The next Play will use the whole clip.'
+      : 'Manual cue and loop trim applied to ' + (beatTrimSourceName ?? 'the selected beat') + '. Playback will use this region on the next Play.')
+  }
+
+  const handleResetBeatTrim = () => {
+    if (isPlaybackLockedNow() || savedLibraryBusy || !activeBeatTrimKey) return
+    setBeatTrims((current) => {
+      if (!(activeBeatTrimKey in current)) return current
+      const next = { ...current }
+      delete next[activeBeatTrimKey]
+      return next
+    })
+    setActionError(null)
+    setTransportNote('Manual trim cleared for ' + (beatTrimSourceName ?? 'the selected beat') + '. The full beat clip will play next time.')
   }
 
   const handleTtmGuideChange = (sampleId: string, selection: string) => {
@@ -2846,6 +2971,7 @@ export default function App() {
       sampleVolume,
       beatVolume,
       ...(includeBeat && selectedBeatFile ? { beatFile: selectedBeatFile } : {}),
+      ...(includeBeat && activeBeatTrim ? { beatPlaybackRegion: activeBeatTrim } : {}),
       ...(includeBeat && customBeatSelected && customBeatBuffer && beatReferenceBpm !== null
         ? { beatBuffer: customBeatBuffer, beatReferenceBpm }
         : {}),
@@ -3256,6 +3382,14 @@ export default function App() {
           customBeatCandidateBpm={customBeatCandidateBpm}
           customBeatCandidateMessage={customBeatAnalysisMessage}
           customBeatCandidateReady={Boolean(customBeatCandidate?.buffer)}
+          beatTrimSourceKey={activeBeatTrimKey}
+          beatTrimSourceName={beatTrimSourceName}
+          beatTrimSourceReferenceBpm={customBeatSelected
+            ? customBeatFile && customBeatReferenceBpm !== null ? customBeatReferenceBpm : null
+            : selectedBeatFile ? preset.bpm : null}
+          beatTrimSourceFile={customBeatSelected ? customBeatFile : selectedBeatFile ?? null}
+          beatTrimSourceBuffer={customBeatSelected ? customBeatBuffer : null}
+          beatTrim={activeBeatTrim}
           disabled={sessionControlsDisabled}
           beatSelectionDisabled={isPlaybackLocked || isCustomBeatAnalysisBusy || savedLibraryBusy}
           onBpmChange={handleBpmChange}
@@ -3267,6 +3401,8 @@ export default function App() {
           onCustomBeatCandidateBpmChange={setCustomBeatCandidateBpm}
           onUseCustomBeat={handleUseCustomBeat}
           onCustomBeatReferenceBpmChange={handleCustomBeatReferenceBpmChange}
+          onApplyBeatTrim={handleApplyBeatTrim}
+          onResetBeatTrim={handleResetBeatTrim}
           onReset={handleResetSessionControls}
         />
         </div>

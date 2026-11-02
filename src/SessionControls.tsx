@@ -1,10 +1,189 @@
-import type { ChangeEvent } from 'react'
+import { useEffect, useState, type ChangeEvent } from 'react'
 import type { AssetResolution } from './domain'
+import { loadWaveform, WAVEFORM_VIEWBOX_HEIGHT, type WaveformData } from './waveforms/waveform'
+import type { SavedBeatTrimRegion } from './session-library/storage'
 import './SessionControls.css'
 
 export type CustomBeatAnalysisStatus = 'idle' | 'analyzing' | 'detected' | 'ambiguous' | 'insufficient' | 'error'
 
 export type TempoRange = { min: number; max: number }
+
+type BeatTrimControlsProps = {
+  sourceKey: string | null
+  sourceName: string | null
+  sourceReferenceBpm: number | null
+  sourceFile: File | null
+  sourceBuffer: AudioBuffer | null
+  appliedRegion: SavedBeatTrimRegion | null
+  disabled: boolean
+  onApply: (region: SavedBeatTrimRegion, decodedDurationSeconds: number) => void
+  onReset: () => void
+}
+
+function BeatTrimControls({
+  sourceKey,
+  sourceName,
+  sourceReferenceBpm,
+  sourceFile,
+  sourceBuffer,
+  appliedRegion,
+  disabled,
+  onApply,
+  onReset,
+}: BeatTrimControlsProps) {
+  const [expanded, setExpanded] = useState(false)
+  const [waveform, setWaveform] = useState<WaveformData | null>(null)
+  const [waveformStatus, setWaveformStatus] = useState<'idle' | 'loading' | 'ready' | 'unavailable'>('idle')
+  const [startInput, setStartInput] = useState('0')
+  const [endInput, setEndInput] = useState('')
+
+  useEffect(() => {
+    setStartInput(appliedRegion ? String(appliedRegion.startOffsetSeconds) : '0')
+    setEndInput(appliedRegion?.loopEndSeconds === null || !appliedRegion ? '' : String(appliedRegion.loopEndSeconds))
+  }, [sourceKey, appliedRegion?.startOffsetSeconds, appliedRegion?.loopEndSeconds])
+
+  useEffect(() => {
+    if (!expanded || !sourceFile) {
+      setWaveform(null)
+      setWaveformStatus('idle')
+      return
+    }
+    let cancelled = false
+    setWaveform(null)
+    setWaveformStatus('loading')
+    void loadWaveform(sourceFile).then((result) => {
+      if (cancelled) return
+      setWaveform(result)
+      setWaveformStatus(result ? 'ready' : 'unavailable')
+    })
+    return () => { cancelled = true }
+  }, [expanded, sourceKey, sourceFile])
+
+  const decodedDurationSeconds = sourceBuffer?.duration ?? waveform?.durationSeconds ?? null
+  const numericStart = Number(startInput)
+  const numericEnd = endInput.trim() === '' ? decodedDurationSeconds : Number(endInput)
+  const sourceReady = Boolean(sourceKey && sourceFile && sourceName && sourceReferenceBpm !== null)
+  const durationReady = decodedDurationSeconds !== null && Number.isFinite(decodedDurationSeconds) && decodedDurationSeconds > 0
+  const startValid = Number.isFinite(numericStart) && numericStart >= 0 && durationReady && numericStart < decodedDurationSeconds
+  const endValid = durationReady && numericEnd !== null && Number.isFinite(numericEnd)
+    && numericEnd > numericStart && numericEnd <= decodedDurationSeconds
+  const rangeValid = sourceReady && startValid && endValid
+  const showRangeError = sourceReady && durationReady && (startInput !== '' || endInput !== '') && !rangeValid
+  const rangeMessage = !startValid
+    ? 'The first downbeat must be at or after 0 seconds and before the decoded clip end (' + (decodedDurationSeconds?.toFixed(3) ?? '—') + ' seconds).'
+    : 'Loop end must be after the first downbeat and no later than the decoded clip end (' + (decodedDurationSeconds?.toFixed(3) ?? '—') + ' seconds).'
+  const startFraction = durationReady && Number.isFinite(numericStart)
+    ? Math.max(0, Math.min(1, numericStart / decodedDurationSeconds))
+    : 0
+  const endFraction = durationReady && numericEnd !== null && Number.isFinite(numericEnd)
+    ? Math.max(0, Math.min(1, numericEnd / decodedDurationSeconds))
+    : 1
+  const markerWidth = waveform?.peaks.length ?? 192
+  const startMarker = startFraction * markerWidth
+  const endMarker = endFraction * markerWidth
+
+  const apply = () => {
+    if (!rangeValid || decodedDurationSeconds === null) return
+    const fullEnd = numericEnd !== null && numericEnd >= decodedDurationSeconds - 0.000001
+    onApply({
+      startOffsetSeconds: numericStart,
+      loopEndSeconds: fullEnd ? null : numericEnd,
+    }, decodedDurationSeconds)
+  }
+
+  return (
+    <details
+      className="session-controls__beat-trim"
+      onToggle={(event) => setExpanded(event.currentTarget.open)}
+    >
+      <summary>Manual beat trim</summary>
+      <div className="session-controls__beat-trim-body">
+        {sourceReady ? (
+          <>
+            <p className="session-controls__beat-trim-context">
+              {sourceName} · source BPM {sourceReferenceBpm} · {durationReady ? decodedDurationSeconds.toFixed(3) + ' seconds decoded' : waveformStatus === 'loading' ? 'checking decoded length…' : 'decoded length unavailable'}
+            </p>
+            {waveform?.path && durationReady && (
+              <svg
+                className="session-controls__trim-waveform"
+                viewBox={'0 0 ' + markerWidth + ' ' + WAVEFORM_VIEWBOX_HEIGHT}
+                role="img"
+                aria-label={'Waveform of ' + sourceName + ', with cue and loop-end markers'}
+                preserveAspectRatio="none"
+              >
+                <rect x="0" y="0" width={markerWidth} height={WAVEFORM_VIEWBOX_HEIGHT} className="session-controls__trim-waveform-track" />
+                <rect x={startMarker} y="0" width={Math.max(0, endMarker - startMarker)} height={WAVEFORM_VIEWBOX_HEIGHT} className="session-controls__trim-waveform-region" />
+                <path d={waveform.path} className="session-controls__trim-waveform-path" />
+                <line x1={startMarker} y1="0" x2={startMarker} y2={WAVEFORM_VIEWBOX_HEIGHT} className="session-controls__trim-waveform-cue" />
+                <line x1={endMarker} y1="0" x2={endMarker} y2={WAVEFORM_VIEWBOX_HEIGHT} className="session-controls__trim-waveform-end" />
+              </svg>
+            )}
+            {waveformStatus === 'unavailable' && (
+              <p className="session-controls__hint">Waveform preview is unavailable in this browser. The numeric cue and loop controls use the decoded clip length.</p>
+            )}
+            {!durationReady && (
+              <p className="session-controls__hint" role="status" aria-live="polite">
+                {waveformStatus === 'loading' ? 'Decoding the selected beat to bound trim values…' : 'Could not read a decoded clip length for this beat. Choose another beat or reload the preset.'}
+              </p>
+            )}
+            <div className="session-controls__trim-fields">
+              <label className="session-controls__trim-field" htmlFor="beat-trim-start">
+                <span>First downbeat / loop start (seconds)</span>
+                <input
+                  id="beat-trim-start"
+                  aria-label="First downbeat / loop start (seconds)"
+                  aria-describedby="beat-trim-help"
+                  aria-invalid={durationReady && !startValid}
+                  type="number"
+                  inputMode="decimal"
+                  min="0"
+                  max={durationReady ? decodedDurationSeconds : undefined}
+                  step="0.001"
+                  value={startInput}
+                  disabled={disabled || !durationReady}
+                  onChange={(event) => setStartInput(event.currentTarget.value)}
+                />
+              </label>
+              <label className="session-controls__trim-field" htmlFor="beat-trim-end">
+                <span>Loop end (seconds)</span>
+                <input
+                  id="beat-trim-end"
+                  aria-label="Loop end (seconds)"
+                  aria-describedby="beat-trim-help"
+                  aria-invalid={durationReady && endInput !== '' && !endValid}
+                  type="number"
+                  inputMode="decimal"
+                  min="0"
+                  max={durationReady ? decodedDurationSeconds : undefined}
+                  step="0.001"
+                  placeholder={durationReady ? decodedDurationSeconds.toFixed(3) + ' · full length' : 'Full length'}
+                  value={endInput}
+                  disabled={disabled || !durationReady}
+                  onChange={(event) => setEndInput(event.currentTarget.value)}
+                />
+              </label>
+            </div>
+            <p id="beat-trim-help" className="session-controls__hint">
+              The first downbeat is the playback cue and loop start. Leave loop end blank to use the decoded end; its boundary is exclusive.
+            </p>
+            {showRangeError && <p className="session-controls__trim-error" role="alert">{rangeMessage}</p>}
+            <p className="session-controls__trim-status" role="status" aria-live="polite" aria-atomic="true">
+              {appliedRegion
+                ? 'Applied: cue ' + appliedRegion.startOffsetSeconds.toFixed(3) + 's · loop end ' + (appliedRegion.loopEndSeconds === null ? 'full length' : appliedRegion.loopEndSeconds.toFixed(3) + 's') + '. Changes take effect on the next Play.'
+                : 'Full clip — no manual trim applied.'}
+            </p>
+            <div className="session-controls__trim-actions">
+              <button className="button button--small" type="button" disabled={disabled || !rangeValid} onClick={apply}>Apply beat trim</button>
+              <button className="button button--small" type="button" disabled={disabled || !appliedRegion} onClick={onReset}>Reset beat trim</button>
+            </div>
+          </>
+        ) : (
+          <p className="session-controls__hint">Choose an applied preset or custom beat to set its first downbeat and clean loop end.</p>
+        )}
+      </div>
+    </details>
+  )
+}
 
 export function getTempoRange(referenceBpm: number, beatReferenceBpm?: number | null): TempoRange | null {
   const min = Math.max(1, referenceBpm * 0.5, beatReferenceBpm ? beatReferenceBpm * 0.5 : 1)
@@ -30,6 +209,12 @@ export type SessionControlsProps = {
   customBeatCandidateBpm: string
   customBeatCandidateMessage: string
   customBeatCandidateReady: boolean
+  beatTrimSourceKey: string | null
+  beatTrimSourceName: string | null
+  beatTrimSourceReferenceBpm: number | null
+  beatTrimSourceFile: File | null
+  beatTrimSourceBuffer: AudioBuffer | null
+  beatTrim: SavedBeatTrimRegion | null
   disabled: boolean
   beatSelectionDisabled?: boolean
   onBpmChange: (value: string) => void
@@ -41,6 +226,8 @@ export type SessionControlsProps = {
   onCustomBeatCandidateBpmChange: (value: string) => void
   onUseCustomBeat: () => void
   onCustomBeatReferenceBpmChange: (value: string) => void
+  onApplyBeatTrim: (region: SavedBeatTrimRegion, decodedDurationSeconds: number) => void
+  onResetBeatTrim: () => void
   onReset: () => void
 }
 
@@ -62,6 +249,12 @@ export function SessionControls({
   customBeatCandidateBpm,
   customBeatCandidateMessage,
   customBeatCandidateReady,
+  beatTrimSourceKey,
+  beatTrimSourceName,
+  beatTrimSourceReferenceBpm,
+  beatTrimSourceFile,
+  beatTrimSourceBuffer,
+  beatTrim,
   disabled,
   beatSelectionDisabled = false,
   onBpmChange,
@@ -73,6 +266,8 @@ export function SessionControls({
   onCustomBeatCandidateBpmChange,
   onUseCustomBeat,
   onCustomBeatReferenceBpmChange,
+  onApplyBeatTrim,
+  onResetBeatTrim,
   onReset,
 }: SessionControlsProps) {
   const beatReferenceBpm = customBeatSelected ? customBeatReferenceBpm : null
@@ -337,6 +532,18 @@ export function SessionControls({
           </div>
         )}
       </div>
+
+      <BeatTrimControls
+        sourceKey={beatTrimSourceKey}
+        sourceName={beatTrimSourceName}
+        sourceReferenceBpm={beatTrimSourceReferenceBpm}
+        sourceFile={beatTrimSourceFile}
+        sourceBuffer={beatTrimSourceBuffer}
+        appliedRegion={beatTrim}
+        disabled={disabled || beatSelectionDisabled}
+        onApply={onApplyBeatTrim}
+        onReset={onResetBeatTrim}
+      />
     </section>
   )
 }
