@@ -1,0 +1,133 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      PRESET_RELEASE_TAG: presets-v1
+      PRESET_RELEASE_ASSET: built-in-presets.zip
+      EXPECTED_PRESET_PACK_SHA256: f4371ff1ce632f944576cc7e97aa906858d2c2d367534bf307adc9160087775e
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Download and verify built-in preset archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive_directory="$RUNNER_TEMP/preset-archive"
+          mkdir -p "$archive_directory"
+          gh release download "$PRESET_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$PRESET_RELEASE_ASSET" \
+            --dir "$archive_directory"
+          archive="$archive_directory/$PRESET_RELEASE_ASSET"
+          actual_sha256="$(sha256sum "$archive" | cut -d ' ' -f1)"
+          if [[ "$actual_sha256" != "$EXPECTED_PRESET_PACK_SHA256" ]]; then
+            echo "Preset archive SHA-256 mismatch: $actual_sha256" >&2
+            exit 1
+          fi
+          python - "$archive" public/private-presets <<'PY'
+          import json
+          import pathlib
+          import stat
+          import sys
+          import zipfile
+
+          archive = pathlib.Path(sys.argv[1])
+          destination = pathlib.Path(sys.argv[2])
+          expected_ini = {
+              "SSC-085BPM-01.ini",
+              "SSC-085BPM-02.ini",
+              "SSC-085BPM-03.ini",
+              "SSC-085BPM-04.ini",
+              "SSC-085BPM-05.ini",
+              "SSC-096BPM2-01.ini",
+          }
+          expected_ids = {name[:-4] for name in expected_ini}
+          with zipfile.ZipFile(archive) as bundle:
+              entries = [entry for entry in bundle.infolist() if not entry.is_dir()]
+              names = [entry.filename for entry in entries]
+              if len(entries) != 129 or len(set(names)) != 129:
+                  raise SystemExit("Preset archive must contain 129 unique files.")
+              wav_names = set()
+              ini_names = set()
+              for entry in entries:
+                  name = entry.filename
+                  path = pathlib.PurePosixPath(name)
+                  mode = (entry.external_attr >> 16) & 0o170000
+                  if (not name or "\\" in name or ":" in name or path.is_absolute()
+                          or any(part in {"", ".", ".."} for part in path.parts)
+                          or (mode and mode != stat.S_IFREG)):
+                      raise SystemExit(f"Unsafe preset archive entry: {name!r}")
+                  if name == "catalog.json":
+                      continue
+                  if name in expected_ini:
+                      ini_names.add(name)
+                      continue
+                  if (len(path.parts) == 2 and path.parts[0] in {"085BPM", "096BPM2"}
+                          and path.suffix.lower() == ".wav"):
+                      wav_names.add(name)
+                      continue
+                  raise SystemExit(f"Unsupported preset archive entry: {name!r}")
+              if "catalog.json" not in names or ini_names != expected_ini or len(wav_names) != 122:
+                  raise SystemExit("Preset archive contents do not match the supported catalog.")
+              catalog = json.loads(bundle.read("catalog.json"))
+              ids = {entry.get("id") for entry in catalog.get("presets", []) if isinstance(entry, dict)}
+              if (catalog.get("version") != 1
+                      or catalog.get("defaultPresetId") != "SSC-085BPM-01"
+                      or ids != expected_ids
+                      or len(catalog.get("presets", [])) != 6):
+                  raise SystemExit("Preset catalog does not match the supported presets.")
+              destination.mkdir(parents=True, exist_ok=True)
+              bundle.extractall(destination)
+          PY
+
+      - name: Build static site
+        run: npm run build
+        env:
+          VITE_BASE_PATH: /scratch-combo-web/
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: ./dist
+
+      - name: Deploy Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

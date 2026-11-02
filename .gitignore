@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+*.log
+.DS_Store
+desktop.ini
+public/private-presets/
+/.forge/
+/.impeccable/
+/docs/browser-validation.md
+/docs/domain-validation.md
+/docs/generator-parity-plan.md
+/docs/qa-loop-browser-validation.md
+/scripts/prepare-private-presets.mjs
