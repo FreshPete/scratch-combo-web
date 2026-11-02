@@ -1,5 +1,7 @@
 # TTM movement and fader guides
 
+TTM is local-development only while the missing techniques and variants are reviewed. Production keeps the TTM choice disabled and omits guide assignment controls; users see Waveform. The existing local catalogue is intentionally preserved for further work.
+
 The TTM view uses a small set of **illustrative practice guides**. They show record direction and whether the fader is open or closed; they are not transcriptions of the bundled WAVs and are not a complete TTM score editor.
 
 The official [TTM basics](https://www.ttm-dj.com/ttm-01-01-basics/) describes a staff with time on the horizontal axis and record rotation on the vertical axis. Forward movement slopes upward, backward movement slopes downward, and a horizontal line means the record is stopped. A vertical line would represent movement in zero time, so this guide format rejects repeated time coordinates. The source defines a baby/rub as forward and backward record movement with no mixer cut, a forward scratch as similar movement with the return muted by a mixer control, and a chirp as forward/backward strokes cut at the direction change. The charts below are simplified examples based on those descriptions, with arbitrary normalized proportions rather than TTM beat subdivisions.

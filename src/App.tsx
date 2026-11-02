@@ -867,7 +867,7 @@ function SequenceTimeline({
   const unitsPerBeat = timebase === 'legacy' ? LEGACY_TICKS_PER_BEAT : 4
   const unitsPerBar = unitsPerBeat * 4
   const unitDescription = timebase === 'legacy' ? 'legacy ticks' : 'sixteenth units'
-  const view = requestedView
+  const view = import.meta.env.DEV ? requestedView : 'waveform'
 
   useEffect(() => {
     const generation = waveformGeneration.current + 1
@@ -1047,7 +1047,10 @@ function SequenceTimeline({
         <fieldset className="timeline-view-control" aria-label="Timeline view">
           <legend>View</legend>
           <label><input type="radio" name="timeline-view" value="waveform" checked={view === 'waveform'} onChange={() => onViewChange('waveform')} />Waveform</label>
-          <label><input type="radio" name="timeline-view" value="ttm" checked={view === 'ttm'} onChange={() => onViewChange('ttm')} />TTM practice guides</label>
+          <label className={import.meta.env.DEV ? undefined : 'timeline-view-option--disabled'}>
+            <input type="radio" name="timeline-view" value="ttm" checked={view === 'ttm'} disabled={!import.meta.env.DEV} onChange={() => { if (import.meta.env.DEV) onViewChange('ttm') }} />
+            TTM practice guides{!import.meta.env.DEV && <small>Local debug only</small>}
+          </label>
         </fieldset>
         <span className="timing-readout">{fixture.events.length} events</span>
       </figcaption>
@@ -1211,14 +1214,14 @@ function SampleEditor({
           <input id="sample-use" type="checkbox" checked={draft.enabled || draft.silent} disabled={disabled || draft.silent} onChange={(event) => onDraftChange({ ...draft, enabled: event.currentTarget.checked })} />
           <span>{draft.silent ? 'Use sample · always included (silent)' : 'Use sample'}</span>
         </label>
-        <label className="sample-editor__field sample-editor__field--guide" htmlFor="sample-ttm-guide">
+        {import.meta.env.DEV && <label className="sample-editor__field sample-editor__field--guide" htmlFor="sample-ttm-guide">
           <span>TTM guide</span>
           <select id="sample-ttm-guide" aria-label={'TTM guide for ' + sample.name} value={selectedGuideId} disabled={disabled} onChange={(event) => onTtmGuideChange(event.currentTarget.value)}>
             <option value={UNTRANSCRIBED.kind}>{!ttmGuideIsExplicit && !suggestedGuide ? 'Unassigned · Untranscribed' : 'Untranscribed'}</option>
             {Object.values(TTM_GUIDES).map((guide) => <option key={guide.id} value={guide.id}>{!ttmGuideIsExplicit && suggestedGuide === guide.id ? 'Suggested: ' : ''}{guide.label}</option>)}
           </select>
           <small>{guideHelperText}</small>
-        </label>
+        </label>}
       </div>
       <div className="sample-editor__actions">
         <button className="button button--small" type="button" disabled={disabled} onClick={onCancel}>Cancel</button>
@@ -2227,7 +2230,7 @@ export default function App() {
   }
 
   const handleTtmGuideChange = (sampleId: string, selection: string) => {
-    if (isPlaybackLockedNow()) return
+    if (!import.meta.env.DEV || isPlaybackLockedNow()) return
     const nextSelection: TtmSampleGuideSelection = selection === UNTRANSCRIBED.kind
       ? UNTRANSCRIBED
       : getTtmGuide(selection)?.id ?? UNTRANSCRIBED
@@ -2783,7 +2786,7 @@ export default function App() {
                 view={timelineView}
                 layout={timelineLayout}
                 ttmAnnotations={ttmAnnotations}
-                onViewChange={setTimelineView}
+                onViewChange={(view) => { if (import.meta.env.DEV) setTimelineView(view) }}
                 onLayoutChange={setTimelineLayout}
               />
             : <div className="sequence-empty" role="status" aria-live="polite">

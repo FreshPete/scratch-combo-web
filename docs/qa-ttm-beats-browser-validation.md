@@ -1,5 +1,7 @@
 # Browser validation: TTM guides, beat sources, and workspace navigation
 
+> **Production gate update (2026-11-02):** TTM guides are development-only. The current Pages preview disables the “TTM practice guides — Local debug only” radio, always renders waveforms, and omits guide assignment controls. Results, coverage notes, and production TTM screenshots below are historical pre-gate evidence. The current gate passed a focused production Pages check in Edge and Chrome (1/1 each); the existing development browser test still passes (1/1 Edge).
+
 ## Results
 
 - Full unit suite: **182/182 passed** across 14 files.

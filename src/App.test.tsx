@@ -661,22 +661,24 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByText(/No guide is assigned/i)).toBeInTheDocument()
   })
 
-  it('keeps TTM guides and assignment controls available in production', async () => {
+  it('disables local TTM guides and hides guide assignment controls in production', async () => {
     vi.stubEnv('DEV', false)
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
 
-    const ttmView = screen.getByRole('radio', { name: 'TTM practice guides' })
-    expect(ttmView).toBeEnabled()
-    expect(screen.getByRole('radio', { name: 'Waveform' })).toBeChecked()
+    const ttmView = screen.getByRole('radio', { name: /TTM practice guides.*Local debug only/i })
+    const waveformView = screen.getByRole('radio', { name: 'Waveform' })
+    expect(ttmView).toBeDisabled()
+    expect(screen.getByText('Local debug only')).toBeVisible()
+    expect(waveformView).toBeChecked()
 
     fireEvent.click(ttmView)
-    expect(screen.getByRole('radio', { name: 'TTM practice guides' })).toBeChecked()
-    expect(document.querySelector('.ttm-guide-legend')).toBeInTheDocument()
-    expect(screen.queryByText('Local debug only')).not.toBeInTheDocument()
+    expect(waveformView).toBeChecked()
+    expect(document.querySelector('.ttm-guide-legend')).not.toBeInTheDocument()
+    expect(document.querySelector('[class*="sequence-ttm-"]')).not.toBeInTheDocument()
     selectWorkspaceTab('Samples')
     fireEvent.click(screen.getByRole('button', { name: 'Edit Bundled kick' }))
-    expect(screen.getByRole('combobox', { name: 'TTM guide for Bundled kick' })).toBeEnabled()
+    expect(screen.queryByRole('combobox', { name: /TTM guide for/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(screen.queryByRole('combobox', { name: /TTM guide for/ })).not.toBeInTheDocument()
   })

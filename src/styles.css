@@ -212,6 +212,7 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
 .timeline-view-control input { width: 13px; height: 13px; margin: 0; accent-color: var(--accent); }
 .timeline-view-control .timeline-view-option--disabled { color: var(--text-muted); cursor: not-allowed; }
 .timeline-view-control .timeline-view-option--disabled input { cursor: not-allowed; }
+.timeline-view-control .timeline-view-option--disabled small { color: var(--text-muted); font-size: 8px; font-weight: 500; }
 .timeline-debug-note { color: var(--text-muted); font-family: var(--mono); font-size: 8px; white-space: nowrap; }
 .timeline-caption > span:first-child { display: flex; align-items: baseline; gap: 10px; }
 .timeline-caption strong { color: var(--text); font-size: 12px; font-weight: 620; }

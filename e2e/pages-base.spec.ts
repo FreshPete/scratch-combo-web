@@ -1,6 +1,4 @@
 import { expect, test, type Page } from '@playwright/test'
-import { mkdirSync } from 'node:fs'
-import path from 'node:path'
 import { createValidWizardFixture } from './fixtures/import-wizard-fixtures'
 import { expectStepTwoFocus } from './helpers/import-wizard'
 
@@ -155,12 +153,7 @@ async function assertTimelineCaptionItemsDoNotOverlap(page: Page): Promise<void>
   }
 }
 
-function proofPath(name: string): string {
-  const browser = (process.env.PLAYWRIGHT_CHANNEL ?? 'msedge').toLowerCase().replace(/[^a-z0-9-]+/g, '-')
-  return path.resolve(process.cwd(), 'docs/images', `pages-production-${name}-${browser}.png`)
-}
-
-test('production Pages preview renders 85 BPM TTM guides, assignments, fader states, Grid/Inline playback, and the worklet', async ({ page }) => {
+test('production Pages preview gates TTM and keeps waveform Grid/Inline playback and the worklet', async ({ page }) => {
   test.setTimeout(120_000)
   await instrumentBeatSource(page)
   await page.setViewportSize({ width: 1280, height: 900 })
@@ -197,8 +190,8 @@ test('production Pages preview renders 85 BPM TTM guides, assignments, fader sta
   const ttmView = page.getByRole('radio', { name: 'TTM practice guides' })
   await expect(waveformView).toBeChecked()
   await expect(ttmView).toBeVisible()
-  await expect(ttmView).toBeEnabled()
-  await expect(page.getByText(/Local debug only/i)).toHaveCount(0)
+  await expect(ttmView).toBeDisabled()
+  await expect(ttmView).toHaveAccessibleName(/TTM practice guides.*Local debug only/i)
   await expect(page.getByRole('img', { name: /Sequence timeline: 128 legacy ticks/ })).toBeVisible()
   await expect(page.locator('.sequence-waveform path').first()).toBeVisible()
   const peakFillColors = await page.locator('.sequence-waveform path').evaluateAll((paths) => Array.from(new Set(
@@ -206,139 +199,46 @@ test('production Pages preview renders 85 BPM TTM guides, assignments, fader sta
   )))
   expect(peakFillColors.length).toBeGreaterThanOrEqual(2)
 
-  await ttmView.check()
-  const legend = page.locator('.ttm-guide-legend')
-  await expect(legend).toBeVisible()
-  await expect(legend).toContainText(/Time.*record forward.*backward/)
-  await expect(legend).toContainText(/OPEN.*audible.*CUT.*closed.*muted/)
-  await expect(legend).toContainText(/Illustrative guides only.*not WAV transcriptions/)
-
-  const activeLaneNames = await page.locator('.timeline-lane').evaluateAll((lanes) => lanes
-    .filter((lane) => lane.querySelector('.sequence-event:not(.sequence-event--silent)'))
-    .map((lane) => lane.querySelector('.timeline-lane-name-text')?.textContent?.trim() ?? '')
-    .filter((name) => name && name !== 'Rest'),
-  )
-  const distinctActiveNames = [...new Set(activeLaneNames)]
-  const namesWithoutBuiltInSuggestions = distinctActiveNames.filter((name) =>
-    !new Set(['Baby', 'Baby (F)', 'Baby (R)', 'Baby Fade', 'Chirp']).has(name),
-  )
-  const targetName = namesWithoutBuiltInSuggestions[0]!
-  expect(targetName).toBeTruthy()
-  const untranscribedName = namesWithoutBuiltInSuggestions[1]
-    ?? ['Baby (F)', 'Baby (R)', 'Chirp'].find((name) => distinctActiveNames.includes(name))
-    ?? distinctActiveNames.find((name) => name !== targetName && name !== 'Baby')
-  if (!untranscribedName) throw new Error('The practice combo needs an active second sample for the Untranscribed check.')
-  const targetEventId = await page.locator('.timeline-lane').filter({
-    has: page.locator('.timeline-lane-name-text', { hasText: new RegExp('^' + targetName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$') }),
-  }).locator('.sequence-event[data-event-id]').first().getAttribute('data-event-id')
-  const untranscribedEventId = await page.locator('.timeline-lane').filter({
-    has: page.locator('.timeline-lane-name-text', { hasText: new RegExp('^' + untranscribedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$') }),
-  }).locator('.sequence-event[data-event-id]').first().getAttribute('data-event-id')
-  expect(targetEventId).not.toBeNull()
-  expect(untranscribedEventId).not.toBeNull()
-
   const samplesTab = page.getByRole('tab', { name: 'Samples', exact: true })
   await samplesTab.click()
   await expect(page.locator('.sample-table tbody tr')).toHaveCount(64)
   await page.getByRole('button', { name: 'Edit Baby (F)', exact: true }).click()
-  const suggestedGuide = page.getByLabel('TTM guide for Baby (F)')
-  await expect(suggestedGuide).toHaveValue('forward-movement')
-  await expect(suggestedGuide.locator('option:checked')).toHaveText('Suggested: Forward movement')
-  await expect(page.getByText(/Suggested from the exact sample label only.*no audio is analyzed/i)).toBeVisible()
-  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
-
-  await page.getByRole('button', { name: 'Edit Baby Fade', exact: true }).click()
-  const unassignedGuide = page.getByLabel('TTM guide for Baby Fade')
-  await expect(unassignedGuide).toHaveValue('untranscribed')
-  await expect(unassignedGuide.locator('option:checked')).toHaveText('Unassigned · Untranscribed')
-  await expect(page.getByText(/No guide is assigned/i)).toBeVisible()
-  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
-
-  await page.getByRole('button', { name: 'Edit ' + targetName, exact: true }).click()
-  const targetGuide = page.getByLabel('TTM guide for ' + targetName)
-  await targetGuide.selectOption('forward-cut')
-  await expect(page.getByText(/Session-only illustrative guide/i)).toBeVisible()
-  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
-  await page.getByRole('button', { name: 'Edit ' + untranscribedName, exact: true }).click()
-  const explicitUntranscribed = page.getByLabel('TTM guide for ' + untranscribedName)
-  await explicitUntranscribed.selectOption('untranscribed')
-  await expect(page.getByText('Explicitly Untranscribed for this session. Choose a guide to add an illustrative pattern.')).toBeVisible()
+  await expect(page.getByRole('form', { name: 'Edit Baby (F)' })).toBeVisible()
+  await expect(page.getByLabel('TTM guide for Baby (F)')).toHaveCount(0)
   await page.getByRole('button', { name: 'Cancel', exact: true }).click()
 
   await practiceTab.click()
-  await expect(ttmView).toBeChecked()
-  const targetEvent = page.locator(`.sequence-event[data-event-id="${targetEventId}"]`)
-  const untranscribedEvent = page.locator(`.sequence-event[data-event-id="${untranscribedEventId}"]`)
-  await expect(targetEvent).toHaveClass(/sequence-event--ttm-guide/)
-  const targetMotion = targetEvent.locator('.sequence-ttm-motion path')
-  await expect(targetMotion).toHaveAttribute('d', 'M6 92 L50 8 L94 92')
-  const motionEvidence = await targetMotion.evaluate((pathElement) => {
-    const box = pathElement.getBoundingClientRect()
-    const style = getComputedStyle(pathElement)
-    return {
-      d: pathElement.getAttribute('d') ?? '',
-      stroke: style.stroke,
-      strokeWidth: Number.parseFloat(style.strokeWidth),
-      box: { width: box.width, height: box.height },
-    }
-  })
-  expect(new Set((motionEvidence.d.match(/-?\d+(?:\.\d+)?/g) ?? []).map(Number)).size).toBeGreaterThan(2)
-  expect(motionEvidence.stroke).not.toBe('none')
-  expect(motionEvidence.strokeWidth).toBeGreaterThan(0)
-  expect(motionEvidence.box.width).toBeGreaterThan(0)
-  expect(motionEvidence.box.height).toBeGreaterThan(0)
-  await expect(targetEvent.locator('.sequence-ttm-fader__interval')).toHaveCount(2)
-  await expect(targetEvent.locator('.sequence-ttm-fader__interval--open')).toHaveCount(1)
-  await expect(targetEvent.locator('.sequence-ttm-fader__interval--closed')).toHaveCount(1)
-  const faderIntervals = await targetEvent.locator('.sequence-ttm-fader__interval').evaluateAll((intervals) => intervals.map((interval) => ({
-    state: interval.classList.contains('sequence-ttm-fader__interval--open') ? 'open'
-      : interval.classList.contains('sequence-ttm-fader__interval--closed') ? 'closed' : 'unknown',
-    left: interval.style.left,
-    width: interval.style.width,
-  })))
-  expect(faderIntervals).toEqual([
-    { state: 'open', left: '6%', width: '44%' },
-    { state: 'closed', left: '50%', width: '44%' },
-  ])
-  await expect(untranscribedEvent).toHaveClass(/sequence-event--ttm-untranscribed/)
-  await expect(untranscribedEvent.locator('.sequence-ttm-motion')).toHaveCount(0)
-  await expect(untranscribedEvent.locator('.sequence-ttm-placeholder-mark')).toHaveText('—')
+  await expect(waveformView).toBeChecked()
+  await expect(ttmView).toBeDisabled()
+  await expect(page.locator('.ttm-guide-legend, .sequence-ttm-motion, .sequence-ttm-fader')).toHaveCount(0)
 
-  const proofDirectory = path.resolve(process.cwd(), 'docs/images')
-  mkdirSync(proofDirectory, { recursive: true })
   await page.evaluate(() => window.scrollTo(0, 0))
   await expect(page.getByRole('radio', { name: 'Grid' })).toBeChecked()
+  await expect(page.locator('.ttm-guide-legend, .sequence-ttm-motion, .sequence-ttm-fader')).toHaveCount(0)
   await page.getByRole('button', { name: 'Play sequence' }).click()
   await expect(page.locator('.transport-status')).toContainText('Q&A · question playback', { timeout: 30_000 })
   await expect(page.locator('.sequence-event--active')).toHaveCount(1)
   await expect(page.locator('.timeline-lane--active .timeline-playhead')).toBeVisible()
+  await expect(page.locator('.sequence-waveform path').first()).toBeVisible()
   await expect.poll(() => page.evaluate(() => window.__pagesTtmAudioQa?.beatStarts ?? 0)).toBe(1)
   const beatStopsBeforeViewSwitch = await page.evaluate(() => window.__pagesTtmAudioQa?.beatStops ?? 0)
-  await expect(targetEvent.locator('.sequence-ttm-motion path')).toBeVisible()
-  await expect(targetEvent.locator('.sequence-ttm-fader')).toBeVisible()
   await page.evaluate(() => { if (document.activeElement instanceof HTMLElement) document.activeElement.blur() })
-  await page.screenshot({ path: proofPath('ttm-grid'), fullPage: false })
 
-  await waveformView.check()
-  await expect(page.locator('.sequence-waveform path').first()).toBeVisible()
-  await ttmView.check()
-  await expect(targetEvent.locator('.sequence-ttm-motion path')).toBeVisible()
+  await expect(ttmView).toBeDisabled()
+  await expect(waveformView).toBeChecked()
+  await expect(page.locator('.ttm-guide-legend, .sequence-ttm-motion, .sequence-ttm-fader')).toHaveCount(0)
   expect(await page.evaluate(() => window.__pagesTtmAudioQa?.beatStarts ?? 0)).toBe(1)
   expect(await page.evaluate(() => window.__pagesTtmAudioQa?.beatStops ?? 0)).toBe(beatStopsBeforeViewSwitch)
 
   await page.getByRole('radio', { name: 'Inline' }).check()
-  const inlineTargetEvent = page.locator(`.timeline-inline-row .sequence-event[data-event-id="${targetEventId}"]`)
-  const inlineUntranscribedEvent = page.locator(`.timeline-inline-row .sequence-event[data-event-id="${untranscribedEventId}"]`)
-  await expect(inlineTargetEvent.locator('.sequence-ttm-motion path')).toHaveAttribute('d', 'M6 92 L50 8 L94 92')
-  await expect(inlineTargetEvent.locator('.sequence-ttm-fader__interval--closed')).toBeVisible()
-  await expect(inlineUntranscribedEvent.locator('.sequence-ttm-placeholder-mark')).toHaveText('—')
+  await expect(page.locator('.timeline-inline-row .sequence-waveform path').first()).toBeVisible()
   await expect(page.locator('.sequence-event--active')).toHaveCount(1)
+  await expect(page.locator('.ttm-guide-legend, .sequence-ttm-motion, .sequence-ttm-fader')).toHaveCount(0)
   expect(await page.evaluate(() => window.__pagesTtmAudioQa?.beatStarts ?? 0)).toBe(1)
   expect(await page.evaluate(() => window.__pagesTtmAudioQa?.beatStops ?? 0)).toBe(beatStopsBeforeViewSwitch)
   await expect.poll(async () => Number(await page.locator('.timeline-scroll').getAttribute('data-presentation-position-units')))
     .toBeGreaterThan(0)
   await page.evaluate(() => { if (document.activeElement instanceof HTMLElement) document.activeElement.blur() })
-  await page.screenshot({ path: proofPath('ttm-inline'), fullPage: false })
 
   expect(presetRequests.length).toBeGreaterThan(60)
   expect(
@@ -368,7 +268,6 @@ test('production Pages preview renders 85 BPM TTM guides, assignments, fader sta
   await expect(page.getByRole('slider', { name: 'Pitch shift in semitones' })).toBeVisible()
   await expect(page.getByRole('slider', { name: 'Sample level' })).toBeVisible()
   await expect(page.getByRole('slider', { name: 'Beat level' })).toBeVisible()
-  await page.screenshot({ path: proofPath('session-controls'), fullPage: false })
 })
 
 test('production Pages path imports a local folder and plays only from session snapshots', async ({ page }, testInfo) => {
