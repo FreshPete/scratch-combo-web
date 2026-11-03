@@ -7,7 +7,8 @@ import App from './App'
 
 const audioHarness = vi.hoisted(() => {
   type Snapshot = {
-    status: 'idle' | 'loading' | 'counting-in' | 'playing' | 'completed' | 'error' | 'disposed'
+    status: 'idle' | 'loading' | 'counting-in' | 'playing' | 'paused' | 'completed' | 'error' | 'disposed'
+    pausedFrom?: 'counting-in' | 'playing'
     progress: number
     countIn?: { beat: number; beats: number }
     error?: string
@@ -99,6 +100,17 @@ const audioHarness = vi.hoisted(() => {
   const setSampleVolume = vi.fn()
   const setBeatVolume = vi.fn()
   const setMetronomeVolume = vi.fn()
+  const pause = vi.fn(async () => {
+    if (snapshot.status === 'counting-in' || snapshot.status === 'playing') {
+      emit({ ...snapshot, status: 'paused', pausedFrom: snapshot.status })
+    }
+  })
+  const resume = vi.fn(async () => {
+    if (snapshot.status === 'paused' && snapshot.pausedFrom) {
+      const { pausedFrom, ...previous } = snapshot
+      emit({ ...previous, status: pausedFrom })
+    }
+  })
   const stop = vi.fn(() => { tempoAvailable = false; emit({ status: 'idle', progress: 0 }) })
   const resetAssets = vi.fn(() => { tempoAvailable = false; emit({ status: 'idle', progress: 0 }) })
   const dispose = vi.fn(() => { tempoAvailable = false; emit({ status: 'disposed', progress: 0 }) })
@@ -134,6 +146,8 @@ const audioHarness = vi.hoisted(() => {
     setSampleVolume.mockClear()
     setBeatVolume.mockClear()
     setMetronomeVolume.mockClear()
+    pause.mockClear()
+    resume.mockClear()
     stop.mockClear()
     resetAssets.mockClear()
     dispose.mockClear()
@@ -159,7 +173,7 @@ const audioHarness = vi.hoisted(() => {
   }
   return {
     listeners, subscribe, getSnapshot, getProgress, play, playCyclePlan,
-    setTempo, setPitchSemitones, setSampleVolume, setBeatVolume, setMetronomeVolume,
+    setTempo, setPitchSemitones, setSampleVolume, setBeatVolume, setMetronomeVolume, pause, resume,
     stop, resetAssets, dispose, snapshotReferencedWavFiles, emit, reset,
   }
 })
@@ -192,6 +206,8 @@ vi.mock('./audio', () => ({
     setSampleVolume = audioHarness.setSampleVolume
     setBeatVolume = audioHarness.setBeatVolume
     setMetronomeVolume = audioHarness.setMetronomeVolume
+    pause = audioHarness.pause
+    resume = audioHarness.resume
     stop = audioHarness.stop
     resetAssets = audioHarness.resetAssets
     dispose = audioHarness.dispose
@@ -439,6 +455,32 @@ describe('workspace import and transport lifecycle', () => {
     expect(screen.getByRole('checkbox', { name: 'Enable single-character shortcuts' })).not.toBeChecked()
   })
 
+  it('toggles Play, Pause, and Resume while keeping Stop and P behavior intact', async () => {
+    window.localStorage.setItem('scratch-combo-shortcuts', 'on')
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    selectDemoPreset()
+    const play = screen.getByRole('button', { name: 'Play sequence' })
+    fireEvent.click(play)
+    const pause = await screen.findByRole('button', { name: 'Pause playback' })
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
+
+    fireEvent.click(pause)
+    const resume = await screen.findByRole('button', { name: 'Resume playback' })
+    expect(await screen.findByText('Playback paused. Press Resume playback to continue.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
+    expect(audioHarness.pause).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(resume)
+    await screen.findByRole('button', { name: 'Pause playback' })
+    expect(audioHarness.resume).toHaveBeenCalledTimes(1)
+    audioHarness.stop.mockClear()
+    fireEvent.keyDown(document.body, { key: 'p' })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled())
+    expect(audioHarness.stop).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
+  })
+
   it('starts a sequence after the selected count-in, keeps progress still, and lets P stop the countdown', async () => {
     window.localStorage.setItem('scratch-combo-shortcuts', 'on')
     render(<App />)
@@ -463,6 +505,15 @@ describe('workspace import and transport lifecycle', () => {
 
     const options = audioHarness.playCyclePlan.mock.calls[0]?.[0] as CyclePlanOptions
     expect(options).toEqual(expect.objectContaining({ countInBars: 1, metronomeEnabled: true, metronomeVolume: 68 }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pause playback' }))
+    await screen.findByText('Playback paused · count-in beat 1 of 4.')
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
+    expect(countIn).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Resume playback' }))
+    await screen.findByText('Count-in · beat 1 of 4.')
+    expect(audioHarness.pause).toHaveBeenCalledTimes(1)
+    expect(audioHarness.resume).toHaveBeenCalledTimes(1)
 
     selectWorkspaceTab('Session')
     expect(screen.getByRole('spinbutton', { name: 'BPM' })).toBeDisabled()
@@ -938,7 +989,7 @@ describe('workspace import and transport lifecycle', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
     await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
-    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Pause playback' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Generate combo' })).toBeDisabled()
     expect(screen.getByLabelText('Combo length')).toBeDisabled()
@@ -1034,7 +1085,7 @@ describe('workspace import and transport lifecycle', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Generate combo' }))
     fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
     await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
-    expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Pause playback' })).toBeEnabled()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))

@@ -91,6 +91,7 @@ function makeFakeAudioContext(decodeAudioData?: (data: ArrayBuffer) => Promise<A
     sampleRate: 48_000,
     destination: {} as AudioNode,
     resume: vi.fn(async () => { state = "running"; }),
+    suspend: vi.fn(async () => { state = "suspended"; }),
     close: vi.fn(async () => { state = "closed"; }),
     decodeAudioData: vi.fn(decodeAudioData ?? (async () => makeBuffer())),
     createBuffer: vi.fn((_channels: number, length: number, sampleRate: number) => makeBuffer(length / sampleRate, sampleRate)),
@@ -176,7 +177,8 @@ function makeFakeAudioContext(decodeAudioData?: (data: ArrayBuffer) => Promise<A
     keepAliveSources,
     oscillators,
     gains,
-    setCurrentTime: (value: number) => { currentTime = value; },
+    setCurrentTime: (value: number) => { if (state === "running") currentTime = value; },
+    setState: (value: AudioContextState) => { state = value; },
     setOutputLatency: (value: number) => { outputLatencySeconds = value; },
     setOutputContextTime: (value: number | undefined) => { fixedOutputContextTime = value; },
   };
@@ -257,6 +259,148 @@ describe("AudioTransport", () => {
     expect(fake.sources.map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55, 1.05]);
     expect(transport.getProgress()).toBeCloseTo(0.6);
     transport.dispose();
+  });
+
+  it("pauses and resumes playback on the same frozen audio clock without duplicate sources", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    await transport.play({ fixture, bpm: 120 });
+
+    fake.setCurrentTime(0.45);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing" });
+    const progressAtPause = transport.getProgress();
+    expect(fake.sources).toHaveLength(2);
+
+    await transport.pause();
+    expect(fake.context.suspend).toHaveBeenCalledTimes(1);
+    expect(transport.getSnapshot()).toMatchObject({ status: "paused", pausedFrom: "playing" });
+    const pausedProgress = transport.getProgress();
+    expect(pausedProgress).toBeCloseTo(progressAtPause);
+
+    fake.setCurrentTime(2);
+    runScheduler();
+    expect(fake.context.currentTime).toBeCloseTo(0.45);
+    expect(transport.getProgress()).toBeCloseTo(pausedProgress);
+    expect(fake.sources).toHaveLength(2);
+
+    await transport.resume();
+    expect(fake.context.resume).toHaveBeenCalledTimes(2);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing" });
+    expect(fake.context.currentTime).toBeCloseTo(0.45);
+    expect(fake.sources).toHaveLength(2);
+    expect(fake.sources.map(({ startTimes }) => startTimes[0])).toEqual([0.05, 0.55]);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("pauses and resumes from the current count-in beat without replaying earlier clicks", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport, runScheduler } = makeTransport(fake.context);
+    const oneHit: Fixture = {
+      events: [{ id: "pause-count-in-hit", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    await transport.play({ fixture: oneHit, bpm: 120, countInBars: 1 });
+
+    fake.setCurrentTime(0.45);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ status: "counting-in", countIn: { beat: 1, beats: 4 } });
+    expect(fake.oscillators).toHaveLength(2);
+    expect(fake.oscillators[0]?.startTimes[0]).toBeCloseTo(0.05);
+    expect(fake.oscillators[1]?.startTimes[0]).toBeCloseTo(0.55);
+
+    fake.setCurrentTime(0.6);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ status: "counting-in", countIn: { beat: 2, beats: 4 } });
+
+    await transport.pause();
+    expect(transport.getSnapshot()).toMatchObject({
+      status: "paused",
+      pausedFrom: "counting-in",
+      countIn: { beat: 2, beats: 4 },
+    });
+    fake.setCurrentTime(2);
+    await transport.resume();
+    expect(fake.context.currentTime).toBeCloseTo(0.6);
+    expect(transport.getSnapshot()).toMatchObject({ status: "counting-in", countIn: { beat: 2, beats: 4 } });
+    expect(fake.oscillators).toHaveLength(2);
+    expect(fake.oscillators[0]?.startTimes[0]).toBeCloseTo(0.05);
+    expect(fake.oscillators[1]?.startTimes[0]).toBeCloseTo(0.55);
+
+    fake.setCurrentTime(1.05);
+    runScheduler();
+    expect(transport.getSnapshot()).toMatchObject({ status: "counting-in", countIn: { beat: 3, beats: 4 } });
+    expect(fake.oscillators).toHaveLength(3);
+    expect(fake.oscillators[2]?.startTimes[0]).toBeCloseTo(1.05);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("keeps live tempo changes active while playback is paused", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport } = makeTransport(fake.context, async () => processor.node);
+    await transport.play({ fixture, bpm: 120, referenceBpm: 120 });
+    fake.setCurrentTime(0.4);
+    await transport.pause();
+
+    transport.setTempo(100);
+    expect(processor.playbackRate.value).toBeCloseTo(100 / 120);
+    expect(transport.getSnapshot()).toMatchObject({ status: "paused", pausedFrom: "playing" });
+
+    await transport.resume();
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing" });
+    expect(processor.playbackRate.value).toBeCloseTo(100 / 120);
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("does not let a pending pause suspend a replacement playback after Stop", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport } = makeTransport(fake.context);
+    await transport.play({ fixture, bpm: 120 });
+
+    let finishSuspend: (() => void) | undefined;
+    vi.mocked(fake.context.suspend).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      finishSuspend = () => {
+        fake.setState("suspended");
+        resolve();
+      };
+    }));
+    const pendingPause = transport.pause();
+    transport.stop();
+    expect(transport.getSnapshot()).toEqual({ status: "idle", progress: 0 });
+
+    const replacement = transport.play({ fixture, bpm: 120 });
+    finishSuspend?.();
+    await pendingPause;
+    await replacement;
+    expect(fake.context.resume).toHaveBeenCalledTimes(2);
+    expect(transport.getSnapshot()).toMatchObject({ status: "playing" });
+    transport.stop();
+    transport.dispose();
+  });
+
+  it("does not publish stale paused state after Dispose while suspension is pending", async () => {
+    const fake = makeFakeAudioContext();
+    const { transport } = makeTransport(fake.context);
+    await transport.play({ fixture, bpm: 120 });
+
+    let finishSuspend: (() => void) | undefined;
+    vi.mocked(fake.context.suspend).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      finishSuspend = () => {
+        fake.setState("suspended");
+        resolve();
+      };
+    }));
+    const pendingPause = transport.pause();
+    transport.dispose();
+    expect(transport.getSnapshot()).toEqual({ status: "disposed", progress: 0 });
+
+    finishSuspend?.();
+    await pendingPause;
+    expect(transport.getSnapshot()).toEqual({ status: "disposed", progress: 0 });
   });
 
   it("counts in one 4/4 bar before starting the trimmed beat and first sequence source", async () => {

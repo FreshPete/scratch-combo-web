@@ -12,7 +12,7 @@ import { createTempoPitchProcessor, type TempoPitchProcessorFactory, type TempoP
 import { decodeLocalAudioFile, validateLocalAudioBuffer } from "./beatAnalysis";
 import { resolveBeatPlaybackFrameRange, type BeatPlaybackFrameRange, type BeatPlaybackRegion } from "./beatPlaybackRegion";
 
-export type TransportStatus = "idle" | "loading" | "counting-in" | "playing" | "completed" | "error" | "disposed";
+export type TransportStatus = "idle" | "loading" | "counting-in" | "playing" | "paused" | "completed" | "error" | "disposed";
 
 export interface CountInProgress {
   /** One-based beat currently shown during count-in. */
@@ -23,6 +23,8 @@ export interface CountInProgress {
 
 export interface TransportSnapshot {
   readonly status: TransportStatus;
+  /** Phase that was active when playback was paused. Present only for `status: "paused"`. */
+  readonly pausedFrom?: "counting-in" | "playing";
   /** Scheduler/input-clock progress. AudioWorklet output can trail this clock. */
   readonly progress: number;
   /** Present only while the audible count-in is in progress. */
@@ -310,6 +312,9 @@ export class AudioTransport {
   private context: AudioContext | undefined;
   private activePlayback: ActivePlayback | undefined;
   private intervalHandle: unknown;
+  private pausedFrom: "counting-in" | "playing" | undefined;
+  private pauseOperation: Promise<void> | undefined;
+  private resumeOperation: Promise<void> | undefined;
   private generation = 0;
   private disposed = false;
   private fileBufferCache = new WeakMap<File, Promise<AudioBuffer>>();
@@ -395,12 +400,75 @@ export class AudioTransport {
     },
   );
 
+  /** Freeze the active AudioContext clock, including any count-in already in progress. */
+  pause = (): Promise<void> => {
+    if (this.pauseOperation) return this.pauseOperation;
+    if (this.snapshot.status === "paused") return Promise.resolve();
+
+    const playback = this.activePlayback;
+    if (!playback || (this.snapshot.status !== "playing" && this.snapshot.status !== "counting-in")) {
+      return Promise.resolve();
+    }
+
+    this.pausedFrom = this.snapshot.status;
+    this.stopScheduler();
+    const generation = playback.generation;
+    const operation = (async () => {
+      try {
+        if (playback.context.state !== "suspended") await playback.context.suspend();
+        if (this.activePlayback !== playback || !this.isCurrent(generation) || !this.pausedFrom) return;
+        this.publish(this.pausedSnapshot(playback));
+      } catch (error) {
+        if (this.activePlayback !== playback || !this.isCurrent(generation) || !this.pausedFrom) return;
+        this.cancelRun();
+        this.publish({ status: "error", progress: 0, error: `Could not pause audio: ${describeError(error)}` });
+      }
+    })();
+    const trackedOperation = operation.finally(() => {
+      if (this.pauseOperation === trackedOperation) this.pauseOperation = undefined;
+    });
+    this.pauseOperation = trackedOperation;
+    return trackedOperation;
+  };
+
+  /** Resume the same AudioContext timeline and scheduled sources from their frozen positions. */
+  resume = (): Promise<void> => {
+    if (this.resumeOperation) return this.resumeOperation;
+    const pendingPause = this.pauseOperation;
+    const playback = this.activePlayback;
+    if (!playback || !this.pausedFrom) {
+      return pendingPause ?? Promise.resolve();
+    }
+
+    const generation = playback.generation;
+    const operation = (async () => {
+      try {
+        if (pendingPause) await pendingPause;
+        if (this.activePlayback !== playback || !this.isCurrent(generation) || !this.pausedFrom) return;
+        if (playback.context.state !== "running") await playback.context.resume();
+        if (this.activePlayback !== playback || !this.isCurrent(generation) || !this.pausedFrom) return;
+        this.pausedFrom = undefined;
+        this.startScheduler(playback);
+        this.tick(generation);
+      } catch (error) {
+        if (this.activePlayback !== playback || !this.isCurrent(generation)) return;
+        this.cancelRun();
+        this.publish({ status: "error", progress: 0, error: `Could not resume audio: ${describeError(error)}` });
+      }
+    })();
+    const trackedOperation = operation.finally(() => {
+      if (this.resumeOperation === trackedOperation) this.resumeOperation = undefined;
+    });
+    this.resumeOperation = trackedOperation;
+    return trackedOperation;
+  };
+
   /** Update the active sample layer without changing its scheduled sources or phase. */
   setSampleVolume = (value: number): void => {
     const normalized = volumeValue(value, "Sample volume");
     this.selectedSampleVolume = normalized;
     const playback = this.activePlayback;
-    if (playback && this.snapshot.status === "playing") {
+    if (playback && (this.snapshot.status === "playing" || this.snapshot.status === "paused")) {
       setGainValue(playback.sampleGain, normalized, playback.context.currentTime);
     }
   };
@@ -410,7 +478,7 @@ export class AudioTransport {
     const normalized = volumeValue(value, "Beat volume");
     this.selectedBeatVolume = normalized;
     const playback = this.activePlayback;
-    if (playback?.beatGain && this.snapshot.status === "playing") {
+    if (playback?.beatGain && (this.snapshot.status === "playing" || this.snapshot.status === "paused")) {
       setGainValue(playback.beatGain, normalized, playback.context.currentTime);
     }
   };
@@ -450,6 +518,7 @@ export class AudioTransport {
     const tempoRatio = this.validateTempoRatio(bpm, playback.sampleReferenceBpm);
     const beatTempoRatio = this.validateTempoRatio(bpm, playback.beatReferenceBpm);
     this.selectedBpm = bpm;
+    const pausedPhase = this.snapshot.status === "paused" ? this.pausedFrom : undefined;
     if (playback.tempoTraining) {
       this.restoreCurrentScheduleEpoch(playback, playback.context.currentTime);
       delete playback.tempoTraining;
@@ -467,6 +536,13 @@ export class AudioTransport {
     }
     try {
       this.retimePlayback(playback, bpm, tempoRatio);
+      if (pausedPhase
+        && this.activePlayback === playback
+        && this.isCurrent(playback.generation)
+        && this.pausedFrom === pausedPhase
+        && this.snapshot.status !== "error") {
+        this.publish(this.pausedSnapshot(playback));
+      }
     } catch (error) {
       if (this.activePlayback === playback && this.isCurrent(playback.generation)) {
         this.cancelRun();
@@ -578,6 +654,12 @@ export class AudioTransport {
       if (context.state === "closed") {
         throw new Error("The audio session has closed. Reload the page to start a new audio session.");
       }
+
+      // A previous pause can still be settling when Stop is followed immediately by Play.
+      // Wait for that suspend to finish before resuming the shared context.
+      const pendingPause = this.pauseOperation;
+      if (pendingPause) await pendingPause;
+      if (!this.isCurrent(generation)) return;
 
       // Call resume synchronously from Play, before awaiting any file reads or decodes.
       const resumePromise = context.state === "running" ? Promise.resolve() : context.resume();
@@ -777,7 +859,7 @@ export class AudioTransport {
       };
       this.activePlayback = playback;
 
-      this.intervalHandle = this.scheduleInterval(() => this.tick(generation), this.schedulerIntervalMs);
+      this.startScheduler(playback);
       this.tick(generation);
     } catch (error) {
       for (const processor of pendingProcessors) disconnectNode(processor);
@@ -901,6 +983,41 @@ export class AudioTransport {
       ...(countIn ? { countIn } : {}),
       presentation,
     });
+  }
+
+  private pausedSnapshot(playback: ActivePlayback): TransportSnapshot {
+    const now = playback.context.currentTime;
+    const presentationTime = this.presentationTimeAt(playback);
+    const presentation = this.presentationAt(playback, presentationTime);
+    const countIn = this.countInAt(playback, presentationTime);
+    const pausedFrom = countIn ? "counting-in" : "playing";
+
+    if (playback.cyclePlan) {
+      const epoch = this.presentationEpochAt(playback, now);
+      const cyclePlan = "slots" in epoch.timeline ? epoch.timeline as CyclePlanTimeline : playback.cyclePlan;
+      const phase = cyclePhaseAt(now, epoch.startAt, cyclePlan, epoch.cycleIterationBase);
+      const trainingProgress = this.tempoTrainingProgress(playback, presentationTime);
+      return {
+        status: "paused",
+        pausedFrom,
+        progress: countIn ? 0 : repeatingProgressAt(now, epoch.startAt, cyclePlan.totalSeconds),
+        ...(countIn ? { countIn } : {}),
+        presentation,
+        cycleSlotIndex: phase.slotIndex,
+        cycleIteration: phase.iteration,
+        cycleSlotKind: phase.kind,
+        ...(playback.dynamicCycle ? { cyclePlanIndex: playback.dynamicCycle.planIndex } : {}),
+        ...(trainingProgress ? { tempoTraining: trainingProgress } : {}),
+      };
+    }
+
+    return {
+      status: "paused",
+      pausedFrom,
+      progress: countIn ? 0 : progressAt(now, playback.startAt, playback.timeline.totalSeconds),
+      ...(countIn ? { countIn } : {}),
+      presentation,
+    };
   }
 
   private presentationTimeAt(playback: ActivePlayback): number {
@@ -1768,10 +1885,8 @@ export class AudioTransport {
 
   private cancelRun(): void {
     this.generation += 1;
-    if (this.intervalHandle !== undefined) {
-      this.cancelInterval(this.intervalHandle);
-      this.intervalHandle = undefined;
-    }
+    this.stopScheduler();
+    this.pausedFrom = undefined;
     this.activePlayback = undefined;
 
     for (const source of this.sources) {
@@ -1833,6 +1948,20 @@ export class AudioTransport {
       }
     }
     this.outputNodes.clear();
+  }
+
+  private startScheduler(playback: ActivePlayback): void {
+    if (this.intervalHandle !== undefined) return;
+    this.intervalHandle = this.scheduleInterval(
+      () => this.tick(playback.generation),
+      this.schedulerIntervalMs,
+    );
+  }
+
+  private stopScheduler(): void {
+    if (this.intervalHandle === undefined) return;
+    this.cancelInterval(this.intervalHandle);
+    this.intervalHandle = undefined;
   }
 
   private validateTempoRatio(bpm: number, referenceBpm: number): number {

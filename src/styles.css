@@ -209,6 +209,8 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
 .button--stop { background: var(--surface-inset); }
 .button--small { min-height: 30px; padding: 0 9px; font-size: 11px; }
 .play-glyph { width: 0; height: 0; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 7px solid currentColor; }
+.pause-glyph { display: inline-flex; width: 10px; height: 10px; align-items: stretch; justify-content: center; gap: 2px; }
+.pause-glyph span { width: 3px; border-radius: 1px; background: currentColor; }
 .stop-glyph { width: 8px; height: 8px; border: 1px solid currentColor; background: currentColor; }
 .timeline-figure { min-width: 0; margin: 0; overflow: clip; border: 1px solid var(--line); background: var(--surface-inset); }
 .timeline-caption { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
