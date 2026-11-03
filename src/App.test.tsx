@@ -15,6 +15,15 @@ const audioHarness = vi.hoisted(() => {
     cycleIteration?: number
     cycleSlotKind?: 'fixture' | 'silence'
     cyclePlanIndex?: number
+    tempoTraining?: {
+      currentBpm: number
+      targetBpm: number
+      stepBpm: number
+      roundsPerStep: number
+      completedRounds: number
+      roundsIntoStep: number
+      goalReached: boolean
+    }
     presentation?: {
       started: boolean
       progress: number
@@ -44,6 +53,9 @@ const audioHarness = vi.hoisted(() => {
     && typeof (options as { countInBars?: unknown }).countInBars === 'number'
     ? (options as { countInBars: number }).countInBars
     : 0
+  const tempoTrainingFor = (options: unknown) => typeof options === 'object' && options !== null
+    && typeof (options as { tempoTraining?: unknown }).tempoTraining === 'object'
+    && (options as { tempoTraining: { targetBpm: number; stepBpm: number; roundsPerStep: number } }).tempoTraining
   const play = vi.fn(async (options: unknown) => {
     tempoAvailable = hasTempoReference(options)
     const countInBars = countInBarsFor(options)
@@ -54,9 +66,22 @@ const audioHarness = vi.hoisted(() => {
   const playCyclePlan = vi.fn(async (options: unknown) => {
     tempoAvailable = hasTempoReference(options)
     const countInBars = countInBarsFor(options)
+    const requestedTraining = tempoTrainingFor(options)
+    const currentBpm = typeof options === 'object' && options !== null && typeof (options as { bpm?: unknown }).bpm === 'number'
+      ? (options as { bpm: number }).bpm
+      : 0
     emit({
       status: countInBars > 0 ? 'counting-in' : 'playing', progress: 0,
       ...(countInBars > 0 ? { countIn: { beat: 1, beats: countInBars * 4 } } : {}),
+      ...(requestedTraining ? { tempoTraining: {
+        currentBpm,
+        targetBpm: requestedTraining.targetBpm,
+        stepBpm: requestedTraining.stepBpm,
+        roundsPerStep: requestedTraining.roundsPerStep,
+        completedRounds: 0,
+        roundsIntoStep: 0,
+        goalReached: currentBpm >= requestedTraining.targetBpm,
+      } } : {}),
       cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture',
       presentation: { started: false, progress: 0, positionUnits: 0, cycleSlotIndex: 0, cycleIteration: 1, cycleSlotKind: 'fixture' },
     })
@@ -64,6 +89,10 @@ const audioHarness = vi.hoisted(() => {
   const setTempo = vi.fn((_bpm: number) => {
     if (!tempoAvailable || snapshot.status === 'counting-in' || (snapshot.status !== 'playing' && snapshot.status !== 'loading')) {
       throw new Error('Live tempo changes require active playback with an imported preset reference.')
+    }
+    if (snapshot.tempoTraining) {
+      const { tempoTraining: _cancelled, ...withoutTraining } = snapshot
+      emit(withoutTraining)
     }
   })
   const setPitchSemitones = vi.fn()
@@ -450,6 +479,108 @@ describe('workspace import and transport lifecycle', () => {
     expect(sampleOptions).not.toHaveProperty('countInBars')
     expect(sampleOptions).not.toHaveProperty('metronomeEnabled')
     expect(sampleOptions).not.toHaveProperty('metronomeVolume')
+  })
+
+  it('arms tempo training from the current BPM, reports heard progress, and keeps configuration after a manual override', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Generated combo' })
+    selectWorkspaceTab('Session')
+    fireEvent.click(screen.getByText('Tempo trainer'))
+
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Target BPM' }), { target: { value: '120' } })
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Increase by (BPM)' }), { target: { value: '7' } })
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Every full practice rounds' }), { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tempo training' }))
+
+    selectWorkspaceTab('Practice')
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(1))
+    expect(audioHarness.playCyclePlan.mock.calls[0]?.[0]).toEqual(expect.objectContaining({
+      bpm: 85,
+      tempoTraining: { targetBpm: 120, stepBpm: 7, roundsPerStep: 2 },
+    }))
+    expect(screen.getByText(/Tempo training · 85 of 120 BPM/)).toBeInTheDocument()
+
+    act(() => audioHarness.emit({
+      ...audioHarness.getSnapshot(),
+      tempoTraining: {
+        currentBpm: 90,
+        targetBpm: 120,
+        stepBpm: 7,
+        roundsPerStep: 2,
+        completedRounds: 2,
+        roundsIntoStep: 0,
+        goalReached: false,
+      },
+    }))
+    await waitFor(() => expect(screen.getByText(/Tempo training · 90 of 120 BPM · 2 full rounds · next \+7 BPM in 2 full rounds\./)).toBeInTheDocument())
+
+    act(() => audioHarness.emit({
+      ...audioHarness.getSnapshot(),
+      tempoTraining: {
+        currentBpm: 118,
+        targetBpm: 120,
+        stepBpm: 7,
+        roundsPerStep: 2,
+        completedRounds: 8,
+        roundsIntoStep: 0,
+        goalReached: false,
+      },
+    }))
+    await waitFor(() => expect(screen.getByText(/Tempo training · 118 of 120 BPM · 8 full rounds · next \+2 BPM in 2 full rounds\./)).toBeInTheDocument())
+
+    act(() => audioHarness.emit({
+      ...audioHarness.getSnapshot(),
+      tempoTraining: {
+        currentBpm: 120,
+        targetBpm: 120,
+        stepBpm: 7,
+        roundsPerStep: 2,
+        completedRounds: 10,
+        roundsIntoStep: 0,
+        goalReached: true,
+      },
+    }))
+    await waitFor(() => expect(screen.getByText(/Tempo training · holding at 120 BPM · 10 full rounds completed\./)).toBeInTheDocument())
+
+    act(() => audioHarness.emit({
+      ...audioHarness.getSnapshot(),
+      tempoTraining: {
+        currentBpm: 120,
+        targetBpm: 120,
+        stepBpm: 7,
+        roundsPerStep: 2,
+        completedRounds: 12,
+        roundsIntoStep: 0,
+        goalReached: true,
+      },
+    }))
+    await waitFor(() => expect(screen.getByText(/Tempo training · holding at 120 BPM · 12 full rounds completed\./)).toBeInTheDocument())
+
+    selectWorkspaceTab('Session')
+    const bpm = screen.getByRole('spinbutton', { name: 'BPM' })
+    expect(bpm).toHaveValue(120)
+    expect(bpm).toBeEnabled()
+    expect(screen.getByRole('checkbox', { name: 'Enable tempo training' })).toBeDisabled()
+    fireEvent.change(bpm, { target: { value: '' } })
+    expect(audioHarness.getSnapshot().tempoTraining).toBeUndefined()
+    expect(screen.getByText(/Tempo training stopped at 120 BPM/)).toBeInTheDocument()
+    fireEvent.change(bpm, { target: { value: '119' } })
+
+    expect(screen.getByText(/Tempo training stopped at 119 BPM/)).toBeInTheDocument()
+    expect(screen.getByRole('spinbutton', { name: 'Target BPM' })).toHaveValue(120)
+    expect(screen.getByRole('spinbutton', { name: 'Increase by (BPM)' })).toHaveValue(7)
+    expect(screen.getByRole('spinbutton', { name: 'Every full practice rounds' })).toHaveValue(2)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    expect(screen.getByText('Playback stopped.')).toBeInTheDocument()
+    selectWorkspaceTab('Practice')
+    fireEvent.click(screen.getByRole('button', { name: 'Play sequence' }))
+    await waitFor(() => expect(audioHarness.playCyclePlan).toHaveBeenCalledTimes(2))
+    expect(audioHarness.playCyclePlan.mock.calls[1]?.[0]).toEqual(expect.objectContaining({
+      bpm: 119,
+      tempoTraining: { targetBpm: 120, stepBpm: 7, roundsPerStep: 2 },
+    }))
   })
 
   it('switches Grid and Inline without changing event timing or restarting playback', async () => {

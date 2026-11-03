@@ -2,6 +2,9 @@ export {
   AudioTransport,
   SOUNDTOUCH_ESTIMATED_PRESENTATION_DELAY_SECONDS,
   SOUNDTOUCH_FINITE_DRAIN_SECONDS,
+  MIN_TEMPO_TRAINING_STEP_BPM,
+  MAX_TEMPO_TRAINING_STEP_BPM,
+  MAX_TEMPO_TRAINING_ROUNDS_PER_STEP,
 } from "./AudioTransport";
 export type {
   BeatPlaybackFrameRange,
@@ -20,6 +23,8 @@ export type {
   TransportSnapshot,
   TransportPresentation,
   TransportStatus,
+  TempoTrainingOptions,
+  TempoTrainingProgress,
 } from "./AudioTransport";
 export { createCyclePlanTimeline, createFixtureTimeline, secondsForUnits } from "./timeline";
 export {

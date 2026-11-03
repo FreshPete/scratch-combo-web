@@ -1,4 +1,5 @@
 import type { Fixture, Preset } from '../domain'
+import { DEFAULT_TEMPO_TRAINING_SETTINGS, isValidTempoTrainingSettings, type TempoTrainingSettings } from '../tempo-training'
 
 export type SavedRecordKind = 'session' | 'favorite'
 export type SavedPresetSource = 'builtin' | 'custom' | 'demo'
@@ -41,6 +42,7 @@ export interface SavedSessionData {
   countInBars: 0 | 1 | 2
   metronomeEnabled: boolean
   metronomeVolume: number
+  tempoTraining: TempoTrainingSettings
   omittedZeroDurationCount: number
   presetFileName: string | null
   sourceIniText: string | null
@@ -308,6 +310,7 @@ export function validateSavedSessionData(value: unknown): SavedSessionData {
     || !(candidate.countInBars === undefined || oneOf(candidate.countInBars, [0, 1, 2]))
     || !(candidate.metronomeEnabled === undefined || typeof candidate.metronomeEnabled === 'boolean')
     || !(candidate.metronomeVolume === undefined || integer(candidate.metronomeVolume, 0, 100))
+    || !(candidate.tempoTraining === undefined || isValidTempoTrainingSettings(candidate.tempoTraining))
     || !integer(candidate.omittedZeroDurationCount, 0, 8192)
     || !(candidate.presetFileName === null || string(candidate.presetFileName, 512))
     || !(candidate.sourceIniText === null || string(candidate.sourceIniText, MAX_INI_BYTES))
@@ -343,6 +346,7 @@ export function validateSavedSessionData(value: unknown): SavedSessionData {
     countInBars: candidate.countInBars === undefined ? 0 : candidate.countInBars,
     metronomeEnabled: candidate.metronomeEnabled === undefined ? false : candidate.metronomeEnabled,
     metronomeVolume: candidate.metronomeVolume === undefined ? 60 : candidate.metronomeVolume,
+    tempoTraining: candidate.tempoTraining === undefined ? { ...DEFAULT_TEMPO_TRAINING_SETTINGS } : candidate.tempoTraining,
     presetBeatTrimId: candidate.presetBeatTrimId === undefined ? legacyPresetBeatTrimId : candidate.presetBeatTrimId,
     customBeatTrimId: candidate.customBeatTrimId === undefined ? legacyCustomBeatTrimId : candidate.customBeatTrimId,
     beatTrims: candidate.beatTrims === undefined ? {} : candidate.beatTrims,

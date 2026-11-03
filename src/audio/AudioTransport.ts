@@ -38,6 +38,29 @@ export interface TransportSnapshot {
   readonly cycleSlotKind?: CycleSlot["kind"];
   /** One-based generated cycle-plan index, present only when Auto-generate is enabled. */
   readonly cyclePlanIndex?: number;
+  /** Live tempo-trainer progress, reported at the estimated heard phase. */
+  readonly tempoTraining?: TempoTrainingProgress;
+}
+
+export interface TempoTrainingOptions {
+  /** Goal BPM; the transport clamps the last step to this value. */
+  readonly targetBpm: number;
+  /** BPM added after each configured group of complete rounds. */
+  readonly stepBpm: number;
+  /** Complete passes through the full ordered slot list per tempo step. */
+  readonly roundsPerStep: number;
+}
+
+export interface TempoTrainingProgress {
+  readonly currentBpm: number;
+  readonly targetBpm: number;
+  readonly stepBpm: number;
+  readonly roundsPerStep: number;
+  /** Full slot-list passes that have reached the output presentation clock. */
+  readonly completedRounds: number;
+  /** Zero-based completed rounds since the last tempo step. Resets to zero at the goal. */
+  readonly roundsIntoStep: number;
+  readonly goalReached: boolean;
 }
 
 export interface TransportPresentation {
@@ -64,6 +87,8 @@ export interface PlayOptions {
   /** Selected beat track's original BPM. Defaults to the scratch reference BPM. */
   readonly beatReferenceBpm?: number;
   readonly bpm: number;
+  /** Optional automatic tempo ramp for repeating cycle-plan practice. */
+  readonly tempoTraining?: TempoTrainingOptions;
   /** Audible 4/4 bars before sequence start. Defaults to no count-in. */
   readonly countInBars?: 0 | 1 | 2;
   /** Continue quarter-note clicks after count-in, including silent cycle slots. Defaults to false. */
@@ -155,10 +180,9 @@ interface ActivePlayback {
   readonly metronomeGain?: GainNode;
   readonly countInBeats: number;
   readonly metronomeEnabled: boolean;
+  metronomeTempoEpochs: MetronomeTempoEpoch[];
   /** Initial sequence-start anchor. Count-in never reopens at later plan boundaries. */
   readonly countInEndAt: number;
-  /** Sequence beat-zero anchor; remains stable across Auto-generate plan boundaries. */
-  clickAnchorAt: number;
   nextMetronomeBeatIndex: number;
   readonly keepAliveSources: readonly ConstantSourceNode[];
   drainEndAt?: number;
@@ -174,11 +198,16 @@ interface ActivePlayback {
   readonly referenceBpm?: number;
   readonly sampleReferenceBpm: number;
   readonly beatReferenceBpm: number;
+  /** Tempo currently used by the scheduler for future sources. */
+  bpm: number;
   tempoRatio: number;
   beatTempoRatio: number;
   pitchSemitones: number;
   cycleIterationBase: number;
   dynamicCycle?: DynamicCyclePlayback;
+  tempoTraining?: ActiveTempoTraining;
+  /** At least one non-silent hit in the current trainer round was missed or truncated. */
+  tempoTrainingRoundIncomplete: boolean;
   maxSampleDuration: number;
   nextEventIndex: number;
   nextCycleStartAt: number;
@@ -191,7 +220,25 @@ interface PresentationEpoch {
   readonly startAt: number;
   readonly timeline: FixtureTimeline;
   readonly cycleIterationBase: number;
+  readonly bpm: number;
   readonly cyclePlanIndex?: number;
+}
+
+interface MetronomeTempoEpoch {
+  readonly effectiveAt: number;
+  /** Fractional global beat position at `effectiveAt`, continuous through tempo changes. */
+  readonly beatIndexAt: number;
+  readonly secondsPerBeat: number;
+}
+
+interface ActiveTempoTraining extends TempoTrainingOptions {
+  readonly startingBpm: number;
+  /** Scheduled full rounds; presentation progress is derived independently from output time. */
+  scheduledRounds: number;
+  roundsSinceStep: number;
+  /** Full scheduled rounds whose boundaries have reached the estimated output clock. */
+  presentedRounds: number;
+  pendingRoundBoundaries: number[];
 }
 
 interface PendingPresentationBoundary {
@@ -243,6 +290,9 @@ const MAX_PRESENTATION_EPOCHS = 64;
 const BEATS_PER_BAR = 4;
 const DEFAULT_METRONOME_VOLUME_PERCENT = 60;
 const METRONOME_CLICK_DURATION_SECONDS = 0.045;
+export const MIN_TEMPO_TRAINING_STEP_BPM = 0.1;
+export const MAX_TEMPO_TRAINING_STEP_BPM = 20;
+export const MAX_TEMPO_TRAINING_ROUNDS_PER_STEP = 64;
 /**
  * Edge actual-worklet PCM probes at 48 kHz measured first/repeated transient offsets of
  * 102–137 ms for common 0.75–1.176 tempo ratios and 0/+3 semitones. Use 130 ms as an
@@ -272,6 +322,7 @@ export class AudioTransport {
   private selectedReferenceBpm: number | undefined;
   private selectedBeatReferenceBpm: number | undefined;
   private selectedPitchSemitones = 0;
+  private loadingTempoTrainingCancelled = false;
   private readonly sources = new Set<AudioBufferSourceNode>();
   private readonly keepAliveSources = new Set<ConstantSourceNode>();
   private readonly sampleSources = new Map<AudioBufferSourceNode, SampleSourceState>();
@@ -319,10 +370,12 @@ export class AudioTransport {
       return this.snapshot.progress;
     }
     if (playback.cyclePlan) {
+      const epoch = this.presentationEpochAt(playback, playback.context.currentTime);
+      const cyclePlan = "slots" in epoch.timeline ? epoch.timeline as CyclePlanTimeline : playback.cyclePlan;
       return repeatingProgressAt(
         playback.context.currentTime,
-        playback.startAt,
-        playback.cyclePlan.totalSeconds,
+        epoch.startAt,
+        cyclePlan.totalSeconds,
       );
     }
     return progressAt(playback.context.currentTime, playback.startAt, playback.timeline.totalSeconds);
@@ -382,6 +435,7 @@ export class AudioTransport {
         if (this.selectedReferenceBpm !== undefined) this.validateTempoRatio(bpm, this.selectedReferenceBpm);
         if (this.selectedBeatReferenceBpm !== undefined) this.validateTempoRatio(bpm, this.selectedBeatReferenceBpm);
         this.selectedBpm = bpm;
+        this.loadingTempoTrainingCancelled = true;
         return;
       }
       throw new Error("Live tempo changes require playback with a BPM reference.");
@@ -396,6 +450,10 @@ export class AudioTransport {
     const tempoRatio = this.validateTempoRatio(bpm, playback.sampleReferenceBpm);
     const beatTempoRatio = this.validateTempoRatio(bpm, playback.beatReferenceBpm);
     this.selectedBpm = bpm;
+    if (playback.tempoTraining) {
+      this.restoreCurrentScheduleEpoch(playback, playback.context.currentTime);
+      delete playback.tempoTraining;
+    }
     if (!playback.cyclePlan && playback.context.currentTime >= playback.finishAt) {
       playback.tempoRatio = tempoRatio;
       playback.beatTempoRatio = beatTempoRatio;
@@ -447,7 +505,9 @@ export class AudioTransport {
   ): Promise<void> => {
     if (this.disposed) return;
 
+    this.capturePresentedTempo();
     this.cancelRun();
+    this.loadingTempoTrainingCancelled = false;
     const generation = this.generation;
     this.publish({ status: "loading", progress: 0 });
     const pendingProcessors: TempoPitchProcessorNode[] = [];
@@ -482,6 +542,12 @@ export class AudioTransport {
       const dynamicCycleConfig = createDynamicCycleConfig(options);
       if (dynamicCycleConfig && !cyclePlan) {
         throw new Error("Auto-generate requires a cycle plan.");
+      }
+      const requestedTempoTraining = options.tempoTraining === undefined
+        ? undefined
+        : this.validateTempoTrainingOptions(options.tempoTraining, bpm, sampleReferenceBpm, beatReferenceBpm);
+      if (requestedTempoTraining && !cyclePlan) {
+        throw new Error("Tempo training requires a repeating cycle plan.");
       }
       this.selectedBpm = bpm;
       this.selectedReferenceBpm = referenceBpm;
@@ -566,6 +632,15 @@ export class AudioTransport {
       const currentBpm = this.selectedBpm ?? bpm;
       const tempoRatio = this.validateTempoRatio(currentBpm, sampleReferenceBpm);
       const beatTempoRatio = this.validateTempoRatio(currentBpm, beatReferenceBpm);
+      const activeTempoTraining = requestedTempoTraining && !this.loadingTempoTrainingCancelled
+        ? this.createActiveTempoTraining(
+          requestedTempoTraining,
+          currentBpm,
+          sampleReferenceBpm,
+          beatReferenceBpm,
+        )
+        : undefined;
+      this.selectedBpm = currentBpm;
       const currentPitch = this.selectedPitchSemitones;
       if (currentBpm !== timeline.bpm) {
         timeline = cyclePlan
@@ -654,8 +729,12 @@ export class AudioTransport {
         ...(metronomeGain ? { metronomeGain } : {}),
         countInBeats,
         metronomeEnabled,
+        metronomeTempoEpochs: [{
+          effectiveAt: startAt,
+          beatIndexAt: 0,
+          secondsPerBeat,
+        }],
         countInEndAt: startAt,
-        clickAnchorAt: startAt,
         nextMetronomeBeatIndex: countInBeats > 0 ? -countInBeats : 0,
         keepAliveSources,
         ...(processor ? { processor } : {}),
@@ -666,6 +745,7 @@ export class AudioTransport {
           startAt,
           timeline,
           cycleIterationBase: 0,
+          bpm: currentBpm,
           ...(dynamicCycleConfig ? { cyclePlanIndex: 1 } : {}),
         }],
         pendingPresentationBoundaries: [],
@@ -674,6 +754,7 @@ export class AudioTransport {
         ...(referenceBpm === undefined ? {} : { referenceBpm }),
         sampleReferenceBpm,
         beatReferenceBpm,
+        bpm: currentBpm,
         tempoRatio,
         beatTempoRatio,
         pitchSemitones: currentPitch,
@@ -688,6 +769,8 @@ export class AudioTransport {
             providerRequested: false,
           },
         } : {}),
+        ...(activeTempoTraining ? { tempoTraining: activeTempoTraining } : {}),
+        tempoTrainingRoundIncomplete: false,
         maxSampleDuration,
         nextEventIndex: 0,
         nextCycleStartAt: startAt,
@@ -706,6 +789,7 @@ export class AudioTransport {
 
   stop = (): void => {
     if (this.disposed) return;
+    this.capturePresentedTempo();
     this.cancelRun();
     this.publish({ status: "idle", progress: 0 });
   };
@@ -713,6 +797,7 @@ export class AudioTransport {
   /** Stop active or pending playback and release decoded references after a new import. */
   resetAssets = (): void => {
     if (this.disposed) return;
+    this.capturePresentedTempo();
     this.cancelRun();
     this.fileBufferCache = new WeakMap<File, Promise<AudioBuffer>>();
     this.beatFileBufferCache = new WeakMap<File, Promise<AudioBuffer>>();
@@ -722,6 +807,7 @@ export class AudioTransport {
 
   dispose = (): void => {
     if (this.disposed) return;
+    this.capturePresentedTempo();
     this.cancelRun();
     this.disposed = true;
     this.fileBufferCache = new WeakMap<File, Promise<AudioBuffer>>();
@@ -763,6 +849,9 @@ export class AudioTransport {
 
     const presentationTime = this.presentationTimeAt(playback);
     const presentation = this.presentationAt(playback, presentationTime);
+    if (playback.tempoTraining) {
+      this.selectedBpm = this.presentationEpochAt(playback, presentationTime).bpm;
+    }
     this.flushPresentedBoundaries(playback, presentationTime);
     if (!this.isCurrent(generation) || this.activePlayback !== playback) return;
 
@@ -781,16 +870,27 @@ export class AudioTransport {
 
     const countIn = this.countInAt(playback, presentationTime);
     if (playback.cyclePlan) {
-      const phase = cyclePhaseAt(now, playback.startAt, playback.cyclePlan, playback.cycleIterationBase);
+      const schedulerEpoch = this.presentationEpochAt(playback, now);
+      const schedulerPlan = "slots" in schedulerEpoch.timeline
+        ? schedulerEpoch.timeline as CyclePlanTimeline
+        : playback.cyclePlan;
+      const phase = cyclePhaseAt(
+        now,
+        schedulerEpoch.startAt,
+        schedulerPlan,
+        schedulerEpoch.cycleIterationBase,
+      );
+      const progress = this.tempoTrainingProgress(playback, presentationTime);
       this.publish({
         status: countIn ? "counting-in" : "playing",
-        progress: countIn ? 0 : repeatingProgressAt(now, playback.startAt, playback.cyclePlan.totalSeconds),
+        progress: countIn ? 0 : repeatingProgressAt(now, schedulerEpoch.startAt, schedulerPlan.totalSeconds),
         ...(countIn ? { countIn } : {}),
         presentation,
         cycleSlotIndex: phase.slotIndex,
         cycleIteration: phase.iteration,
         cycleSlotKind: phase.kind,
         ...(playback.dynamicCycle ? { cyclePlanIndex: playback.dynamicCycle.planIndex } : {}),
+        ...(progress ? { tempoTraining: progress } : {}),
       });
       return;
     }
@@ -838,6 +938,46 @@ export class AudioTransport {
     return playback.lastOutputContextTime;
   }
 
+  private presentationEpochAt(playback: ActivePlayback, time: number): PresentationEpoch {
+    const epochs = playback.presentationEpochs;
+    let epochIndex = 0;
+    for (let index = 1; index < epochs.length; index += 1) {
+      if (epochs[index]!.effectiveAt > time) break;
+      epochIndex = index;
+    }
+    return epochs[epochIndex] ?? epochs[0]!;
+  }
+
+  private capturePresentedTempo(): void {
+    const playback = this.activePlayback;
+    if (!playback?.tempoTraining) return;
+    this.selectedBpm = this.presentationEpochAt(playback, this.presentationTimeAt(playback)).bpm;
+  }
+
+  private tempoTrainingProgress(
+    playback: ActivePlayback,
+    presentationTime: number,
+  ): TempoTrainingProgress | undefined {
+    const training = playback.tempoTraining;
+    if (!training) return undefined;
+    const currentBpm = this.presentationEpochAt(playback, presentationTime).bpm;
+    this.confirmPresentedTempoTrainingRounds(training, presentationTime);
+    // This counter advances only when a scheduled full-round boundary reaches the
+    // estimated output clock. Use it directly because catch-up can rebase the phase
+    // before the next round while a prior boundary is still in processor latency.
+    const completedRounds = training.presentedRounds;
+    const goalReached = currentBpm >= training.targetBpm;
+    return {
+      currentBpm,
+      targetBpm: training.targetBpm,
+      stepBpm: training.stepBpm,
+      roundsPerStep: training.roundsPerStep,
+      completedRounds,
+      roundsIntoStep: goalReached ? 0 : completedRounds % training.roundsPerStep,
+      goalReached,
+    };
+  }
+
   private countInAt(playback: ActivePlayback, presentationTime: number): CountInProgress | undefined {
     if (playback.countInBeats === 0 || presentationTime >= playback.countInEndAt) return undefined;
     const secondsPerBeat = playback.timeline.secondsPerUnit * playback.timeline.unitsPerBeat;
@@ -851,12 +991,7 @@ export class AudioTransport {
 
   private presentationAt(playback: ActivePlayback, presentationTime: number): TransportPresentation {
     const epochs = playback.presentationEpochs;
-    let epochIndex = 0;
-    for (let index = 1; index < epochs.length; index += 1) {
-      if (epochs[index]!.effectiveAt > presentationTime) break;
-      epochIndex = index;
-    }
-    const epoch = epochs[epochIndex] ?? epochs[0]!;
+    const epoch = this.presentationEpochAt(playback, presentationTime);
     const timingMetadata = {
       estimatedProcessorDelaySeconds: playback.presentationDelaySeconds,
       drainSeconds: playback.drainEndAt === undefined ? 0 : SOUNDTOUCH_FINITE_DRAIN_SECONDS,
@@ -921,6 +1056,7 @@ export class AudioTransport {
       startAt: playback.startAt,
       timeline: playback.timeline,
       cycleIterationBase: playback.cycleIterationBase,
+      bpm: playback.bpm,
       ...(cyclePlanIndex === undefined ? {} : { cyclePlanIndex }),
     });
     while (playback.presentationEpochs.length > MAX_PRESENTATION_EPOCHS) {
@@ -955,17 +1091,17 @@ export class AudioTransport {
   }
 
   private scheduleMetronomeClicks(playback: ActivePlayback, now: number, schedulingHorizon: number): void {
+    this.compactMetronomeTempoEpochs(playback, now);
     if (!playback.metronomeGain) return;
     if (!playback.metronomeEnabled && playback.nextMetronomeBeatIndex >= 0) return;
 
-    const secondsPerBeat = playback.timeline.secondsPerUnit * playback.timeline.unitsPerBeat;
     const clickDelay = playback.presentationDelaySeconds;
-    const firstCurrentBeat = Math.ceil((now - clickDelay - playback.clickAnchorAt) / secondsPerBeat - 1e-9);
+    const firstCurrentBeat = Math.ceil(this.metronomeBeatIndexAt(playback, now - clickDelay) - 1e-9);
     playback.nextMetronomeBeatIndex = Math.max(playback.nextMetronomeBeatIndex, firstCurrentBeat);
 
     while (true) {
       const beatIndex = playback.nextMetronomeBeatIndex;
-      const beatAt = playback.clickAnchorAt + beatIndex * secondsPerBeat;
+      const beatAt = this.metronomeBeatTimeAt(playback, beatIndex);
       if (beatIndex >= 0 && !playback.cyclePlan && beatAt >= playback.fixtureEndAt) return;
       const when = beatAt + clickDelay;
       if (when > schedulingHorizon) return;
@@ -973,6 +1109,58 @@ export class AudioTransport {
       if (beatIndex < 0 && playback.countInBeats === 0) continue;
       if (beatIndex >= 0 && !playback.metronomeEnabled) continue;
       this.scheduleMetronomeClick(playback, beatIndex, when);
+    }
+  }
+
+  private metronomeBeatIndexAt(playback: ActivePlayback, time: number): number {
+    const epochs = playback.metronomeTempoEpochs;
+    let epoch = epochs[0]!;
+    for (let index = 1; index < epochs.length; index += 1) {
+      const candidate = epochs[index]!;
+      if (candidate.effectiveAt > time) break;
+      epoch = candidate;
+    }
+    return epoch.beatIndexAt + (time - epoch.effectiveAt) / epoch.secondsPerBeat;
+  }
+
+  private metronomeBeatTimeAt(playback: ActivePlayback, beatIndex: number): number {
+    const epochs = playback.metronomeTempoEpochs;
+    let epoch = epochs[0]!;
+    for (let index = 1; index < epochs.length; index += 1) {
+      const candidate = epochs[index]!;
+      if (beatIndex + 1e-9 < candidate.beatIndexAt) break;
+      epoch = candidate;
+    }
+    return epoch.effectiveAt + (beatIndex - epoch.beatIndexAt) * epoch.secondsPerBeat;
+  }
+
+  private replaceMetronomeTempoEpochs(
+    playback: ActivePlayback,
+    effectiveAt: number,
+    beatIndexAt: number,
+    secondsPerBeat: number,
+  ): void {
+    playback.metronomeTempoEpochs = [{ effectiveAt, beatIndexAt, secondsPerBeat }];
+  }
+
+  private appendMetronomeTempoEpoch(
+    playback: ActivePlayback,
+    effectiveAt: number,
+    beatIndexAt: number,
+    secondsPerBeat: number,
+  ): void {
+    const epochs = playback.metronomeTempoEpochs;
+    while (epochs.length > 0 && epochs.at(-1)!.effectiveAt >= effectiveAt) epochs.pop();
+    epochs.push({ effectiveAt, beatIndexAt, secondsPerBeat });
+  }
+
+  private compactMetronomeTempoEpochs(playback: ActivePlayback, now: number): void {
+    const epochs = playback.metronomeTempoEpochs;
+    const nextBeatAt = playback.nextMetronomeBeatIndex;
+    while (epochs.length > 1
+      && epochs[1]!.effectiveAt < now - playback.presentationDelaySeconds
+      && epochs[1]!.beatIndexAt <= nextBeatAt) {
+      epochs.shift();
     }
   }
 
@@ -1154,11 +1342,97 @@ export class AudioTransport {
     playback.nextEventIndex = 0;
     playback.nextCycleStartAt += cyclePlan.totalSeconds;
     const dynamic = playback.dynamicCycle;
-    if (!dynamic) return;
-    dynamic.cyclesScheduledInPlan += 1;
-    if (dynamic.cyclesScheduledInPlan >= dynamic.cyclesPerPlan) {
-      dynamic.awaitingBoundaryAt = playback.nextCycleStartAt;
+    if (dynamic) {
+      dynamic.cyclesScheduledInPlan += 1;
+      if (dynamic.cyclesScheduledInPlan >= dynamic.cyclesPerPlan) {
+        dynamic.awaitingBoundaryAt = playback.nextCycleStartAt;
+      }
     }
+    if (!playback.tempoTrainingRoundIncomplete) {
+      this.advanceTempoTrainingRound(playback, playback.nextCycleStartAt);
+    }
+    playback.tempoTrainingRoundIncomplete = false;
+  }
+
+  private advanceTempoTrainingRound(playback: ActivePlayback, boundaryAt: number): void {
+    const training = playback.tempoTraining;
+    if (!training) return;
+    training.scheduledRounds = boundedCount(training.scheduledRounds + 1);
+    training.pendingRoundBoundaries.push(boundaryAt);
+    if (playback.bpm >= training.targetBpm) return;
+    training.roundsSinceStep += 1;
+    if (training.roundsSinceStep < training.roundsPerStep) return;
+    training.roundsSinceStep = 0;
+    const nextBpm = Math.min(training.targetBpm, playback.bpm + training.stepBpm);
+    if (nextBpm <= playback.bpm) return;
+    this.applyTempoTrainingStepAtBoundary(playback, nextBpm, boundaryAt);
+  }
+
+  private confirmPresentedTempoTrainingRounds(
+    training: ActiveTempoTraining,
+    presentationTime: number,
+  ): void {
+    while (training.pendingRoundBoundaries[0] !== undefined
+      && training.pendingRoundBoundaries[0] <= presentationTime) {
+      training.pendingRoundBoundaries.shift();
+      training.presentedRounds = boundedCount(training.presentedRounds + 1);
+    }
+  }
+
+  private applyTempoTrainingStepAtBoundary(
+    playback: ActivePlayback,
+    nextBpm: number,
+    boundaryAt: number,
+  ): void {
+    const currentPlan = playback.cyclePlan;
+    const training = playback.tempoTraining;
+    if (!currentPlan || !training || this.activePlayback !== playback || !this.isCurrent(playback.generation)) return;
+
+    const tempoRatio = this.validateTempoRatio(nextBpm, playback.sampleReferenceBpm);
+    const beatTempoRatio = this.validateTempoRatio(nextBpm, playback.beatReferenceBpm);
+    const nextPlan = rescaleCyclePlanTimeline(currentPlan, nextBpm);
+    const now = playback.context.currentTime;
+
+    // Keep clicks whose musical onset has already passed, then rebuild only future clicks
+    // on a piecewise beat grid that changes at the same round boundary as the samples.
+    this.scheduleMetronomeClicks(playback, now, now + playback.presentationDelaySeconds);
+    this.cancelFutureMetronomeClicks(now, playback.presentationDelaySeconds);
+    const boundaryBeat = this.metronomeBeatIndexAt(playback, boundaryAt);
+    this.appendMetronomeTempoEpoch(
+      playback,
+      boundaryAt,
+      boundaryBeat,
+      nextPlan.secondsPerUnit * nextPlan.unitsPerBeat,
+    );
+    const currentBeat = this.metronomeBeatIndexAt(playback, now);
+    playback.nextMetronomeBeatIndex = Math.max(0, Math.floor(currentBeat + 1e-9) + 1);
+
+    playback.timeline = nextPlan;
+    playback.cyclePlan = nextPlan;
+    playback.startAt = boundaryAt;
+    playback.fixtureEndAt = boundaryAt + nextPlan.totalSeconds;
+    playback.nextCycleStartAt = boundaryAt;
+    playback.cycleIterationBase = training.scheduledRounds;
+    playback.bpm = nextBpm;
+    playback.tempoRatio = tempoRatio;
+    playback.beatTempoRatio = beatTempoRatio;
+    if (playback.dynamicCycle?.preparedTimeline) {
+      playback.dynamicCycle.preparedTimeline = rescaleCyclePlanTimeline(
+        playback.dynamicCycle.preparedTimeline,
+        nextBpm,
+      );
+    }
+
+    const parameterAt = Math.max(now, boundaryAt);
+    if (playback.processor) setAudioParamValueAt(playback.processor.playbackRate, tempoRatio, parameterAt);
+    if (playback.beatProcessor) setAudioParamValueAt(playback.beatProcessor.playbackRate, beatTempoRatio, parameterAt);
+    if (playback.beatSource) setAudioParamValueAt(playback.beatSource.playbackRate, beatTempoRatio, parameterAt);
+    // Keep native source-rate compensation aligned with SoundTouch at the exact
+    // boundary, including long hits already running or queued into lookahead.
+    for (const source of this.sampleSources.keys()) {
+      setAudioParamValueAt(source.playbackRate, tempoRatio, parameterAt);
+    }
+    this.appendPresentationEpoch(playback, boundaryAt, playback.dynamicCycle?.planIndex);
   }
 
   private schedulePreparedCyclePlan(
@@ -1266,15 +1540,36 @@ export class AudioTransport {
 
   private skipExpiredCycles(playback: ActivePlayback, now: number): void {
     const cyclePlan = playback.cyclePlan;
-    if (!cyclePlan || playback.nextCycleStartAt + cyclePlan.totalSeconds > now - playback.maxSampleDuration) return;
+    if (!cyclePlan) return;
 
-    const fullyExpiredCycles = Math.floor(
-      (now - playback.maxSampleDuration - playback.nextCycleStartAt) / cyclePlan.totalSeconds,
-    );
-    if (fullyExpiredCycles <= 0) return;
+    const fullyExpiredCycles = playback.nextCycleStartAt + cyclePlan.totalSeconds <= now - playback.maxSampleDuration
+      ? Math.floor((now - playback.maxSampleDuration - playback.nextCycleStartAt) / cyclePlan.totalSeconds)
+      : 0;
+    // With training enabled, a round whose start already passed cannot be a full
+    // practice pass after a scheduler stall, even if a long sample tail is seekable.
+    const missedTrainerCycles = playback.tempoTraining && playback.nextEventIndex === 0
+      ? Math.max(0, Math.ceil((now - playback.nextCycleStartAt) / cyclePlan.totalSeconds))
+      : 0;
+    const cyclesToSkip = Math.max(fullyExpiredCycles, missedTrainerCycles);
+    if (cyclesToSkip <= 0) return;
 
-    playback.nextCycleStartAt += fullyExpiredCycles * cyclePlan.totalSeconds;
+    playback.nextCycleStartAt += cyclesToSkip * cyclePlan.totalSeconds;
     playback.nextEventIndex = 0;
+
+    const training = playback.tempoTraining;
+    if (training) {
+      // Missed rounds leave both BPM and cadence untouched. Rebase the heard phase at
+      // the next on-time pass so skipped wall-clock cycles never appear as progress.
+      playback.startAt = playback.nextCycleStartAt;
+      playback.fixtureEndAt = playback.startAt + cyclePlan.totalSeconds;
+      const presentationTime = this.presentationTimeAt(playback);
+      this.confirmPresentedTempoTrainingRounds(training, presentationTime);
+      playback.cycleIterationBase = training.presentedRounds;
+      playback.presentationEpochs = playback.presentationEpochs.filter(
+        (epoch) => epoch.effectiveAt <= now,
+      );
+      this.appendPresentationEpoch(playback, now, playback.dynamicCycle?.planIndex);
+    }
   }
 
   private scheduleEvent(playback: ActivePlayback, event: FixtureTimeline["events"][number], when: number, now: number): void {
@@ -1285,6 +1580,9 @@ export class AudioTransport {
       throw new Error(`Audio for “${event.sampleId}” could not be loaded. Re-import its WAV file and try again.`);
     }
     const elapsedSeconds = Math.max(0, now - when);
+    if (playback.tempoTraining && elapsedSeconds > 0) {
+      playback.tempoTrainingRoundIncomplete = true;
+    }
     if (elapsedSeconds >= buffer.duration / playback.tempoRatio) return;
     this.scheduleSample(playback, buffer, Math.max(now, when), elapsedSeconds * playback.tempoRatio);
   }
@@ -1545,6 +1843,66 @@ export class AudioTransport {
     return ratio;
   }
 
+  private validateTempoTrainingOptions(
+    value: TempoTrainingOptions,
+    startingBpm: number,
+    sampleReferenceBpm: number,
+    beatReferenceBpm: number,
+  ): TempoTrainingOptions {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Tempo training settings must include a target BPM, step BPM, and rounds per step.");
+    }
+    const targetBpm = positiveBpm(value.targetBpm, "Tempo training target BPM");
+    if (targetBpm < startingBpm) {
+      throw new Error("Tempo training target BPM must be at least the starting BPM.");
+    }
+    this.validateTempoRatio(targetBpm, sampleReferenceBpm);
+    this.validateTempoRatio(targetBpm, beatReferenceBpm);
+
+    if (!Number.isFinite(value.stepBpm)
+      || value.stepBpm < MIN_TEMPO_TRAINING_STEP_BPM
+      || value.stepBpm > MAX_TEMPO_TRAINING_STEP_BPM) {
+      throw new Error(`Tempo training step BPM must be between ${MIN_TEMPO_TRAINING_STEP_BPM} and ${MAX_TEMPO_TRAINING_STEP_BPM}.`);
+    }
+    if (!Number.isSafeInteger(value.roundsPerStep)
+      || value.roundsPerStep < 1
+      || value.roundsPerStep > MAX_TEMPO_TRAINING_ROUNDS_PER_STEP) {
+      throw new Error(`Tempo training rounds per step must be a whole number between 1 and ${MAX_TEMPO_TRAINING_ROUNDS_PER_STEP}.`);
+    }
+    return { targetBpm, stepBpm: value.stepBpm, roundsPerStep: value.roundsPerStep };
+  }
+
+  private createActiveTempoTraining(
+    options: TempoTrainingOptions,
+    startingBpm: number,
+    sampleReferenceBpm: number,
+    beatReferenceBpm: number,
+  ): ActiveTempoTraining {
+    return {
+      ...this.validateTempoTrainingOptions(options, startingBpm, sampleReferenceBpm, beatReferenceBpm),
+      startingBpm,
+      scheduledRounds: 0,
+      roundsSinceStep: 0,
+      presentedRounds: 0,
+      pendingRoundBoundaries: [],
+    };
+  }
+
+  private restoreCurrentScheduleEpoch(playback: ActivePlayback, now: number): void {
+    const epoch = this.presentationEpochAt(playback, now);
+    if ("slots" in epoch.timeline) {
+      const cyclePlan = epoch.timeline as CyclePlanTimeline;
+      playback.timeline = cyclePlan;
+      playback.cyclePlan = cyclePlan;
+    }
+    playback.startAt = epoch.startAt;
+    playback.cycleIterationBase = epoch.cycleIterationBase;
+    playback.bpm = epoch.bpm;
+    playback.tempoRatio = this.validateTempoRatio(epoch.bpm, playback.sampleReferenceBpm);
+    playback.beatTempoRatio = this.validateTempoRatio(epoch.bpm, playback.beatReferenceBpm);
+    playback.presentationEpochs = playback.presentationEpochs.filter((candidate) => candidate.effectiveAt <= now);
+  }
+
   private retimePlayback(playback: ActivePlayback, bpm: number, tempoRatio: number): void {
     if (playback.context.currentTime >= playback.finishAt && !playback.cyclePlan) {
       this.tick(playback.generation);
@@ -1584,8 +1942,7 @@ export class AudioTransport {
 
     const oldSecondsPerUnit = playback.timeline.secondsPerUnit;
     const hadStarted = now >= playback.startAt;
-    const oldBeatPosition = (now - playback.clickAnchorAt)
-      / (oldSecondsPerUnit * playback.timeline.unitsPerBeat);
+    const oldBeatPosition = this.metronomeBeatIndexAt(playback, now);
     const oldElapsedSeconds = Math.max(0, now - playback.startAt);
     const oldCycleLength = playback.cyclePlan?.totalSeconds;
     const previousIteration = oldCycleLength
@@ -1600,13 +1957,12 @@ export class AudioTransport {
       ? rescaleCyclePlanTimeline(playback.cyclePlan, bpm)
       : rescaleFixtureTimeline(playback.timeline, bpm);
     if (playback.cyclePlan) playback.cyclePlan = playback.timeline as CyclePlanTimeline;
-    if (hadStarted) {
-      const newSecondsPerBeat = playback.timeline.secondsPerUnit * playback.timeline.unitsPerBeat;
-      playback.clickAnchorAt = now - oldBeatPosition * newSecondsPerBeat;
-      playback.nextMetronomeBeatIndex = Math.max(0, Math.floor(oldBeatPosition) + 1);
-    }
+    const newSecondsPerBeat = playback.timeline.secondsPerUnit * playback.timeline.unitsPerBeat;
+    this.replaceMetronomeTempoEpochs(playback, now, oldBeatPosition, newSecondsPerBeat);
+    playback.nextMetronomeBeatIndex = Math.max(0, Math.floor(oldBeatPosition) + 1);
     playback.tempoRatio = tempoRatio;
     playback.beatTempoRatio = this.validateTempoRatio(bpm, playback.beatReferenceBpm);
+    playback.bpm = bpm;
     playback.startAt = hadStarted
       ? now - positionUnits * playback.timeline.secondsPerUnit
       : playback.startAt;
@@ -1827,6 +2183,15 @@ function setAudioParamValue(parameter: AudioParam, value: number, currentTime: n
   try {
     parameter.cancelScheduledValues(currentTime);
     parameter.setValueAtTime(value, currentTime);
+  } catch {
+    parameter.value = value;
+  }
+}
+
+function setAudioParamValueAt(parameter: AudioParam, value: number, effectiveAt: number): void {
+  try {
+    parameter.cancelScheduledValues(effectiveAt);
+    parameter.setValueAtTime(value, effectiveAt);
   } catch {
     parameter.value = value;
   }

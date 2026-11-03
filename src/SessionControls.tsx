@@ -2,6 +2,8 @@ import { useEffect, useState, type ChangeEvent } from 'react'
 import type { AssetResolution } from './domain'
 import { loadWaveform, WAVEFORM_VIEWBOX_HEIGHT, type WaveformData } from './waveforms/waveform'
 import type { SavedBeatTrimRegion } from './session-library/storage'
+import { TempoTrainingControls } from './TempoTrainingControls'
+import type { TempoTrainingSettings } from './tempo-training'
 import './SessionControls.css'
 
 export type CustomBeatAnalysisStatus = 'idle' | 'analyzing' | 'detected' | 'ambiguous' | 'insufficient' | 'error'
@@ -215,6 +217,9 @@ export type SessionControlsProps = {
   beatTrimSourceFile: File | null
   beatTrimSourceBuffer: AudioBuffer | null
   beatTrim: SavedBeatTrimRegion | null
+  tempoTraining: TempoTrainingSettings
+  tempoTrainingDisabled: boolean
+  repeatingPracticeAvailable: boolean
   disabled: boolean
   tempoLocked?: boolean
   resetDisabled?: boolean
@@ -230,6 +235,10 @@ export type SessionControlsProps = {
   onCustomBeatReferenceBpmChange: (value: string) => void
   onApplyBeatTrim: (region: SavedBeatTrimRegion, decodedDurationSeconds: number) => void
   onResetBeatTrim: () => void
+  onTempoTrainingEnabledChange: (enabled: boolean) => void
+  onTempoTrainingTargetChange: (targetBpm: number) => void
+  onTempoTrainingStepChange: (stepBpm: number) => void
+  onTempoTrainingRoundsChange: (roundsPerStep: number) => void
   onReset: () => void
 }
 
@@ -257,6 +266,9 @@ export function SessionControls({
   beatTrimSourceFile,
   beatTrimSourceBuffer,
   beatTrim,
+  tempoTraining,
+  tempoTrainingDisabled,
+  repeatingPracticeAvailable,
   disabled,
   tempoLocked = false,
   resetDisabled = false,
@@ -272,6 +284,10 @@ export function SessionControls({
   onCustomBeatReferenceBpmChange,
   onApplyBeatTrim,
   onResetBeatTrim,
+  onTempoTrainingEnabledChange,
+  onTempoTrainingTargetChange,
+  onTempoTrainingStepChange,
+  onTempoTrainingRoundsChange,
   onReset,
 }: SessionControlsProps) {
   const beatReferenceBpm = customBeatSelected ? customBeatReferenceBpm : null
@@ -407,6 +423,18 @@ export function SessionControls({
           {!activeBeatReady && <small className="session-controls__hint">Select an applied beat to adjust its level.</small>}
         </div>
       </div>
+
+      <TempoTrainingControls
+        settings={tempoTraining}
+        currentBpm={numericBpm}
+        tempoRange={tempoRange}
+        repeatingPracticeAvailable={repeatingPracticeAvailable}
+        disabled={tempoTrainingDisabled}
+        onEnabledChange={onTempoTrainingEnabledChange}
+        onTargetBpmChange={onTempoTrainingTargetChange}
+        onStepBpmChange={onTempoTrainingStepChange}
+        onRoundsPerStepChange={onTempoTrainingRoundsChange}
+      />
 
       <fieldset className="session-controls__beat-source" aria-describedby="beat-source-help">
         <legend>Beat source</legend>

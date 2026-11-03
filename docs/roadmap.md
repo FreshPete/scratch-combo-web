@@ -18,12 +18,14 @@
 - [x] Save and reload named practice sessions and favourite the exact generated combo from Practice. IndexedDB stores preset/settings/fixture data and referenced local audio bytes; restore validates audio, stays stopped, and never autoplays.
 - [x] Add manual, source-specific beat downbeat and loop-end trim controls to Session. Cue and exclusive end are bounded by decoded duration, Apply affects the next Play, source mode switches retain per-beat settings, and older saved sessions default to full-clip playback.
 - [x] Add an optional one- or two-bar count-in and ongoing metronome to Practice, with four beats per bar, independent click level, Stop/P cancellation, live level and backward-compatible saved settings.
+- [x] Add optional tempo training for repeating imported-preset practice. It increases by an integer 1–20 BPM after 1–64 full rounds, counts full Q&A answer windows and silent cycles, holds at a clamped target, cancels on manual tempo override for the current run, and treats missed rounds as unpracticed. Settings persist additively in saved sessions.
 
-Beat trim is hosted as merged revision `f5b1960`. Count-in/metronome is local-ready on `codex/count-in-metronome`: the Pages build, 230 unit tests, responsive Pages checks at 390/844/1280px, and both integrated Edge and Chrome journeys pass. See the [count-in/metronome QA evidence](qa/count-in-metronome-evidence.md) for browser audio timing results and screenshots. The hosted app still serves `f5b1960`; count-in/metronome is local-only and is not live.
+Beat trim is hosted as merged revision `f5b1960`. Count-in/metronome is hosted at `7e57199`: its Pages build, 230 unit tests, responsive Pages checks at 390/844/1280px, and integrated Edge and Chrome journeys pass. See the [count-in/metronome QA evidence](qa/count-in-metronome-evidence.md) for browser audio timing results and screenshots.
+
+Tempo training is local-ready on `codex/tempo-training` and is not live. The full unit suite (252 tests), Pages build, and integrated Edge and Chrome journeys pass. See the [tempo training browser validation](tempo-training-browser-validation.md) for Loop and Q&A timing results, responsive screenshots, and measurement limits. The hosted app remains at `7e57199`.
 
 ## Queued — ordered follow-ups
 
-- [ ] Tempo-ramp trainer.
 - [ ] Real pause and resume.
 - [ ] Physical output synchronization checks and real mobile-device evidence.
 - [ ] Pull-request CI before merge.
