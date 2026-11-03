@@ -8,6 +8,12 @@ import {
 } from './audio'
 import { PracticePrepControls, type CountInBars } from './PracticePrepControls'
 import { getTempoRange, SessionControls, type CustomBeatAnalysisStatus } from './SessionControls'
+import {
+  DEFAULT_TEMPO_TRAINING_SETTINGS,
+  isValidTempoTrainingSettings,
+  tempoTrainingValidationMessage,
+  type TempoTrainingSettings,
+} from './tempo-training'
 import { PracticeLibrary } from './PracticeLibrary'
 import {
   buildAssetIndex, buildPreviewFixture, DEMO_PRESET, generateLegacyCombo, parseLegacyIni,
@@ -1383,6 +1389,8 @@ export default function App() {
   const [countInBars, setCountInBars] = useState<CountInBars>(0)
   const [metronomeEnabled, setMetronomeEnabled] = useState(false)
   const [metronomeVolume, setMetronomeVolume] = useState(60)
+  const [tempoTraining, setTempoTraining] = useState<TempoTrainingSettings>(() => ({ ...DEFAULT_TEMPO_TRAINING_SETTINGS }))
+  const [tempoTrainingCancelledNotice, setTempoTrainingCancelledNotice] = useState('')
   const [omittedZeroDurationCount, setOmittedZeroDurationCount] = useState(0)
   const [presetFileName, setPresetFileName] = useState<string | null>(null)
   const [sourceIniText, setSourceIniText] = useState<string | null>(null)
@@ -1500,6 +1508,12 @@ export default function App() {
     && Number.isFinite(sessionTempoNumber)
     && sessionTempoNumber >= selectedTempoRange.min
     && sessionTempoNumber <= selectedTempoRange.max
+  const tempoTrainingError = tempoTrainingValidationMessage(
+    tempoTraining,
+    sessionTempoNumber,
+    selectedTempoRange,
+    Boolean(presetFileName),
+  )
   const diagnostics = assetResolution?.diagnostics ?? []
   const autoGenerateSampleIds = preset.samples
     .filter((sample) => sample.enabled && !sample.silent && sample.weight > 0)
@@ -1593,6 +1607,7 @@ export default function App() {
       countInBars,
       metronomeEnabled,
       metronomeVolume,
+      tempoTraining,
       omittedZeroDurationCount,
       presetFileName,
       sourceIniText,
@@ -1837,6 +1852,7 @@ export default function App() {
       setCountInBars(data.countInBars)
       setMetronomeEnabled(data.metronomeEnabled)
       setMetronomeVolume(data.metronomeVolume)
+      setTempoTraining(data.tempoTraining)
       setOmittedZeroDurationCount(data.omittedZeroDurationCount)
       setPresetFileName(data.presetFileName)
       setSourceIniText(data.sourceIniText)
@@ -2168,6 +2184,12 @@ export default function App() {
       if (activePresetLoadRef.current === controller) presetImportGeneration.current += 1
     }
   }, [])
+
+  useEffect(() => {
+    const progress = transportSnapshot.tempoTraining
+    if (!progress) return
+    setBpm(String(progress.currentBpm))
+  }, [transportSnapshot.tempoTraining?.currentBpm])
 
   useEffect(() => {
     const selectSectionFromHash = () => {
@@ -2608,10 +2630,28 @@ export default function App() {
 
   const handleBpmChange = (value: string) => {
     if (transport.getSnapshot().status === 'counting-in') return
+    const activeTransport = transport.getSnapshot()
+    const liveTempoTraining = activeTransport.status === 'playing' || activeTransport.status === 'loading'
+      ? activeTransport.tempoTraining
+      : undefined
     setBpm(value)
     const nextBpm = Number(value)
-    if (selectedTempoRange && Number.isFinite(nextBpm) && nextBpm >= selectedTempoRange.min && nextBpm <= selectedTempoRange.max) {
-      if (transportSnapshot.status === 'playing' || transportSnapshot.status === 'loading') transport.setTempo(nextBpm)
+    const nextTempoValid = selectedTempoRange !== null
+      && Number.isFinite(nextBpm)
+      && nextBpm >= selectedTempoRange.min
+      && nextBpm <= selectedTempoRange.max
+    if (liveTempoTraining) {
+      transport.setTempo(nextTempoValid ? nextBpm : liveTempoTraining.currentBpm)
+      setTempoTrainingCancelledNotice(
+        'Tempo training stopped at ' + (nextTempoValid ? nextBpm : liveTempoTraining.currentBpm) + ' BPM. Press Play to restart from this tempo.',
+      )
+    } else if (nextTempoValid && (activeTransport.status === 'playing' || activeTransport.status === 'loading')) {
+      transport.setTempo(nextBpm)
+      if (tempoTrainingCancelledNotice) {
+        setTempoTrainingCancelledNotice('Tempo training stopped at ' + nextBpm + ' BPM. Press Play to restart from this tempo.')
+      }
+    }
+    if (nextTempoValid) {
       setActionError(null)
     }
   }
@@ -2676,8 +2716,17 @@ export default function App() {
     transport.setMetronomeVolume(nextVolume)
   }
 
+  const updateTempoTrainingSettings = (change: Partial<TempoTrainingSettings>) => {
+    if (isPlaybackLockedNow() || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy || savedLibraryBusy) return
+    setTempoTraining((current) => {
+      const next = { ...current, ...change }
+      return isValidTempoTrainingSettings(next) ? next : current
+    })
+  }
+
   const handleResetSessionControls = () => {
-    if (transport.getSnapshot().status === 'counting-in') return
+    const activeTransport = transport.getSnapshot()
+    if (activeTransport.status === 'counting-in') return
     const defaults = sourceControlDefaultsRef.current
     const customRange = customBeatSelected && customBeatReferenceBpm !== null
       ? getTempoRange(preset.bpm, customBeatReferenceBpm)
@@ -2691,7 +2740,12 @@ export default function App() {
     setSampleVolume(defaults.sampleVolume)
     setBeatVolume(defaults.beatVolume)
     setMetronomeVolume(60)
-    if (transportSnapshot.status === 'playing' || transportSnapshot.status === 'loading') transport.setTempo(resetBpmValue)
+    if (activeTransport.status === 'playing' || activeTransport.status === 'loading') {
+      transport.setTempo(resetBpmValue)
+      if (activeTransport.tempoTraining) {
+        setTempoTrainingCancelledNotice('Tempo training stopped at ' + resetBpmValue + ' BPM. Press Play to restart from this tempo.')
+      }
+    }
     transport.setPitchSemitones(0)
     transport.setSampleVolume(defaults.sampleVolume)
     transport.setBeatVolume(defaults.beatVolume)
@@ -2983,6 +3037,11 @@ export default function App() {
 
   const startPlayback = (playFixture: Fixture, target: PlaybackTarget, includeBeat: boolean) => {
     if (!isPresetReady || isReadingPreset || isGenerating || isCustomBeatAnalysisBusy || isPlaybackLockedNow()) return
+    if (target?.kind === 'sequence' && presetFileName && tempoTraining.enabled && tempoTrainingError) {
+      setActionError(tempoTrainingError)
+      setTransportNote('Correct the tempo trainer settings in Session before starting this run.')
+      return
+    }
     const bpmValue = Number(bpm)
     const beatReferenceBpm = includeBeat && customBeatSelected ? customBeatReferenceBpm : null
     const tempoRange = getTempoRange(preset.bpm, beatReferenceBpm)
@@ -2999,6 +3058,7 @@ export default function App() {
     }
     invalidateAutoGeneration()
     setActionError(null)
+    setTempoTrainingCancelledNotice('')
     setPlaybackTarget(target)
     setVisibleCyclePlanIndex(null)
     const options = {
@@ -3010,6 +3070,9 @@ export default function App() {
       sampleVolume,
       beatVolume,
       ...(target?.kind === 'sequence' ? { countInBars, metronomeEnabled, metronomeVolume } : {}),
+      ...(target?.kind === 'sequence' && presetFileName && tempoTraining.enabled
+        ? { tempoTraining: { targetBpm: tempoTraining.targetBpm, stepBpm: tempoTraining.stepBpm, roundsPerStep: tempoTraining.roundsPerStep } }
+        : {}),
       ...(includeBeat && selectedBeatFile ? { beatFile: selectedBeatFile } : {}),
       ...(includeBeat && activeBeatTrim ? { beatPlaybackRegion: activeBeatTrim } : {}),
       ...(includeBeat && customBeatSelected && customBeatBuffer && beatReferenceBpm !== null
@@ -3112,11 +3175,13 @@ export default function App() {
     transport.stop()
     setPlaybackTarget(null)
     setVisibleCyclePlanIndex(null)
+    setTempoTrainingCancelledNotice('')
     setActionError(null)
     setTransportNote('Playback stopped.')
   }
 
-  const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating || isCustomBeatAnalysisBusy || isPlaybackLocked || autoGenerateBlocked || !customBeatReferenceInputValid || !sessionTempoValid || savedLibraryBusy
+  const tempoTrainingBlockingError = tempoTraining.enabled && Boolean(presetFileName) ? tempoTrainingError : null
+  const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating || isCustomBeatAnalysisBusy || isPlaybackLocked || autoGenerateBlocked || !customBeatReferenceInputValid || !sessionTempoValid || Boolean(tempoTrainingBlockingError) || savedLibraryBusy
   const stopDisabled = transportSnapshot.status !== 'playing' && transportSnapshot.status !== 'loading' && !isCountInActive
   const isSequencePlaying = playbackTarget?.kind === 'sequence' && transportSnapshot.status === 'playing'
   const displayedProgress = transportSnapshot.status === 'playing' ? presentation?.progress : undefined
@@ -3157,11 +3222,28 @@ export default function App() {
   const sessionControlsDisabled = !isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy || savedLibraryBusy
   const savedLibraryControlsBusy = savedLibraryBusy || isReadingPreset || isGenerating || isPreparingLocalImport || isPlaybackLocked || isCustomBeatAnalysisBusy || isSavingIni
   const resetControlsDisabled = sessionControlsDisabled || isCountInActive
+  const tempoTrainingProgressText = transportSnapshot.tempoTraining
+    ? transportSnapshot.tempoTraining.goalReached
+      ? 'Tempo training · holding at ' + transportSnapshot.tempoTraining.currentBpm + ' BPM · ' + transportSnapshot.tempoTraining.completedRounds + ' full ' + (transportSnapshot.tempoTraining.completedRounds === 1 ? 'round' : 'rounds') + ' completed.'
+      : 'Tempo training · ' + transportSnapshot.tempoTraining.currentBpm + ' of ' + transportSnapshot.tempoTraining.targetBpm + ' BPM · '
+        + (transportSnapshot.tempoTraining.completedRounds === 0
+          ? 'starting tempo'
+          : transportSnapshot.tempoTraining.completedRounds + ' full ' + (transportSnapshot.tempoTraining.completedRounds === 1 ? 'round' : 'rounds'))
+        + ' · next +' + Math.min(transportSnapshot.tempoTraining.stepBpm, transportSnapshot.tempoTraining.targetBpm - transportSnapshot.tempoTraining.currentBpm) + ' BPM in '
+        + (transportSnapshot.tempoTraining.roundsPerStep - transportSnapshot.tempoTraining.roundsIntoStep) + ' full '
+        + (transportSnapshot.tempoTraining.roundsPerStep - transportSnapshot.tempoTraining.roundsIntoStep === 1 ? 'round.' : 'rounds.')
+    : null
   const transportStatusText = isCountInActive && transportSnapshot.countIn
     ? 'Count-in · beat ' + transportSnapshot.countIn.beat + ' of ' + transportSnapshot.countIn.beats + '.'
     : isCountInActive
       ? 'Count-in in progress.'
-      : transportNote
+      : tempoTrainingProgressText
+        ? tempoTrainingProgressText
+        : tempoTrainingCancelledNotice && (transportSnapshot.status === 'playing' || transportSnapshot.status === 'loading')
+          ? tempoTrainingCancelledNotice
+          : tempoTraining.enabled && tempoTrainingError
+            ? tempoTrainingError
+            : transportNote
 
   shortcutActionsRef.current = {
     playDisabled: playDisabled || isReadingPreset,
@@ -3267,7 +3349,7 @@ export default function App() {
           </div>
           <div className="transport-dock__meter">
             <progress value={progressPercent} max="1" aria-label="Preview progress" />
-            <span className="transport-status" role="status" aria-live="polite" aria-atomic="true">{transportStatusText}</span>
+            <span id="tempo-training-status" className="transport-status" role="status" aria-live="polite" aria-atomic="true">{transportStatusText}</span>
           </div>
           {isPlaybackLocked && <p className="playback-lock-note" role="status">Stop playback to change combo options, beat source, or sample settings.</p>}
           {isCustomBeatAnalysisBusy && <p className="playback-lock-note" role="status">Custom beat is loading locally. Playback will stay stopped until analysis finishes.</p>}
@@ -3450,6 +3532,9 @@ export default function App() {
           beatTrimSourceFile={customBeatSelected ? customBeatFile : selectedBeatFile ?? null}
           beatTrimSourceBuffer={customBeatSelected ? customBeatBuffer : null}
           beatTrim={activeBeatTrim}
+          tempoTraining={tempoTraining}
+          tempoTrainingDisabled={!isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy || savedLibraryBusy || isPlaybackLocked}
+          repeatingPracticeAvailable={Boolean(presetFileName)}
           disabled={sessionControlsDisabled}
           tempoLocked={isCountInActive}
           resetDisabled={resetControlsDisabled}
@@ -3465,6 +3550,10 @@ export default function App() {
           onCustomBeatReferenceBpmChange={handleCustomBeatReferenceBpmChange}
           onApplyBeatTrim={handleApplyBeatTrim}
           onResetBeatTrim={handleResetBeatTrim}
+          onTempoTrainingEnabledChange={(enabled) => updateTempoTrainingSettings({ enabled })}
+          onTempoTrainingTargetChange={(targetBpm) => updateTempoTrainingSettings({ targetBpm })}
+          onTempoTrainingStepChange={(stepBpm) => updateTempoTrainingSettings({ stepBpm })}
+          onTempoTrainingRoundsChange={(roundsPerStep) => updateTempoTrainingSettings({ roundsPerStep })}
           onReset={handleResetSessionControls}
         />
         </div>

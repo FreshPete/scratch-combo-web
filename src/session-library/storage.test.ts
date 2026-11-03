@@ -27,6 +27,7 @@ function validSnapshot(): SavedSessionData {
     countInBars: 0,
     metronomeEnabled: false,
     metronomeVolume: 60,
+    tempoTraining: { enabled: false, targetBpm: 100, stepBpm: 1, roundsPerStep: 2 },
     omittedZeroDurationCount: 0,
     presetFileName: null,
     sourceIniText: null,
@@ -86,11 +87,13 @@ describe('saved session payload validation', () => {
     delete legacy.countInBars
     delete legacy.metronomeEnabled
     delete legacy.metronomeVolume
+    delete legacy.tempoTraining
 
     const restored = validateSavedSessionData(legacy)
     expect(restored.countInBars).toBe(0)
     expect(restored.metronomeEnabled).toBe(false)
     expect(restored.metronomeVolume).toBe(60)
+    expect(restored.tempoTraining).toEqual({ enabled: false, targetBpm: 100, stepBpm: 1, roundsPerStep: 2 })
 
     const configured = { ...validSnapshot(), countInBars: 2 as const, metronomeEnabled: true, metronomeVolume: 37 }
     expect(validateSavedSessionData(configured)).toEqual(expect.objectContaining({
@@ -101,6 +104,29 @@ describe('saved session payload validation', () => {
     expect(() => validateSavedSessionData({ ...configured, countInBars: 3 })).toThrow(/invalid settings or audio metadata/i)
     expect(() => validateSavedSessionData({ ...configured, metronomeVolume: Number.POSITIVE_INFINITY })).toThrow(/invalid settings or audio metadata/i)
     expect(() => validateSavedSessionData({ ...configured, metronomeVolume: 101 })).toThrow(/invalid settings or audio metadata/i)
+  })
+
+  it('persists tempo trainer settings additively and rejects non-finite or out-of-bound values', () => {
+    const legacy = { ...validSnapshot() } as Partial<SavedSessionData>
+    delete legacy.tempoTraining
+    expect(validateSavedSessionData(legacy).tempoTraining).toEqual({
+      enabled: false,
+      targetBpm: 100,
+      stepBpm: 1,
+      roundsPerStep: 2,
+    })
+
+    const configured = {
+      ...validSnapshot(),
+      tempoTraining: { enabled: true, targetBpm: 100.5, stepBpm: 2, roundsPerStep: 3 },
+    }
+    expect(validateSavedSessionData(configured).tempoTraining).toEqual(configured.tempoTraining)
+    expect(() => validateSavedSessionData({ ...configured, tempoTraining: { ...configured.tempoTraining, targetBpm: Number.NaN } }))
+      .toThrow(/invalid settings or audio metadata/i)
+    expect(() => validateSavedSessionData({ ...configured, tempoTraining: { ...configured.tempoTraining, stepBpm: 0.5 } }))
+      .toThrow(/invalid settings or audio metadata/i)
+    expect(() => validateSavedSessionData({ ...configured, tempoTraining: { ...configured.tempoTraining, roundsPerStep: 65 } }))
+      .toThrow(/invalid settings or audio metadata/i)
   })
 
   it('accepts source-scoped cue and loop regions and rejects invalid bounds or ownership', () => {

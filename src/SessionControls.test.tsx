@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SessionControls, type SessionControlsProps } from './SessionControls'
+import { DEFAULT_TEMPO_TRAINING_SETTINGS } from './tempo-training'
 import { loadWaveform } from './waveforms/waveform'
 
 vi.mock('./waveforms/waveform', async (importOriginal) => {
@@ -38,6 +39,9 @@ function props(overrides: Partial<SessionControlsProps> = {}): SessionControlsPr
     beatTrimSourceFile: null,
     beatTrimSourceBuffer: null,
     beatTrim: null,
+    tempoTraining: { ...DEFAULT_TEMPO_TRAINING_SETTINGS },
+    tempoTrainingDisabled: false,
+    repeatingPracticeAvailable: true,
     disabled: false,
     onBpmChange: vi.fn(),
     onPitchChange: vi.fn(),
@@ -50,6 +54,10 @@ function props(overrides: Partial<SessionControlsProps> = {}): SessionControlsPr
     onCustomBeatReferenceBpmChange: vi.fn(),
     onApplyBeatTrim: vi.fn(),
     onResetBeatTrim: vi.fn(),
+    onTempoTrainingEnabledChange: vi.fn(),
+    onTempoTrainingTargetChange: vi.fn(),
+    onTempoTrainingStepChange: vi.fn(),
+    onTempoTrainingRoundsChange: vi.fn(),
     onReset: vi.fn(),
     ...overrides,
   }

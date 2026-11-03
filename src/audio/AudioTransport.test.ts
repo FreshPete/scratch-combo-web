@@ -33,11 +33,15 @@ function makeBuffer(duration = 0.2, sampleRate = 48_000): AudioBuffer {
   } as unknown as AudioBuffer;
 }
 
+function audioParamValueCalls(parameter: AudioParam): readonly (readonly [number, number])[] {
+  return (parameter.setValueAtTime as unknown as { mock: { calls: [number, number][] } }).mock.calls;
+}
+
 function makeFakeParam(initialValue = 1) {
   const parameter = {
     value: initialValue,
     cancelScheduledValues: vi.fn(),
-    setValueAtTime: vi.fn((value: number) => { parameter.value = value; }),
+    setValueAtTime: vi.fn((value: number, _when?: number) => { parameter.value = value; }),
     setTargetAtTime: vi.fn((value: number) => { parameter.value = value; }),
     linearRampToValueAtTime: vi.fn((value: number) => { parameter.value = value; }),
     exponentialRampToValueAtTime: vi.fn((value: number) => { parameter.value = value; }),
@@ -46,8 +50,16 @@ function makeFakeParam(initialValue = 1) {
 }
 
 function makeProcessor() {
-  const playbackRate = { value: 1, cancelScheduledValues: vi.fn(), setValueAtTime(value: number) { this.value = value; } };
-  const pitchSemitones = { value: 0, cancelScheduledValues: vi.fn(), setValueAtTime(value: number) { this.value = value; } };
+  const playbackRate = {
+    value: 1,
+    cancelScheduledValues: vi.fn(),
+    setValueAtTime: vi.fn((value: number, _when?: number) => { playbackRate.value = value; }),
+  };
+  const pitchSemitones = {
+    value: 0,
+    cancelScheduledValues: vi.fn(),
+    setValueAtTime: vi.fn((value: number, _when?: number) => { pitchSemitones.value = value; }),
+  };
   return {
     node: {
       playbackRate,
@@ -2048,6 +2060,105 @@ describe("AudioTransport", () => {
     transport.dispose();
   });
 
+  it("holds the trainer across skipped scheduler cycles without regressing heard progress", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const oneRound: Fixture = {
+      events: [{ id: "stall-trainer", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: oneRound }],
+      bpm: 90,
+      referenceBpm: 90,
+      tempoTraining: { targetBpm: 120, stepBpm: 1, roundsPerStep: 2 },
+    });
+    const beforeStall = transport.getSnapshot().tempoTraining!;
+    expect(beforeStall).toMatchObject({ currentBpm: 90, completedRounds: 0 });
+
+    fake.setCurrentTime(10);
+    runScheduler();
+    const afterCatchUp = transport.getSnapshot().tempoTraining!;
+    const resumedStart = fake.sources.find(({ startTimes }) => startTimes[0]! >= 10)?.startTimes[0];
+    expect(resumedStart).toBeDefined();
+    expect(afterCatchUp.completedRounds).toBeGreaterThanOrEqual(beforeStall.completedRounds);
+    expect(afterCatchUp).toMatchObject({ currentBpm: 90, completedRounds: 1, roundsIntoStep: 1 });
+
+    const resumedBoundary = resumedStart! + 60 / 90;
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toContainEqual([91 / 90, resumedBoundary]);
+    fake.setCurrentTime(resumedBoundary + 0.14);
+    runScheduler();
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({ currentBpm: 91, completedRounds: 2 });
+    transport.dispose();
+  });
+
+  it("reports a completed round after processor latency even when catch-up rebases before the next round", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const oneRound: Fixture = {
+      events: [{ id: "latency-rebase-trainer", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: oneRound }],
+      bpm: 90,
+      referenceBpm: 90,
+      tempoTraining: { targetBpm: 100, stepBpm: 1, roundsPerStep: 64 },
+    });
+    const initialRateCalls = processor.playbackRate.setValueAtTime.mock.calls.length;
+
+    fake.setCurrentTime(0.75);
+    runScheduler();
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({ currentBpm: 90, completedRounds: 0 });
+
+    fake.setCurrentTime(0.9);
+    runScheduler();
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({
+      currentBpm: 90,
+      completedRounds: 1,
+      roundsIntoStep: 1,
+    });
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toHaveLength(initialRateCalls);
+    transport.dispose();
+  });
+
+  it("keeps active long-sample rates aligned with each training tempo boundary", async () => {
+    const fake = makeFakeAudioContext(async () => makeBuffer(5));
+    const processor = makeProcessor();
+    const { transport } = makeTransport(fake.context, async () => processor.node, 1.5);
+    const sampleFile = {
+      name: "long-training-hit.wav",
+      arrayBuffer: vi.fn(async () => new ArrayBuffer(1)),
+    } as unknown as File;
+    const oneRound: Fixture = {
+      events: [{ id: "long-training-hit", sampleId: "long-training-hit", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const firstBoundary = 0.05 + 60 / 90;
+    const secondBoundary = firstBoundary + 60 / 95;
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: oneRound }],
+      bpm: 90,
+      referenceBpm: 90,
+      assets: new Map([["long-training-hit", sampleFile]]),
+      tempoTraining: { targetBpm: 100, stepBpm: 5, roundsPerStep: 1 },
+    });
+
+    const sampleSources = fake.sources.filter(({ node }) => !node.loop);
+    expect(sampleSources.length).toBeGreaterThanOrEqual(2);
+    expect(audioParamValueCalls(sampleSources[0]!.node.playbackRate)).toContainEqual([95 / 90, firstBoundary]);
+    expect(audioParamValueCalls(sampleSources[0]!.node.playbackRate)).toContainEqual([100 / 90, secondBoundary]);
+    expect(audioParamValueCalls(sampleSources[1]!.node.playbackRate)).toContainEqual([100 / 90, secondBoundary]);
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toContainEqual([95 / 90, firstBoundary]);
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toContainEqual([100 / 90, secondBoundary]);
+    transport.dispose();
+  });
+
   it("stops a pending cycle-plan decode from starting audio after Stop", async () => {
     let resolveDecode!: (buffer: AudioBuffer) => void;
     const decodePromise = new Promise<AudioBuffer>((resolve) => { resolveDecode = resolve; });
@@ -2101,6 +2212,378 @@ describe("AudioTransport", () => {
       status: "error",
       error: "WAV decode failed",
     });
+    transport.dispose();
+  });
+
+  it("ramps at full round boundaries, clamps to the target, and reports only the heard tempo", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const oneRound: Fixture = {
+      events: [{ id: "trainer-round", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const firstBoundary = 0.05 + 60 / 90;
+    const secondBoundary = firstBoundary + 60 / 97;
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: oneRound }],
+      bpm: 90,
+      referenceBpm: 90,
+      tempoTraining: { targetBpm: 100, stepBpm: 7, roundsPerStep: 1 },
+    });
+
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toContainEqual([97 / 90, firstBoundary]);
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({
+      currentBpm: 90,
+      completedRounds: 0,
+      roundsIntoStep: 0,
+      goalReached: false,
+    });
+
+    fake.setCurrentTime(firstBoundary - 0.05);
+    runScheduler();
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toContainEqual([100 / 90, secondBoundary]);
+
+    fake.setCurrentTime(firstBoundary + 0.14);
+    runScheduler();
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({
+      currentBpm: 97,
+      completedRounds: 1,
+      goalReached: false,
+    });
+
+    fake.setCurrentTime(secondBoundary + 0.14);
+    runScheduler();
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({
+      currentBpm: 100,
+      completedRounds: 2,
+      roundsIntoStep: 0,
+      goalReached: true,
+    });
+
+    const callsAtGoal = processor.playbackRate.setValueAtTime.mock.calls.length;
+    fake.setCurrentTime(secondBoundary + 2);
+    runScheduler();
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toHaveLength(callsAtGoal);
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({ currentBpm: 100, goalReached: true });
+    transport.dispose();
+  });
+
+  it("uses the new tempo for events and clicks already inside scheduler lookahead", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport } = makeTransport(fake.context, async () => processor.node, 1.5);
+    const oneRound: Fixture = {
+      events: [{ id: "lookahead-trainer-round", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const firstBoundary = 0.05 + 60 / 90;
+    const secondBoundary = firstBoundary + 60 / 95;
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: oneRound }],
+      bpm: 90,
+      referenceBpm: 90,
+      metronomeEnabled: true,
+      tempoTraining: { targetBpm: 100, stepBpm: 5, roundsPerStep: 1 },
+    });
+
+    expect(fake.sources.map(({ startTimes }) => startTimes[0])).toEqual([0.05, firstBoundary, secondBoundary]);
+    expect(audioParamValueCalls(fake.sources[0]!.node.playbackRate)).toContainEqual([95 / 90, firstBoundary]);
+    expect(audioParamValueCalls(fake.sources[1]!.node.playbackRate)).toContainEqual([100 / 90, secondBoundary]);
+    const clickTimes = fake.oscillators.map(({ startTimes }) => startTimes[0]!);
+    expect(clickTimes).toHaveLength(3);
+    [0.18, firstBoundary + 0.13, secondBoundary + 0.13]
+      .forEach((expected, index) => expect(clickTimes[index]).toBeCloseTo(expected, 10));
+    transport.dispose();
+  });
+
+  it("waits for the configured number of complete rounds before each step", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const oneRound: Fixture = {
+      events: [{ id: "two-round-trainer", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const firstBoundary = 0.05 + 60 / 90;
+    const secondBoundary = firstBoundary + 60 / 90;
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: oneRound }],
+      bpm: 90,
+      referenceBpm: 90,
+      tempoTraining: { targetBpm: 100, stepBpm: 5, roundsPerStep: 2 },
+    });
+    expect(processor.playbackRate.setValueAtTime.mock.calls).not.toContainEqual([95 / 90, firstBoundary]);
+
+    fake.setCurrentTime(firstBoundary - 0.05);
+    runScheduler();
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toContainEqual([95 / 90, secondBoundary]);
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({ currentBpm: 90, completedRounds: 0 });
+
+    fake.setCurrentTime(secondBoundary + 0.14);
+    runScheduler();
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({
+      currentBpm: 95,
+      completedRounds: 2,
+      roundsIntoStep: 0,
+    });
+    transport.dispose();
+  });
+
+  it("counts Q&A question and all answer slots as one practice round", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const slotFixture = (id: string): Fixture => ({
+      events: [{ id, sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    });
+
+    await transport.playCyclePlan({
+      slots: [
+        { kind: "fixture", fixture: slotFixture("question") },
+        { kind: "silence", durationUnits: 4 },
+        { kind: "fixture", fixture: slotFixture("answer-one") },
+        { kind: "silence", durationUnits: 4 },
+        { kind: "fixture", fixture: slotFixture("answer-two") },
+      ],
+      bpm: 120,
+      referenceBpm: 120,
+      tempoTraining: { targetBpm: 125, stepBpm: 5, roundsPerStep: 1 },
+    });
+
+    expect(processor.playbackRate.setValueAtTime.mock.calls).not.toContainEqual([125 / 120, 0.55]);
+    fake.setCurrentTime(0.95);
+    runScheduler();
+    fake.setCurrentTime(1.95);
+    runScheduler();
+    expect(fake.sources.map(({ startTimes }) => startTimes[0])).toContain(2.05);
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toContainEqual([125 / 120, 2.55]);
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({ currentBpm: 120, completedRounds: 0 });
+
+    fake.setCurrentTime(2.69);
+    runScheduler();
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({ currentBpm: 125, completedRounds: 1 });
+    transport.dispose();
+  });
+
+  it("waits through all three silent cycles in a large-pause round", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const question: Fixture = {
+      events: [{ id: "large-pause-question", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+
+    await transport.playCyclePlan({
+      slots: [
+        { kind: "fixture", fixture: question },
+        { kind: "silence", durationUnits: 4 },
+        { kind: "silence", durationUnits: 4 },
+        { kind: "silence", durationUnits: 4 },
+      ],
+      bpm: 120,
+      referenceBpm: 120,
+      tempoTraining: { targetBpm: 125, stepBpm: 5, roundsPerStep: 1 },
+    });
+
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toContainEqual([125 / 120, 2.05]);
+    fake.setCurrentTime(1.95);
+    runScheduler();
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({ currentBpm: 120, completedRounds: 0 });
+    fake.setCurrentTime(2.69);
+    runScheduler();
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({ currentBpm: 125, completedRounds: 1 });
+    transport.dispose();
+  });
+
+  it("ramps each full round through Auto-generate without restarting the beat or metronome phase", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const oneRound: Fixture = {
+      events: [{ id: "auto-trainer-round", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+    const slots = [{ kind: "fixture" as const, fixture: oneRound }];
+    const firstBoundary = 0.05 + 60 / 90;
+    const secondBoundary = firstBoundary + 60 / 95;
+    const thirdBoundary = secondBoundary + 60 / 100;
+    const fourthBoundary = thirdBoundary + 60 / 100;
+    const nextPlan = vi.fn(() => ({ slots }));
+    const onPlanBoundary = vi.fn();
+
+    await transport.playCyclePlan({
+      slots,
+      bpm: 90,
+      referenceBpm: 90,
+      beatReferenceBpm: 90,
+      beatBuffer: makeBuffer(2),
+      metronomeEnabled: true,
+      cyclesPerPlan: 4,
+      nextPlan,
+      onPlanBoundary,
+      tempoTraining: { targetBpm: 100, stepBpm: 5, roundsPerStep: 1 },
+    });
+    expect(transport.getSnapshot().error).toBeUndefined();
+    expect(fake.sources.map(({ node }) => node.loop)).toEqual([true, false]);
+    const beatSource = fake.sources.find(({ node }) => node.loop);
+    expect(beatSource?.startTimes).toEqual([0.05]);
+
+    fake.setCurrentTime(0.1);
+    runScheduler();
+    fake.setCurrentTime(firstBoundary - 0.05);
+    runScheduler();
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toContainEqual([95 / 90, firstBoundary]);
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toContainEqual([100 / 90, secondBoundary]);
+    fake.setCurrentTime(firstBoundary + 0.05);
+    runScheduler();
+    fake.setCurrentTime(secondBoundary - 0.05);
+    runScheduler();
+    fake.setCurrentTime(secondBoundary + 0.05);
+    runScheduler();
+    fake.setCurrentTime(thirdBoundary - 0.05);
+    runScheduler();
+    expect(nextPlan).toHaveBeenCalledWith({ completedRounds: 3, nextPlanIndex: 2 });
+    fake.setCurrentTime(thirdBoundary + 0.04);
+    runScheduler();
+    expect(fake.sources.filter(({ node }) => node.loop)).toHaveLength(1);
+    expect(fake.sources.filter(({ node }) => node.loop)[0]?.startTimes).toEqual([0.05]);
+    const metronomeTimes = fake.oscillators.map(({ startTimes }) => startTimes[0]!);
+    expect(metronomeTimes).toHaveLength(4);
+    [
+      0.18,
+      firstBoundary + 0.13,
+      secondBoundary + 0.13,
+      thirdBoundary + 0.13,
+    ].forEach((expected, index) => expect(metronomeTimes[index]).toBeCloseTo(expected, 10));
+
+    fake.setCurrentTime(fourthBoundary);
+    runScheduler();
+    expect(onPlanBoundary).not.toHaveBeenCalled();
+    fake.setCurrentTime(fourthBoundary + 0.14);
+    runScheduler();
+    expect(onPlanBoundary).toHaveBeenCalledWith({
+      planIndex: 2,
+      completedRounds: 4,
+      plan: { slots },
+    });
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({
+      currentBpm: 100,
+      completedRounds: 4,
+      goalReached: true,
+    });
+    transport.dispose();
+  });
+
+  it("does not count the initial count-in as a round or repeat it at tempo steps", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const oneRound: Fixture = {
+      events: [{ id: "counted-trainer-round", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: oneRound }],
+      bpm: 90,
+      referenceBpm: 90,
+      countInBars: 1,
+      tempoTraining: { targetBpm: 100, stepBpm: 10, roundsPerStep: 1 },
+    });
+    for (const time of [0.1, 0.8, 1.5, 2.1, 2.65]) {
+      fake.setCurrentTime(time);
+      runScheduler();
+    }
+    expect(fake.oscillators).toHaveLength(4);
+    expect(transport.getSnapshot()).toMatchObject({
+      tempoTraining: { currentBpm: 90, completedRounds: 0 },
+    });
+
+    fake.setCurrentTime(3.53);
+    runScheduler();
+    expect(fake.oscillators).toHaveLength(4);
+    expect(transport.getSnapshot().tempoTraining).toMatchObject({ currentBpm: 100, completedRounds: 1 });
+    transport.dispose();
+  });
+
+  it("cancels scheduled training steps when a manual tempo change overrides the run", async () => {
+    const fake = makeFakeAudioContext();
+    const processor = makeProcessor();
+    const { transport, runScheduler } = makeTransport(fake.context, async () => processor.node);
+    const oneRound: Fixture = {
+      events: [{ id: "manual-trainer-round", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+      totalUnits: 4,
+    };
+
+    await transport.playCyclePlan({
+      slots: [{ kind: "fixture", fixture: oneRound }],
+      bpm: 90,
+      referenceBpm: 90,
+      tempoTraining: { targetBpm: 100, stepBpm: 5, roundsPerStep: 1 },
+    });
+    fake.setCurrentTime(0.2);
+    transport.setTempo(95);
+
+    expect(transport.getSnapshot()).not.toHaveProperty("tempoTraining");
+    expect(processor.playbackRate.cancelScheduledValues).toHaveBeenCalledWith(0.2);
+    const callsAfterManualOverride = processor.playbackRate.setValueAtTime.mock.calls.length;
+    fake.setCurrentTime(1);
+    runScheduler();
+    expect(processor.playbackRate.setValueAtTime.mock.calls).toHaveLength(callsAfterManualOverride);
+    expect(transport.getSnapshot()).not.toHaveProperty("tempoTraining");
+    transport.dispose();
+  });
+
+  it("rejects out-of-range, non-finite, and fractional trainer settings before audio setup", async () => {
+    const invalidTraining: readonly { readonly settings: unknown; readonly beatReferenceBpm?: number }[] = [
+      { settings: { targetBpm: 89, stepBpm: 5, roundsPerStep: 1 } },
+      { settings: { targetBpm: 181, stepBpm: 5, roundsPerStep: 1 } },
+      { settings: { targetBpm: 171, stepBpm: 5, roundsPerStep: 1 }, beatReferenceBpm: 85 },
+      { settings: { targetBpm: 100, stepBpm: 0, roundsPerStep: 1 } },
+      { settings: { targetBpm: 100, stepBpm: 20.1, roundsPerStep: 1 } },
+      { settings: { targetBpm: 100, stepBpm: 5, roundsPerStep: 0 } },
+      { settings: { targetBpm: 100, stepBpm: 5, roundsPerStep: 1.5 } },
+      { settings: { targetBpm: Number.NaN, stepBpm: 5, roundsPerStep: 1 } },
+    ];
+
+    for (const { settings, beatReferenceBpm } of invalidTraining) {
+      const fake = makeFakeAudioContext();
+      const contextFactory = vi.fn(() => fake.context);
+      const transport = new AudioTransport({ audioContextFactory: contextFactory });
+      await transport.playCyclePlan({
+        slots: [{ kind: "fixture", fixture: {
+          events: [{ id: "invalid-trainer", sampleId: "synthPulse", startUnits: 0, durationUnits: 4, silent: false }],
+          totalUnits: 4,
+        } }],
+        bpm: 90,
+        referenceBpm: 90,
+        tempoTraining: settings as never,
+        ...(beatReferenceBpm === undefined ? {} : { beatReferenceBpm }),
+      });
+      expect(transport.getSnapshot().status).toBe("error");
+      expect(contextFactory).not.toHaveBeenCalled();
+      transport.dispose();
+    }
+  });
+
+  it("requires tempo training to use a repeating cycle plan", async () => {
+    const fake = makeFakeAudioContext();
+    const contextFactory = vi.fn(() => fake.context);
+    const transport = new AudioTransport({ audioContextFactory: contextFactory });
+    await transport.play({
+      fixture,
+      bpm: 90,
+      referenceBpm: 90,
+      tempoTraining: { targetBpm: 100, stepBpm: 5, roundsPerStep: 1 },
+    });
+    expect(transport.getSnapshot()).toMatchObject({ status: "error", error: "Tempo training requires a repeating cycle plan." });
+    expect(contextFactory).not.toHaveBeenCalled();
     transport.dispose();
   });
 
