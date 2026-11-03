@@ -32,6 +32,7 @@ const SUPPORTED_PRESETS = new Map([
   ['SSC-096BPM2-01', { iniFile: 'SSC-096BPM2-01.ini', bpm: 96, audioDirectory: '096BPM2' }],
 ])
 const MAX_REFERENCED_WAVS = 256
+const WAV_BATCH_SIZE = 6
 
 function safePathSegments(value: string): string[] {
   const segments = value.replace(/\\/g, '/').split('/').filter(Boolean)
@@ -57,10 +58,21 @@ async function checkedResponse(
   signal: AbortSignal | undefined,
   label: string,
 ): Promise<Response> {
-  const response = await fetcher(url, {
+  const request: RequestInit = {
     ...(signal ? { signal } : {}),
     credentials: 'same-origin',
+  }
+  // Give a temporary network or hosting failure one chance to recover.
+  const firstResponse = await fetcher(url, request).catch((error: unknown) => {
+    if (signal?.aborted || !(error instanceof TypeError)) throw error
+    return undefined
   })
+  let response = firstResponse
+  if (!response || response.status === 429 || response.status >= 500) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 250))
+    if (signal?.aborted) throw new DOMException('Preset loading was cancelled.', 'AbortError')
+    response = await fetcher(url, { ...request, cache: 'reload' })
+  }
   if (!response.ok) throw new Error(`Could not load ${label} (HTTP ${response.status}).`)
   if (response.url) {
     const responseUrl = new URL(response.url, window.location.origin)
@@ -131,7 +143,7 @@ export async function loadBuiltInPreset(
 
   const references = [...new Set([...preset.samples.map(({ fileName }) => fileName), ...preset.beatFiles])]
   if (references.length > MAX_REFERENCED_WAVS) throw new Error(`${entry.iniFile} references too many WAV files.`)
-  const audioFiles = await Promise.all(references.map(async (reference) => {
+  const loadAudioFile = async (reference: string): Promise<File> => {
     const referenceSegments = safePathSegments(reference)
     if (referenceSegments.length !== 1 || !referenceSegments[0]?.toLowerCase().endsWith('.wav')) {
       throw new Error(`${entry.iniFile} contains an invalid WAV reference: ${reference}`)
@@ -152,7 +164,13 @@ export async function loadBuiltInPreset(
       value: relativePath,
     })
     return file
-  }))
+  }
+  const audioFiles: File[] = []
+  for (let start = 0; start < references.length; start += WAV_BATCH_SIZE) {
+    if (options.signal?.aborted) throw new DOMException('Preset loading was cancelled.', 'AbortError')
+    const batch = references.slice(start, start + WAV_BATCH_SIZE)
+    audioFiles.push(...await Promise.all(batch.map(loadAudioFile)))
+  }
 
   return {
     preset,

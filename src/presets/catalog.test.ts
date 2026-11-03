@@ -61,6 +61,20 @@ function response(options: {
 }
 
 describe('built-in preset catalog boundary', () => {
+  it('retries a temporary WAV download failure and completes the preset', async () => {
+    let attempts = 0
+    const fetcher: PresetFetch = vi.fn(async (input) => {
+      const url = String(input)
+      if (url.endsWith('.ini')) return response({ text: iniText })
+      if (url.endsWith('/beat-two.wav') && ++attempts === 1) return response({ status: 503 })
+      return response()
+    })
+
+    const loaded = await loadBuiltInPreset(supportedEntries[0]!, { fetcher })
+    expect(loaded.audioFiles).toHaveLength(3)
+    expect(attempts).toBe(2)
+  })
+
   it('loads the six-entry catalog from the same-origin private preset route', async () => {
     const fetcher: PresetFetch = vi.fn(async () => response({
       json: { version: 1, defaultPresetId: 'SSC-085BPM-01', presets: supportedEntries },
