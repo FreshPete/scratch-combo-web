@@ -58,6 +58,10 @@ Snapshots report `status: "counting-in"` and `countIn: { beat, beats }` during t
 
 Tempo changes are locked during count-in and become live at sequence start. During sequence playback, future clicks are cancelled and rescheduled on the current musical beat phase after a tempo change, preventing queued old-tempo clicks from replaying. Metronome level can change live. Clicks bypass SoundTouch to preserve their pitch; when SoundTouch is active, they are scheduled using the existing 130 ms estimated content lag so the click and first processed sequence content share the transport's estimated output phase. This estimate can vary with browser and material; it is not a physical speaker timing measurement or guarantee.
 
+## Pause and resume
+
+`AudioTransport.pause()` suspends the active `AudioContext` and stops its scheduler interval. Existing sample, beat, SoundTouch keep-alive, and metronome sources remain scheduled on the frozen context clock, so resume continues their current positions without restarting the combo or count-in. `resume()` resumes that same context and restarts the scheduler; it does not create new sources for already-scheduled events. Snapshots report `status: "paused"`, `pausedFrom: "counting-in" | "playing"`, frozen progress/presentation, and the current count-in beat when applicable. Tempo remains locked through count-in, including a paused count-in; live tempo, pitch, and level changes can be applied during a paused playback phase. Stop, replacement playback, and disposal invalidate any pending suspend/resume transition so stale operations cannot restart or pause a newer run.
+
 ## Tempo-ramp training
 
 `CyclePlanOptions.tempoTraining` optionally accepts `{ targetBpm, stepBpm, roundsPerStep }`. Training is off when the option is omitted and applies to repeating cycle-plan playback only. One full pass through the current ordered `slots` is one practice round, including every fixture and silent slot. Auto-generate's `cyclesPerPlan` controls when the slot list changes; it does not redefine a training round. The initial count-in does not count as a round, and tempo steps do not add another count-in.

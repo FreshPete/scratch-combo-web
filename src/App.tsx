@@ -865,7 +865,7 @@ function cycleSlotsFor(fixture: Fixture, mode: PracticeMode, largePause: boolean
 }
 
 function SequenceTimeline({
-  fixture, preset, assets, progress, isPlaying, presentationStarted, presentationPositionUnits, presentationCycleSlotKind,
+  fixture, preset, assets, progress, isPlaying, isPaused, presentationStarted, presentationPositionUnits, presentationCycleSlotKind,
   presentationCyclePlanIndex, activeSampleId, activeEventId, auditionedSampleId, timebase, view: requestedView, layout, ttmAnnotations, onViewChange, onLayoutChange,
 }: {
   fixture: Fixture
@@ -873,6 +873,7 @@ function SequenceTimeline({
   assets: ReadonlyMap<string, File>
   progress: number
   isPlaying: boolean
+  isPaused: boolean
   presentationStarted: boolean
   presentationPositionUnits: number | null
   presentationCycleSlotKind: CycleSlot['kind'] | undefined
@@ -898,6 +899,7 @@ function SequenceTimeline({
   const unitsPerBar = unitsPerBeat * 4
   const unitDescription = timebase === 'legacy' ? 'legacy ticks' : 'sixteenth units'
   const view = import.meta.env.DEV ? requestedView : 'waveform'
+  const activePlaybackLabel = isPaused ? 'Paused here' : 'Now playing'
 
   useEffect(() => {
     const generation = waveformGeneration.current + 1
@@ -985,7 +987,7 @@ function SequenceTimeline({
           + guideResolution.guide.label + ', not an audio transcription'
         : guideResolution?.state === 'unassigned' ? ', TTM guide: Unassigned (Untranscribed)' : ', TTM guide: Untranscribed'
       : ''
-    return <li key={event.id}>Event {index + 1}: {name}, starts at {startLabel}{event.startUnits + 1}, lasts {event.durationUnits}{durationLabel}{event.silent ? ', silent' : ''}{event.id === activeEventId ? ', now playing' : ''}{guideDescription}</li>
+    return <li key={event.id}>Event {index + 1}: {name}, starts at {startLabel}{event.startUnits + 1}, lasts {event.durationUnits}{durationLabel}{event.silent ? ', silent' : ''}{event.id === activeEventId ? (isPaused ? ', playback paused here' : ', now playing') : ''}{guideDescription}</li>
   })
   const renderSequenceEvent = (event: Fixture['events'][number], inline = false, eventNumber = 0) => {
     const waveform = event.silent ? undefined : waveforms.get(event.sampleId)
@@ -1022,9 +1024,9 @@ function SequenceTimeline({
         data-active={active ? 'true' : undefined}
         className={'sequence-event' + (event.silent ? ' sequence-event--silent' : '') + sampleColorClass + waveformClass + guideClass + inlineClass + activeClass}
         style={{ ...(sampleColor ? { '--sample-color': sampleColor } : {}), left: (event.startUnits / totalUnits) * 100 + '%', width: (event.durationUnits / totalUnits) * 100 + '%' } as CSSProperties}
-        title={event.silent ? name + ': silent event' : (active ? 'Now playing · ' : '') + name + ': ' + event.durationUnits + ' units' + guideDescription}
+        title={event.silent ? name + ': silent event' : (active ? activePlaybackLabel + ' · ' : '') + name + ': ' + event.durationUnits + ' units' + guideDescription}
       >
-        {inline && <span className={view === 'ttm' ? 'sequence-inline-event-label sequence-inline-event-label--ttm' : 'sequence-inline-event-label'}>{view === 'ttm' ? eventNumber + ' · ' + name : (active ? 'Now playing · ' : '') + name}</span>}
+        {inline && <span className={view === 'ttm' ? 'sequence-inline-event-label sequence-inline-event-label--ttm' : 'sequence-inline-event-label'}>{view === 'ttm' ? eventNumber + ' · ' + name : (active ? activePlaybackLabel + ' · ' : '') + name}</span>}
         {view === 'waveform' && waveform && geometry && (
           <svg
             className="sequence-waveform"
@@ -1121,7 +1123,7 @@ function SequenceTimeline({
                 <span className={view === 'ttm' ? 'timeline-lane-label timeline-lane-label--ttm' : 'timeline-lane-label'}>
                   <span className="timeline-lane-name"><span className={lane.color ? 'timeline-color-swatch' : 'timeline-color-swatch timeline-color-swatch--silent'} aria-hidden="true" /><span className="timeline-lane-name-text">{lane.name}</span></span>
                   <small>{lane.note}</small>
-                  {lane.id === activeSampleId && <span className="timeline-now-playing">Now playing</span>}
+                  {lane.id === activeSampleId && <span className="timeline-now-playing">{activePlaybackLabel}</span>}
                 </span>
                 <span className={view === 'ttm' ? 'timeline-track timeline-track--ttm' : 'timeline-track'} aria-hidden="true" style={{ gridTemplateColumns: 'repeat(' + totalUnits + ', minmax(8px, 1fr))' }}>
                   {unitNumbers.map((unit) => <span className={unit % unitsPerBeat === 0 ? 'timeline-tick timeline-tick--beat' : 'timeline-tick'} key={unit} />)}
@@ -1369,10 +1371,12 @@ export default function App() {
   const presentationCycleIteration = presentation?.cycleIteration
   const presentationCyclePlanIndex = presentation?.cyclePlanIndex
   const isCountInActive = transportSnapshot.status === 'counting-in'
-  const isPlaybackLocked = transportSnapshot.status === 'loading' || isCountInActive || transportSnapshot.status === 'playing'
+  const isCountInPaused = transportSnapshot.status === 'paused' && transportSnapshot.pausedFrom === 'counting-in'
+  const isCountInSuspended = isCountInActive || isCountInPaused
+  const isPlaybackLocked = transportSnapshot.status === 'loading' || isCountInActive || transportSnapshot.status === 'playing' || transportSnapshot.status === 'paused'
   const isPlaybackLockedNow = () => {
     const status = transport.getSnapshot().status
-    return status === 'loading' || status === 'counting-in' || status === 'playing'
+    return status === 'loading' || status === 'counting-in' || status === 'playing' || status === 'paused'
   }
   const [preset, setPreset] = useState<Preset>(DEMO_PRESET)
   const [fixture, setFixture] = useState<Fixture | null>(null)
@@ -2215,6 +2219,7 @@ export default function App() {
 
   useEffect(() => {
     if (transportSnapshot.status === 'loading') setTransportNote('Preparing preview audio.')
+    if (transportSnapshot.status === 'paused') setTransportNote('Playback paused. Press Resume playback to continue.')
     if (transportSnapshot.status === 'playing') {
       if (playbackTarget?.kind === 'sample') {
         setTransportNote('Previewing ' + playbackTarget.name + '.')
@@ -2629,9 +2634,12 @@ export default function App() {
   }
 
   const handleBpmChange = (value: string) => {
-    if (transport.getSnapshot().status === 'counting-in') return
     const activeTransport = transport.getSnapshot()
-    const liveTempoTraining = activeTransport.status === 'playing' || activeTransport.status === 'loading'
+    const isPausedCountIn = activeTransport.status === 'paused' && activeTransport.pausedFrom === 'counting-in'
+    if (activeTransport.status === 'counting-in' || isPausedCountIn) return
+    const tempoCanChangeLive = activeTransport.status === 'playing' || activeTransport.status === 'loading'
+      || (activeTransport.status === 'paused' && activeTransport.pausedFrom === 'playing')
+    const liveTempoTraining = tempoCanChangeLive
       ? activeTransport.tempoTraining
       : undefined
     setBpm(value)
@@ -2645,7 +2653,7 @@ export default function App() {
       setTempoTrainingCancelledNotice(
         'Tempo training stopped at ' + (nextTempoValid ? nextBpm : liveTempoTraining.currentBpm) + ' BPM. Press Play to restart from this tempo.',
       )
-    } else if (nextTempoValid && (activeTransport.status === 'playing' || activeTransport.status === 'loading')) {
+    } else if (nextTempoValid && tempoCanChangeLive) {
       transport.setTempo(nextBpm)
       if (tempoTrainingCancelledNotice) {
         setTempoTrainingCancelledNotice('Tempo training stopped at ' + nextBpm + ' BPM. Press Play to restart from this tempo.')
@@ -2726,7 +2734,7 @@ export default function App() {
 
   const handleResetSessionControls = () => {
     const activeTransport = transport.getSnapshot()
-    if (activeTransport.status === 'counting-in') return
+    if (activeTransport.status === 'counting-in' || (activeTransport.status === 'paused' && activeTransport.pausedFrom === 'counting-in')) return
     const defaults = sourceControlDefaultsRef.current
     const customRange = customBeatSelected && customBeatReferenceBpm !== null
       ? getTempoRange(preset.bpm, customBeatReferenceBpm)
@@ -2740,7 +2748,7 @@ export default function App() {
     setSampleVolume(defaults.sampleVolume)
     setBeatVolume(defaults.beatVolume)
     setMetronomeVolume(60)
-    if (activeTransport.status === 'playing' || activeTransport.status === 'loading') {
+    if (activeTransport.status === 'playing' || activeTransport.status === 'loading' || (activeTransport.status === 'paused' && activeTransport.pausedFrom === 'playing')) {
       transport.setTempo(resetBpmValue)
       if (activeTransport.tempoTraining) {
         setTempoTrainingCancelledNotice('Tempo training stopped at ' + resetBpmValue + ' BPM. Press Play to restart from this tempo.')
@@ -3179,18 +3187,46 @@ export default function App() {
     setActionError(null)
     setTransportNote('Playback stopped.')
   }
+  const handleTogglePlayback = () => {
+    const status = transport.getSnapshot().status
+    if (status === 'paused') {
+      setActionError(null)
+      void transport.resume().catch((error: unknown) => {
+        setActionError('Playback could not resume: ' + describeError(error))
+      })
+      return
+    }
+    if (status === 'playing' || status === 'counting-in') {
+      setActionError(null)
+      void transport.pause().catch((error: unknown) => {
+        setActionError('Playback could not pause: ' + describeError(error))
+      })
+      return
+    }
+    handlePlaySequence()
+  }
 
   const tempoTrainingBlockingError = tempoTraining.enabled && Boolean(presetFileName) ? tempoTrainingError : null
   const playDisabled = transportSnapshot.status === 'disposed' || !isPresetReady || !fixture || isReadingPreset || isGenerating || isCustomBeatAnalysisBusy || isPlaybackLocked || autoGenerateBlocked || !customBeatReferenceInputValid || !sessionTempoValid || Boolean(tempoTrainingBlockingError) || savedLibraryBusy
-  const stopDisabled = transportSnapshot.status !== 'playing' && transportSnapshot.status !== 'loading' && !isCountInActive
-  const isSequencePlaying = playbackTarget?.kind === 'sequence' && transportSnapshot.status === 'playing'
-  const displayedProgress = transportSnapshot.status === 'playing' ? presentation?.progress : undefined
-  const progressPercent = isCountInActive
+  const stopDisabled = transportSnapshot.status !== 'playing' && transportSnapshot.status !== 'loading' && !isCountInActive && transportSnapshot.status !== 'paused'
+  const pauseResumeDisabled = transportSnapshot.status === 'loading' || transportSnapshot.status === 'disposed'
+    ? true
+    : transportSnapshot.status === 'playing' || isCountInActive || transportSnapshot.status === 'paused'
+      ? false
+      : playDisabled || isReadingPreset
+  const playbackActionLabel = transportSnapshot.status === 'paused'
+    ? 'Resume playback'
+    : transportSnapshot.status === 'playing' || isCountInActive
+      ? 'Pause playback'
+      : 'Play sequence'
+  const isSequencePlaying = playbackTarget?.kind === 'sequence' && (transportSnapshot.status === 'playing' || transportSnapshot.status === 'paused')
+  const displayedProgress = transportSnapshot.status === 'playing' || transportSnapshot.status === 'paused' ? presentation?.progress : undefined
+  const progressPercent = isCountInSuspended
     ? 0
     : transportSnapshot.status === 'completed'
     ? 1
     : Math.max(0, Math.min(1, displayedProgress ?? transportSnapshot.progress))
-  const timelineProgressPercent = isCountInActive
+  const timelineProgressPercent = isCountInSuspended
     ? 0
     : presentation?.started && fixture
     ? Math.max(0, Math.min(1, presentation.positionUnits / Math.max(fixture.totalUnits, 1)))
@@ -3221,7 +3257,7 @@ export default function App() {
   const visibleStagedAudioCount = stagedAudioFiles.length || preparedLocalImport?.selectedAudioFileCount || 0
   const sessionControlsDisabled = !isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy || savedLibraryBusy
   const savedLibraryControlsBusy = savedLibraryBusy || isReadingPreset || isGenerating || isPreparingLocalImport || isPlaybackLocked || isCustomBeatAnalysisBusy || isSavingIni
-  const resetControlsDisabled = sessionControlsDisabled || isCountInActive
+  const resetControlsDisabled = sessionControlsDisabled || isCountInSuspended
   const tempoTrainingProgressText = transportSnapshot.tempoTraining
     ? transportSnapshot.tempoTraining.goalReached
       ? 'Tempo training · holding at ' + transportSnapshot.tempoTraining.currentBpm + ' BPM · ' + transportSnapshot.tempoTraining.completedRounds + ' full ' + (transportSnapshot.tempoTraining.completedRounds === 1 ? 'round' : 'rounds') + ' completed.'
@@ -3233,17 +3269,21 @@ export default function App() {
         + (transportSnapshot.tempoTraining.roundsPerStep - transportSnapshot.tempoTraining.roundsIntoStep) + ' full '
         + (transportSnapshot.tempoTraining.roundsPerStep - transportSnapshot.tempoTraining.roundsIntoStep === 1 ? 'round.' : 'rounds.')
     : null
-  const transportStatusText = isCountInActive && transportSnapshot.countIn
-    ? 'Count-in · beat ' + transportSnapshot.countIn.beat + ' of ' + transportSnapshot.countIn.beats + '.'
-    : isCountInActive
-      ? 'Count-in in progress.'
-      : tempoTrainingProgressText
-        ? tempoTrainingProgressText
-        : tempoTrainingCancelledNotice && (transportSnapshot.status === 'playing' || transportSnapshot.status === 'loading')
-          ? tempoTrainingCancelledNotice
-          : tempoTraining.enabled && tempoTrainingError
-            ? tempoTrainingError
-            : transportNote
+  const transportStatusText = transportSnapshot.status === 'paused'
+    ? isCountInPaused && transportSnapshot.countIn
+      ? 'Playback paused · count-in beat ' + transportSnapshot.countIn.beat + ' of ' + transportSnapshot.countIn.beats + '.'
+      : 'Playback paused. Press Resume playback to continue.'
+    : isCountInActive && transportSnapshot.countIn
+      ? 'Count-in · beat ' + transportSnapshot.countIn.beat + ' of ' + transportSnapshot.countIn.beats + '.'
+      : isCountInActive
+        ? 'Count-in in progress.'
+        : tempoTrainingProgressText
+          ? tempoTrainingProgressText
+          : tempoTrainingCancelledNotice && (transportSnapshot.status === 'playing' || transportSnapshot.status === 'loading')
+            ? tempoTrainingCancelledNotice
+            : tempoTraining.enabled && tempoTrainingError
+              ? tempoTrainingError
+              : transportNote
 
   shortcutActionsRef.current = {
     playDisabled: playDisabled || isReadingPreset,
@@ -3332,8 +3372,10 @@ export default function App() {
 
         <section className="transport-dock" aria-label="Playback controls">
           <div className="transport-dock__actions">
-            <button className="button button--play" type="button" onClick={handlePlaySequence} disabled={playDisabled || isReadingPreset}>
-              <span className="play-glyph" aria-hidden="true" />Play sequence
+            <button className="button button--play" type="button" onClick={handleTogglePlayback} disabled={pauseResumeDisabled}>
+              {transportSnapshot.status === 'playing' || isCountInActive
+                ? <span className="pause-glyph" aria-hidden="true"><span /><span /></span>
+                : <span className="play-glyph" aria-hidden="true" />}{playbackActionLabel}
             </button>
             <button className="button button--stop" type="button" onClick={handleStop} disabled={stopDisabled}>
               <span className="stop-glyph" aria-hidden="true" />Stop
@@ -3455,6 +3497,7 @@ export default function App() {
                 assets={sampleAssets}
                 progress={timelineProgressPercent}
                 isPlaying={timelineIsPlaying}
+                isPaused={transportSnapshot.status === 'paused'}
                 presentationStarted={timelinePresentationStarted}
                 presentationPositionUnits={presentationPositionUnits}
                 presentationCycleSlotKind={isSequencePlaying && visibleFixturePlanMatches ? presentationCycleSlotKind : undefined}
@@ -3536,7 +3579,7 @@ export default function App() {
           tempoTrainingDisabled={!isPresetReady || isReadingPreset || isGenerating || isSavingIni || isCustomBeatAnalysisBusy || savedLibraryBusy || isPlaybackLocked}
           repeatingPracticeAvailable={Boolean(presetFileName)}
           disabled={sessionControlsDisabled}
-          tempoLocked={isCountInActive}
+          tempoLocked={isCountInSuspended}
           resetDisabled={resetControlsDisabled}
           beatSelectionDisabled={isPlaybackLocked || isCustomBeatAnalysisBusy || savedLibraryBusy}
           onBpmChange={handleBpmChange}
