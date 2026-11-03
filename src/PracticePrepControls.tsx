@@ -22,8 +22,8 @@ export function PracticePrepControls({
   const clickEnabled = countInBars > 0 || metronomeEnabled
 
   return (
-    <fieldset className="playback-prep" aria-describedby="playback-prep-help">
-      <legend>Playback prep</legend>
+    <div className="playback-prep" role="group" aria-labelledby="playback-prep-title" aria-describedby="playback-prep-help">
+      <span id="playback-prep-title" className="playback-prep__title">Playback prep</span>
       <div className="playback-prep__controls">
         <label className="playback-prep__field" htmlFor="count-in-bars">
           <span>Count-in</span>
@@ -67,6 +67,6 @@ export function PracticePrepControls({
         </label>
       </div>
       <p id="playback-prep-help">Count-in clicks use 4 beats per bar. Metronome clicks continue through the sequence.</p>
-    </fieldset>
+    </div>
   )
 }

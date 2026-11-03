@@ -153,7 +153,7 @@ async function assertTimelineCaptionItemsDoNotOverlap(page: Page): Promise<void>
   }
 }
 
-test('production Pages preview gates TTM and keeps waveform Grid/Inline playback and the worklet', async ({ page }) => {
+test('production Pages preview gates TTM and keeps waveform Grid/Inline playback and the worklet', async ({ page }, testInfo) => {
   test.setTimeout(120_000)
   await instrumentBeatSource(page)
   await page.setViewportSize({ width: 1280, height: 900 })
@@ -168,11 +168,30 @@ test('production Pages preview gates TTM and keeps waveform Grid/Inline playback
   await page.goto('/scratch-combo-web/')
   await expect(page.getByRole('heading', { name: 'Generated combo' })).toBeVisible({ timeout: 30_000 })
   await expect(page.getByLabel('Quick preset')).toHaveValue('SSC-085BPM-01')
-  for (const width of [390, 844, 1280]) {
+  for (const width of [320, 390, 844, 1280]) {
     await page.setViewportSize({ width, height: 844 })
     await assertPracticeTopRowsDoNotOverlap(page, false)
     await assertPracticeTopRowsDoNotOverlap(page, true)
     await assertTimelineCaptionItemsDoNotOverlap(page)
+    if (width <= 390) {
+      const layout = await page.getByRole('group', { name: 'Timeline layout' }).boundingBox()
+      const view = await page.getByRole('group', { name: 'Timeline view' }).boundingBox()
+      expect(layout).not.toBeNull()
+      expect(view).not.toBeNull()
+      expect(Math.abs(layout!.x - view!.x)).toBeLessThanOrEqual(1)
+      const grid = await page.getByRole('radio', { name: 'Grid', exact: true }).boundingBox()
+      const waveform = await page.getByRole('radio', { name: 'Waveform', exact: true }).boundingBox()
+      expect(Math.abs(grid!.x - waveform!.x)).toBeLessThanOrEqual(1)
+
+      const prep = await page.getByRole('group', { name: 'Playback prep' }).boundingBox()
+      const title = await page.getByText('Playback prep', { exact: true }).boundingBox()
+      const countIn = await page.getByText('Count-in', { exact: true }).boundingBox()
+      expect(title!.y - prep!.y).toBeGreaterThanOrEqual(10)
+      expect(Math.abs(title!.x - countIn!.x)).toBeLessThanOrEqual(1)
+    }
+    if (width === 390) {
+      await page.locator('.timeline-caption').screenshot({ path: testInfo.outputPath('mobile-timeline-alignment.png') })
+    }
   }
   const previewHelp = page.locator('.preview-help')
   if (await previewHelp.evaluate((element) => (element as HTMLDetailsElement).open)) {
