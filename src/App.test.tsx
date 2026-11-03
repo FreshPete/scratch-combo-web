@@ -1466,15 +1466,13 @@ describe('workspace import and transport lifecycle', () => {
   it('keeps playback unavailable after a bundled file error and retries the selected preset', async () => {
     presetHarness.loadBuiltInPreset.mockRejectedValueOnce(new Error('Beat02 could not be fetched.'))
     render(<App />)
-    selectWorkspaceTab('Files')
 
     const retry = await screen.findByRole('button', { name: 'Retry built-in preset' })
-    expect(screen.getByRole('alert')).toHaveTextContent('Beat02 could not be fetched.')
+    expect(within(screen.getByRole('tabpanel', { name: 'Practice' })).getByText('Beat02 could not be fetched.')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeDisabled()
     expect(screen.queryByText('Bundled kick')).not.toBeInTheDocument()
     fireEvent.click(retry)
 
-    selectWorkspaceTab('Practice')
     await screen.findByRole('heading', { name: 'Generated combo' })
     expect(screen.getByRole('button', { name: 'Play sequence' })).toBeEnabled()
   })

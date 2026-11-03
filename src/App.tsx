@@ -2084,7 +2084,7 @@ export default function App() {
         controller.abort()
         setFixture(null)
         setIsPresetReady(false)
-        setBootstrapError(describeError(error) + ' Retry the built-in preset or choose your own INI below.')
+        setBootstrapError(describeError(error))
         setIsBootstrapLoading(false)
         setImportMessage('The selected built-in preset is not ready. Playback is disabled until all files load.')
         setTransportNote('Built-in preset could not be loaded.')
@@ -3514,7 +3514,10 @@ export default function App() {
               />
             : <div className="sequence-empty" role="status" aria-live="polite">
                 <strong>{isBootstrapLoading ? 'Loading built-in preset' : isReadingPreset ? 'Reading preset' : !isPresetReady ? 'Preset is not ready' : isImportedPreset ? 'Generate a combo to preview the sequence' : 'Build a preview to see the sequence'}</strong>
-                <span>{isBootstrapLoading ? 'The selected INI and every referenced WAV must load before playback is enabled.' : isReadingPreset ? 'The previous sequence was cleared while the local file is read.' : !isPresetReady ? 'Retry the built-in preset or choose a valid custom INI in Local files.' : isImportedPreset ? comboBeats + ' beats · ' + comboLengthTicks + ' legacy ticks' : 'The fixed demo uses synthetic sounds.'}</span>
+                <span>{isBootstrapLoading ? 'Downloading preset sounds…' : isReadingPreset ? 'The previous sequence was cleared while the local file is read.' : !isPresetReady ? bootstrapError ?? 'Choose a preset to start.' : isImportedPreset ? comboBeats + ' beats · ' + comboLengthTicks + ' legacy ticks' : 'The fixed demo uses synthetic sounds.'}</span>
+                {!isBootstrapLoading && !isReadingPreset && !isPresetReady && bootstrapError && (
+                  <button className="button button--small" type="button" disabled={savedLibraryBusy || isPlaybackLocked} onClick={handleRetryBuiltIn}>Retry built-in preset</button>
+                )}
               </div>}
         </section>
         </div>
