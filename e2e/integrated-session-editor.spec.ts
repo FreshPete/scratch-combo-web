@@ -177,13 +177,18 @@ test("live BPM, pitch, and levels stay independent; reset preserves the playing 
 
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Generated combo" })).toBeVisible({ timeout: 30_000 });
+  const practiceTab = page.getByRole("tab", { name: "Practice", exact: true });
+  const sessionTab = page.getByRole("tab", { name: "Session", exact: true });
+  await sessionTab.click();
   await expect(page.getByRole("spinbutton", { name: "BPM" })).toHaveValue("85");
+  await practiceTab.click();
   await expect(page.getByRole("radio", { name: "Q&A" })).toBeChecked();
   await page.getByLabel("Combo length").selectOption("16");
   await page.getByRole("button", { name: "Generate combo" }).click();
   await expect(page.getByRole("img", { name: /Sequence timeline: 256 legacy ticks/ })).toBeVisible();
-  await page.getByLabel("Beat bed").selectOption("1");
   await page.getByLabel("Large pause").check();
+  await sessionTab.click();
+  await page.getByLabel("Beat bed").selectOption("1");
   await page.getByRole("button", { name: "Play sequence" }).click();
   const status = page.locator(".transport-status");
   await expect(status).toHaveText("Q&A · question playback · cycle 1.");
@@ -242,6 +247,7 @@ test("live BPM, pitch, and levels stay independent; reset preserves the playing 
   expect(cycleAfterReset).toBeGreaterThanOrEqual(cycleAfterLiveChanges);
   await expect(page.getByRole("button", { name: "Stop" })).toBeEnabled();
   await expect(page.getByLabel("Beat bed")).toHaveValue("1");
+  await practiceTab.click();
   await expect(page.getByRole("radio", { name: "Q&A" })).toBeChecked();
   await expect(page.getByLabel("Large pause")).toBeChecked();
   await expect(page.getByLabel("Combo length")).toHaveValue("16");
