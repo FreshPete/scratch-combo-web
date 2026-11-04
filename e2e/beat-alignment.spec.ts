@@ -323,7 +323,7 @@ async function expectNoOverflow(page: Page, width: number): Promise<void> {
 }
 
 function proofImagePath(browser: string, viewport: 'desktop' | 'mobile'): string {
-  return path.resolve(process.cwd(), 'docs/images/beat-alignment', `manual-cue-loop-trim-${browser}-${viewport}.png`)
+  return path.resolve(process.cwd(), 'test-results/screenshots/beat-alignment', `manual-cue-loop-trim-${browser}-${viewport}.png`)
 }
 
 function browserLabel(): string {
@@ -444,7 +444,7 @@ test('manual beat cue and loop trim survive selection and saved-session restore,
   await expect(endInput).toHaveValue(String(beatLoopEndSeconds))
 
   const browser = browserLabel()
-  const proofDirectory = path.resolve(process.cwd(), 'docs/images/beat-alignment')
+  const proofDirectory = path.resolve(process.cwd(), 'test-results/screenshots/beat-alignment')
   mkdirSync(proofDirectory, { recursive: true })
   await page.setViewportSize({ width: 1280, height: 900 })
   await startInput.scrollIntoViewIfNeeded()

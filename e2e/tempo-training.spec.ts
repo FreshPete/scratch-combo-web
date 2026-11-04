@@ -527,7 +527,7 @@ async function captureTrainerScreenshots(page: Page): Promise<void> {
   await openDetails(trainer)
   const target = page.locator('#tempo-training-target-bpm')
   const browser = browserLabel()
-  const screenshotDirectory = path.resolve(process.cwd(), 'docs', 'images', 'tempo-training')
+  const screenshotDirectory = path.resolve(process.cwd(), 'test-results', 'screenshots', 'tempo-training')
   mkdirSync(screenshotDirectory, { recursive: true })
   for (const viewport of [
     { name: 'desktop', width: 1280, height: 900 },

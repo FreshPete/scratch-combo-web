@@ -664,7 +664,7 @@ async function readOrRemoveSettings(page: Page, remove: boolean): Promise<Record
 
 async function capturePrepScreenshots(page: Page): Promise<void> {
   const browser = browserLabel()
-  const imageDirectory = path.resolve(process.cwd(), 'docs', 'images', 'count-in-metronome')
+  const imageDirectory = path.resolve(process.cwd(), 'test-results', 'screenshots', 'count-in-metronome')
   mkdirSync(imageDirectory, { recursive: true })
   for (const viewport of [
     { name: 'desktop', width: 1280, height: 900 },

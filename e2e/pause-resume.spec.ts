@@ -112,7 +112,7 @@ async function waitForAudioContextState(page: Page, state: AudioContextState): P
 async function capturePausedState(page: Page, name: string): Promise<void> {
   const browser = (process.env.PLAYWRIGHT_CHANNEL ?? 'msedge').toLowerCase().replace(/[^a-z0-9-]+/g, '-')
   const viewport = process.env.PLAYWRIGHT_MOBILE === '1' ? 'mobile' : 'desktop'
-  const directory = path.resolve(process.cwd(), 'docs', 'images', 'pause-resume')
+  const directory = path.resolve(process.cwd(), 'test-results', 'screenshots', 'pause-resume')
   mkdirSync(directory, { recursive: true })
   await page.evaluate(() => window.scrollTo(0, 0))
   await page.screenshot({ path: path.join(directory, `${name}-${browser}-${viewport}.png`), fullPage: true })

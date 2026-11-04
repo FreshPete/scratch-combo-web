@@ -54,5 +54,5 @@ Analysis uses at most the first 120 seconds and can report an estimate, an ambig
 
 The transport accepts a separate beat reference BPM. Scratch events use the preset's recorded BPM; a custom beat uses its confirmed recorded BPM. When those references differ, separate SoundTouch paths apply matching source/processor rates to keep each layer's tempo and pitch controls independent. The target practice tempo stays within the intersection of each source's supported 0.5–2× range. Presentation timing retains the measured processor-delay estimate rather than claiming exact physical onset alignment.
 
-Pause and physical onset accuracy remain unverified. The source preset and audio assets are not modified.
+Pause suspends the audio context and freezes scheduling. Resume continues the same run. Physical onset accuracy remains unverified. The source preset and audio assets are not modified.
 
