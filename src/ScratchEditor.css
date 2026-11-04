@@ -1,0 +1,61 @@
+.scratch-editor {
+  display: grid;
+  gap: 16px;
+  margin-top: 0;
+  padding: 18px;
+}
+.scratch-editor__heading,
+.scratch-editor__lane-heading,
+.scratch-editor__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.scratch-editor__heading h2 { margin: 0; color: var(--text-warm); font-size: 19px; font-weight: 640; letter-spacing: -.025em; }
+.scratch-editor__heading p { margin: 5px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
+.scratch-editor__toolbar { align-items: end; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.scratch-editor__source { display: grid; width: min(100%, 450px); min-width: 0; gap: 4px; color: var(--text-secondary); font-size: 11px; }
+.scratch-editor__source select { width: 100%; min-width: 0; min-height: 40px; padding: 0 30px 0 10px; border: 1px solid var(--line-strong); border-radius: 2px; background: var(--surface-inset); color: var(--text); }
+.scratch-editor__actions { display: flex; align-items: center; gap: 12px; }
+.scratch-editor__duration { color: var(--text-muted); font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+.scratch-editor__lanes { min-width: 0; border: 1px solid var(--line-strong); background: var(--surface-inset); }
+.scratch-editor__lane-heading { min-height: 56px; padding: 10px 12px 8px; }
+.scratch-editor__lane-heading h3 { margin: 0; color: var(--text); font-size: 12px; font-weight: 620; }
+.scratch-editor__lane-heading p { margin: 3px 0 0; color: var(--text-secondary); font-size: 10px; line-height: 1.4; }
+.scratch-editor__position-labels { display: grid; gap: 4px; color: #8dddf1; font-family: var(--mono); font-size: 9px; text-align: right; text-transform: uppercase; }
+.scratch-editor__canvas { display: block; width: 100%; touch-action: none; user-select: none; outline-offset: -2px; cursor: crosshair; }
+.scratch-editor__canvas--record { height: clamp(100px, 17vw, 144px); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #131b1d; }
+.scratch-editor__canvas--fader { height: clamp(54px, 8vw, 72px); border-top: 1px solid var(--line); background: #131719; }
+.scratch-editor__grid { stroke: #263234; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.scratch-editor__grid-major { stroke: #374547; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.scratch-editor__movement { fill: none; stroke: #52d8ff; stroke-width: 3; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 3px #37a1bd88); }
+.scratch-editor__selected { fill: var(--accent); stroke: #111516; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.scratch-editor__selected-line { stroke: #d5ff30aa; stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+.scratch-editor__playhead { stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; pointer-events: none; }
+.scratch-editor__fader-key { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 10px; white-space: nowrap; }
+.scratch-editor__fader-open,
+.scratch-editor__fader-closed { display: inline-block; width: 13px; height: 13px; border: 1px solid #ff5bb9; }
+.scratch-editor__fader-open { background: #ff5bb9; }
+.scratch-editor__fader-closed { height: 7px; background: transparent; }
+.scratch-editor__fader-cell { vector-effect: non-scaling-stroke; }
+.scratch-editor__fader-cell--open { fill: #ff5bb9; stroke: #ff8bce; stroke-width: 1; }
+.scratch-editor__fader-cell--closed { fill: #35302f; stroke: #72605b; stroke-width: 1; }
+.scratch-editor__time-axis { display: flex; justify-content: space-between; padding: 5px 9px; color: var(--text-muted); font-family: var(--mono); font-size: 9px; }
+.scratch-editor__time-axis--bottom { border-top: 1px solid var(--line); }
+.scratch-editor__hint,
+.scratch-editor__status { margin: 0; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
+.scratch-editor__status { min-height: 16px; color: #d2db9b; }
+.scratch-editor__lanes--playing .scratch-editor__canvas { cursor: default; }
+@media (max-width: 600px) {
+  .scratch-editor { gap: 13px; padding: 14px 12px; }
+  .scratch-editor__heading { align-items: flex-start; }
+  .scratch-editor__heading .button { flex: 0 0 auto; }
+  .scratch-editor__toolbar { align-items: stretch; flex-direction: column; }
+  .scratch-editor__source { width: 100%; }
+  .scratch-editor__actions { justify-content: space-between; }
+  .scratch-editor__lane-heading { align-items: flex-start; gap: 8px; padding-right: 9px; padding-left: 9px; }
+  .scratch-editor__lane-heading p { max-width: 36ch; }
+  .scratch-editor__fader-key { gap: 4px; font-size: 9px; }
+  .scratch-editor__hint { font-size: 10px; }
+}

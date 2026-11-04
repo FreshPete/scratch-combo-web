@@ -315,6 +315,7 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
 .transport-meter progress::-moz-progress-bar { background: var(--accent); }
 .transport-status { color: var(--text-secondary); font-size: 11px; line-height: 1.4; }
 .transport-dock { position: sticky; z-index: 4; top: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, .9fr); align-items: center; gap: 10px 20px; margin: -8px 0 18px; padding: 10px 12px; border: 1px solid var(--line-strong); background: var(--surface); }
+.transport-dock[hidden] { display: none; }
 .transport-dock__actions { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 8px; }
 .transport-dock__help { min-height: 40px; white-space: nowrap; }
 .transport-dock__meter { display: grid; min-width: 0; grid-template-columns: 72px minmax(0, 1fr); align-items: center; gap: 10px; }
@@ -426,9 +427,9 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
 }
 @media (max-width: 520px) {
   .rail { padding-right: 10px; padding-left: 10px; }
-  .rail__nav { gap: 2px; margin-right: 6px; margin-left: 6px; }
-  .rail__nav [role="tab"] { min-width: 54px; flex-direction: column; gap: 3px; font-size: 9px; }
-  .rail__foot { font-size: 8px; }
+  .rail__nav { flex: 1; gap: 2px; margin-right: 0; margin-left: 6px; }
+  .rail__nav [role="tab"] { min-width: 0; min-height: 40px; flex: 1; flex-direction: column; gap: 3px; font-size: 9px; }
+  .rail__foot { display: none; }
   .workspace { padding-right: 12px; padding-left: 12px; }
   .workspace-header { align-items: flex-start; flex-direction: column; gap: 12px; }
   .session-state { font-size: 11px; }
