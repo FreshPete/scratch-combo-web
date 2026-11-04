@@ -1,35 +1,8 @@
 import { useEffect, useRef, type ChangeEvent, type InputHTMLAttributes } from 'react'
-import type { SnapshotFileValidation } from './audio'
-import type { AssetDiagnostic, AssetResolution, Preset, PresetAssetResolution } from './domain'
+import type { AssetDiagnostic } from './domain'
+import type { ImportWizardStep, PreparedLocalImport } from './preparePresetImport'
 
 const WAV_ACCEPT = '.wav,audio/wav,audio/x-wav'
-
-export type ImportWizardStep = 1 | 2 | 3
-export type ImportReferenceCheck = {
-  subject: 'sample' | 'beat'
-  id: string
-  requested: string
-  required: boolean
-  resolution: AssetResolution
-  validation: SnapshotFileValidation | null
-}
-export type PreparedLocalImport = {
-  iniFileName: string
-  iniText: string
-  preset: Preset
-  resolution: PresetAssetResolution
-  snapshotResolution: PresetAssetResolution
-  snapshotFiles: File[]
-  selectedAudioFileCount: number
-  checks: ImportReferenceCheck[]
-  copiedFileCount: number
-  copiedBytes: number
-  decodedFileCount: number
-  decodeAttemptCount: number
-  canLoad: boolean
-  applied: boolean
-  blockedMessage: string | null
-}
 
 function LocalFilePicker({
   inputId, label, description, accept, multiple = false, directory = false, disabled = false, onChange,
