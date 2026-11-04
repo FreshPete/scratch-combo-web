@@ -1,8 +1,10 @@
+import { DiagnosticList, ImportWizard, type ImportReferenceCheck, type ImportWizardStep, type PreparedLocalImport } from './ImportWizard'
+import { SampleTable } from './SampleTable'
 import { SequenceTimeline, type TimelineLayout, type TimelineView } from './SequenceTimeline'
 import { SYNTHETIC_SAMPLE_IDS } from './domain/demo'
 import {
   useEffect, useMemo, useRef, useState, useSyncExternalStore,
-  type ChangeEvent, type InputHTMLAttributes, type KeyboardEvent as ReactKeyboardEvent,
+  type ChangeEvent, type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
 import {
   analyzeLocalAudioFile, AudioTransport, LocalWavSnapshotError, snapshotReferencedWavFiles,
@@ -19,7 +21,7 @@ import {
 import { PracticeLibrary } from './PracticeLibrary'
 import {
   buildAssetIndex, buildPreviewFixture, DEMO_PRESET, generateLegacyCombo, parseLegacyIni,
-  patchLegacyIniText, resolvePresetAssets, REST_SAMPLE_ID, web24bitRnd, type AssetDiagnostic, type AssetIndex,
+  patchLegacyIniText, resolvePresetAssets, REST_SAMPLE_ID, web24bitRnd, type AssetIndex,
   type AssetResolution, type Fixture, type Preset, type PresetAssetResolution,
   type SampleDefinition,
 } from './domain'
@@ -28,7 +30,7 @@ import {
   type BuiltInPresetCatalog,
 } from './presets/catalog'
 import {
-  getTtmGuide, suggestedGuideForSampleName,
+  getTtmGuide,
   UNTRANSCRIBED, TTM_GUIDES,
   type TtmSampleGuideSelection,
 } from './notation/ttm-guides'
@@ -43,7 +45,6 @@ const DEFAULT_COMBO_BEATS = 8
 const COMBO_BEAT_OPTIONS = [4, 8, 16, 32] as const
 const AUTO_GENERATE_ROUND_OPTIONS = [1, 2, 4, 8] as const
 const LEGACY_TICKS_PER_BEAT = 16
-const WAV_ACCEPT = '.wav,audio/wav,audio/x-wav'
 const MAX_LOCAL_INI_BYTES = 1024 * 1024
 const MAX_SELECTED_AUDIO_FILE_COUNT = 10_000
 const MAX_LOCAL_IMPORT_REFERENCES = 512
@@ -74,33 +75,6 @@ type PracticeMode = 'qa' | 'loop'
 type WorkspaceSection = 'sequence' | 'files' | 'session' | 'samples'
 type PresetSource = 'loading' | 'builtin' | 'custom' | 'demo'
 type CustomBeatCandidate = { file: File; buffer: AudioBuffer | null }
-type ImportWizardStep = 1 | 2 | 3
-type ImportReferenceCheck = {
-  subject: 'sample' | 'beat'
-  id: string
-  requested: string
-  required: boolean
-  resolution: AssetResolution
-  validation: SnapshotFileValidation | null
-}
-type PreparedLocalImport = {
-  iniFileName: string
-  iniText: string
-  preset: Preset
-  resolution: PresetAssetResolution
-  snapshotResolution: PresetAssetResolution
-  snapshotFiles: File[]
-  selectedAudioFileCount: number
-  checks: ImportReferenceCheck[]
-  copiedFileCount: number
-  copiedBytes: number
-  decodedFileCount: number
-  decodeAttemptCount: number
-  canLoad: boolean
-  applied: boolean
-  blockedMessage: string | null
-}
-
 const WORKSPACE_TABS: ReadonlyArray<{ section: WorkspaceSection; label: string; href: string; id: string }> = [
   { section: 'sequence', label: 'Practice', href: '#sequence-section', id: 'tab-practice' },
   { section: 'session', label: 'Session', href: '#session-section', id: 'tab-session' },
@@ -309,13 +283,6 @@ function assetMapFor(resolution: PresetAssetResolution | undefined): ReadonlyMap
   return files
 }
 
-function resolutionForSample(
-  sample: SampleDefinition,
-  resolution: PresetAssetResolution | undefined,
-): AssetResolution | undefined {
-  return resolution?.samplesById.get(sample.id)
-}
-
 function eventAtTimelinePosition(fixture: Fixture, positionUnits: number): Fixture['events'][number] | null {
   if (!Number.isFinite(positionUnits) || positionUnits < 0) return null
   return fixture.events.find((event) => (
@@ -338,22 +305,6 @@ function handleWorkspaceTabKeyDown(event: ReactKeyboardEvent<HTMLAnchorElement>,
   const nextTab = document.getElementById(WORKSPACE_TABS[nextIndex]!.id)
   nextTab?.focus()
   nextTab?.click()
-}
-
-function sampleFileState(
-  sample: SampleDefinition,
-  resolution: PresetAssetResolution | undefined,
-): { label: string; tone: 'ready' | 'missing' | 'muted' } {
-  if (sample.silent) return { label: 'Marked silent', tone: 'muted' }
-  if (SYNTHETIC_SAMPLE_IDS.has(sample.id)) return { label: 'Demo sound', tone: 'ready' }
-  const asset = resolutionForSample(sample, resolution)
-  if (asset?.status === 'resolved') return { label: asset.selectedPath ?? sample.fileName, tone: 'ready' }
-  if (asset?.status === 'ambiguous') return { label: 'Ambiguous file match', tone: 'missing' }
-  return { label: 'WAV needed', tone: 'missing' }
-}
-
-function formatWeight(weight: number): string {
-  return Number.isInteger(weight) ? String(weight) : weight.toLocaleString(undefined, { maximumFractionDigits: 2 })
 }
 
 function requiredImportSample(sample: SampleDefinition): boolean {
@@ -501,247 +452,6 @@ function legacyFixtureFor(preset: Preset, requestedRawTicks: number) {
   }
 }
 
-function LocalFilePicker({
-  inputId, label, description, accept, multiple = false, directory = false, disabled = false, onChange,
-}: {
-  inputId: string
-  label: string
-  description: string
-  accept: string
-  multiple?: boolean
-  directory?: boolean
-  disabled?: boolean
-  onChange: (event: ChangeEvent<HTMLInputElement>) => void
-}) {
-  const inputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => {
-    if (!directory) return
-    inputRef.current?.setAttribute('webkitdirectory', '')
-    inputRef.current?.setAttribute('directory', '')
-  }, [directory])
-  const extraAttributes = directory
-    ? ({ webkitdirectory: '', directory: '' } as unknown as InputHTMLAttributes<HTMLInputElement>)
-    : {}
-
-  return (
-    <label className={disabled ? 'file-picker file-picker--disabled' : 'file-picker'} htmlFor={inputId}>
-      <span className="file-picker__copy">
-        <span className="file-picker__label">{label}</span>
-        <span className="file-picker__description">{description}</span>
-      </span>
-      <span className="file-picker__action" aria-hidden="true">Browse</span>
-      <input
-        ref={inputRef}
-        className="file-picker__input"
-        id={inputId}
-        type="file"
-        accept={accept}
-        multiple={multiple || directory}
-        aria-label={label}
-        disabled={disabled}
-        onChange={onChange}
-        {...extraAttributes}
-      />
-    </label>
-  )
-}
-
-function ImportWizard({
-  step, fileMode, stagedIniFileName, stagedPresetName, stagedAudioCount, currentPresetName,
-  currentAudioCount, busy, wizardError, selectionNote, prepared, locked, isBootstrapLoading,
-  bootstrapError, onRetryBuiltIn, onIniChange, onAudioChange, onFileModeChange, onBack,
-  onCancel, onReviewEmptySelection, onLoad, onStartAnother,
-}: {
-  step: ImportWizardStep
-  fileMode: 'folder' | 'files'
-  stagedIniFileName: string | null
-  stagedPresetName: string | null
-  stagedAudioCount: number
-  currentPresetName: string
-  currentAudioCount: number
-  busy: boolean
-  wizardError: string | null
-  selectionNote: string | null
-  prepared: PreparedLocalImport | null
-  locked: boolean
-  isBootstrapLoading: boolean
-  bootstrapError: string | null
-  onRetryBuiltIn: () => void
-  onIniChange: (event: ChangeEvent<HTMLInputElement>) => void
-  onAudioChange: (event: ChangeEvent<HTMLInputElement>) => void
-  onFileModeChange: (mode: 'folder' | 'files') => void
-  onBack: () => void
-  onCancel: () => void
-  onReviewEmptySelection: () => void
-  onLoad: () => void
-  onStartAnother: () => void
-}) {
-  const stepTitle = step === 1
-    ? 'Choose your INI preset'
-    : step === 2
-      ? 'Choose the audio files'
-      : 'Review and load'
-  const referenceRows = prepared?.checks ?? []
-  const requiredMissing = referenceRows.filter((check) => check.required && check.resolution.status !== 'resolved')
-  const requiredDecodeFailures = referenceRows.filter((check) => check.required && check.validation?.status === 'invalid')
-  return (
-    <section id="files-section" className="workspace-section import-section" aria-labelledby="import-heading">
-      <div className="section-heading">
-        <div>
-          <h2 id="import-heading">Your files</h2>
-          <p>Stage a preset and its referenced WAVs, review the matches, then load them into this session.</p>
-        </div>
-        <span className="section-index" aria-hidden="true">LOCAL</span>
-      </div>
-
-      <div className="import-current" aria-label="Current session files">
-        <div>
-          <span className="import-current__label">Current setup</span>
-          <strong>{currentPresetName}</strong>
-        </div>
-        <span className="import-current__count">{currentAudioCount} WAV {currentAudioCount === 1 ? 'file' : 'files'} in session</span>
-      </div>
-
-      <ol className="import-steps" aria-label="Preset import steps">
-        {(['INI', 'Audio', 'Review'] as const).map((label, index) => (
-          <li key={label} className={step === index + 1 ? 'import-steps__item import-steps__item--current' : step > index + 1 ? 'import-steps__item import-steps__item--complete' : 'import-steps__item'} aria-current={step === index + 1 ? 'step' : undefined}>
-            <span>{label}</span>
-          </li>
-        ))}
-      </ol>
-
-      <div className="import-wizard" aria-busy={busy}>
-        <div className="import-wizard__heading">
-          <h3 id={'import-step-' + step + '-heading'} tabIndex={-1}>{stepTitle}</h3>
-          {stagedIniFileName && <span className="import-wizard__file-name">{stagedIniFileName}</span>}
-        </div>
-
-        {step === 1 && (
-          <div className="import-wizard__step">
-            <p>Choose one legacy INI file. It will be read in this browser and checked before your current setup changes.</p>
-            {busy && <p className="inline-status" role="status">Reading {stagedIniFileName} locally. Your current setup stays active.</p>}
-            <LocalFilePicker inputId="preset-file" label="Choose INI preset" description="One .ini file · up to 1 MiB" accept=".ini,text/plain" disabled={locked} onChange={onIniChange} />
-          </div>
-        )}
-
-        {step === 2 && (
-          <div className="import-wizard__step">
-            <p>{stagedPresetName ? stagedPresetName + ' is staged. Choose the folder that contains its WAV files.' : 'Choose the folder that contains the WAV files referenced by this INI.'}</p>
-            {fileMode === 'folder' ? (
-              <>
-                <LocalFilePicker inputId="audio-folder" label="Choose audio folder" description="One folder · WAV references are matched locally" accept={WAV_ACCEPT} directory disabled={locked || busy} onChange={onAudioChange} />
-                <button className="button button--text import-wizard__alternate" type="button" disabled={locked || busy} onClick={() => onFileModeChange('files')}>Choose files instead</button>
-              </>
-            ) : (
-              <>
-                <LocalFilePicker inputId="audio-files" label="Choose WAV files" description="Select multiple files for this preset" accept={WAV_ACCEPT} multiple disabled={locked || busy} onChange={onAudioChange} />
-                <button className="button button--text import-wizard__alternate" type="button" disabled={locked || busy} onClick={() => onFileModeChange('folder')}>Choose a folder instead</button>
-              </>
-            )}
-            <p className="import-wizard__selection">{stagedAudioCount} WAV {stagedAudioCount === 1 ? 'file' : 'files'} selected for this draft.</p>
-            <div className="import-wizard__actions">
-              <button className="button button--secondary" type="button" disabled={busy} onClick={onBack}>Back</button>
-              <button className="button button--primary" type="button" disabled={locked || busy} onClick={onReviewEmptySelection}>Review selection</button>
-            </div>
-          </div>
-        )}
-
-        {step === 3 && (
-          <div className="import-wizard__step">
-            {busy ? (
-              <>
-                <p className="inline-status" role="status">Copying referenced WAVs into session memory and checking eligible audio. Your current setup stays active.</p>
-                <div className="import-wizard__actions">
-                  <button className="button button--secondary" type="button" onClick={onBack}>Back</button>
-                  <button className="button button--secondary" type="button" onClick={onCancel}>Cancel</button>
-                </div>
-              </>
-            ) : prepared ? (
-              <>
-                <p className="import-wizard__summary">{prepared.preset.name} · {prepared.selectedAudioFileCount} WAV {prepared.selectedAudioFileCount === 1 ? 'file' : 'files'} selected · {prepared.copiedFileCount} referenced WAV {prepared.copiedFileCount === 1 ? 'file' : 'files'} copied · {prepared.decodedFileCount} of {prepared.decodeAttemptCount} eligible WAVs decoded.</p>
-                {prepared.applied
-                  ? <p className="import-wizard__loaded" role="status">Preset loaded. Generate a combo when you are ready; playback has not started.</p>
-                  : <p className="import-wizard__preserve">Your current setup stays active until you load this preset. Nothing is written back to the selected files.</p>}
-                {(requiredMissing.length > 0 || requiredDecodeFailures.length > 0 || prepared.blockedMessage) && (
-                  <p className="inline-error" role="alert">
-                    {prepared.blockedMessage ?? 'Resolve the required sample WAVs below before loading this preset.'}
-                  </p>
-                )}
-                {selectionNote && <p className="inline-status" role="status">{selectionNote}</p>}
-                <div className="import-review-scroll">
-                  <table className="import-review-table">
-                    <thead><tr><th scope="col">Reference</th><th scope="col">Match</th><th scope="col">Check</th></tr></thead>
-                    <tbody>
-                      {referenceRows.map((check) => {
-                        const resolution = check.resolution
-                        const title = check.subject === 'sample'
-                          ? prepared.preset.samples.find((sample) => sample.id === check.id)?.name ?? check.id
-                          : 'Beat ' + check.id.replace(/^Beat/i, '')
-                        const path = resolution.status === 'resolved'
-                          ? resolution.selectedPath ?? check.requested
-                          : resolution.candidates.join(', ')
-                        const status = check.validation?.status === 'invalid'
-                          ? 'WAV could not decode'
-                          : resolution.status !== 'resolved'
-                            ? resolution.status === 'ambiguous' ? 'Ambiguous' : check.required ? 'Required WAV missing' : 'Not selected'
-                            : check.validation === null
-                              ? 'Matched · not copied or validated'
-                            : check.validation?.status === 'not-requested'
-                              ? 'Copied · decode not needed now'
-                              : 'Copied · audio decoded'
-                        const detail = check.validation?.status === 'invalid'
-                          ? check.validation.message
-                          : resolution.status === 'ambiguous'
-                            ? 'Matches ' + resolution.candidates.join(', ')
-                            : resolution.status === 'missing'
-                              ? 'INI references ' + JSON.stringify(check.requested)
-                              : check.validation === null
-                                ? 'Snapshot copy or validation did not complete for this matched WAV.'
-                              : check.required
-                                ? 'Required for an enabled, audible sample.'
-                                : check.subject === 'beat'
-                                  ? 'Optional beat bed; unavailable beats will stay unselected.'
-                                  : 'Not required now because this sample is disabled, silent, weightless, or zero duration.'
-                        return (
-                          <tr key={check.subject + '-' + check.id} className={check.required && (resolution.status !== 'resolved' || check.validation?.status === 'invalid') ? 'import-review-table__row--error' : undefined}>
-                            <th scope="row"><span>{title}</span><small>{check.subject === 'sample' ? 'Sample' : 'Preset beat'} · {check.id}</small></th>
-                            <td><code>{path || check.requested}</code></td>
-                            <td><strong>{status}</strong><small>{detail}</small></td>
-                          </tr>
-                        )
-                      })}
-                      {referenceRows.length === 0 && <tr><td colSpan={3}>This preset has no sample or beat file references.</td></tr>}
-                    </tbody>
-                  </table>
-                </div>
-                <div className="import-wizard__actions">
-                  {!prepared.applied && <button className="button button--secondary" type="button" disabled={busy} onClick={onBack}>Back</button>}
-                  {!prepared.applied && <button className="button button--secondary" type="button" disabled={busy} onClick={onCancel}>Cancel</button>}
-                  {prepared.applied
-                    ? <button className="button button--primary" type="button" disabled>Preset loaded</button>
-                    : prepared.canLoad
-                      ? <button className="button button--primary" type="button" disabled={locked || busy} onClick={onLoad}>Load preset</button>
-                      : <button className="button button--primary" type="button" disabled>Load preset</button>}
-                  <button className="button button--text" type="button" disabled={locked || busy} onClick={onStartAnother}>Start another import</button>
-                </div>
-              </>
-            ) : (
-              <p className="inline-status" role="status">Select or review an audio folder to prepare this preset.</p>
-            )}
-          </div>
-        )}
-
-        {wizardError && <p className="inline-error" role="alert">{wizardError}</p>}
-        {step === 1 && <div className="import-wizard__actions"><button className="button button--secondary" type="button" onClick={onCancel}>Cancel</button></div>}
-        {step === 2 && <div className="import-wizard__actions import-wizard__actions--cancel"><button className="button button--secondary" type="button" disabled={busy} onClick={onCancel}>Cancel</button></div>}
-      </div>
-
-      {isBootstrapLoading && <p className="inline-status" role="status">Loading the built-in preset. Your current files panel will be ready when it finishes.</p>}
-      {bootstrapError && <div className="inline-error" role="alert"><p>{bootstrapError}</p><button className="button button--small" type="button" disabled={locked} onClick={onRetryBuiltIn}>Retry built-in preset</button></div>}
-    </section>
-  )
-}
-
 function QuickPresetControl({
   builtInCatalog,
   selectedPresetId,
@@ -833,217 +543,6 @@ function cycleSlotsFor(fixture: Fixture, mode: PracticeMode, largePause: boolean
       durationUnits: fixture.totalUnits,
     })),
   ]
-}
-
-function DiagnosticList({ diagnostics }: { diagnostics: AssetDiagnostic[] }) {
-  if (diagnostics.length === 0) {
-    return <div className="asset-check asset-check--ready" role="status"><span className="asset-check__mark" aria-hidden="true" /><p>Current setup: all referenced files are ready.</p></div>
-  }
-  return (
-    <div className="diagnostics" role="status" aria-live="polite">
-      <div className="diagnostics__heading">
-        <strong>Current setup: {diagnostics.length} file {diagnostics.length === 1 ? 'reference needs' : 'references need'} attention</strong>
-        <span>Resolve these locally before playback.</span>
-      </div>
-      <ul>
-        {diagnostics.map((diagnostic, index) => (
-          <li className={diagnostic.severity === 'error' ? 'diagnostic diagnostic--error' : 'diagnostic'} key={diagnostic.code + diagnostic.requested + index}>
-            <span className="diagnostic__kind">{diagnostic.subject}</span>
-            <span className="diagnostic__message">{diagnostic.message}</span>
-            {diagnostic.candidates.length > 0 && <span className="diagnostic__candidates">Matches: {diagnostic.candidates.join(', ')}</span>}
-          </li>
-        ))}
-      </ul>
-    </div>
-  )
-}
-
-function SampleEditor({
-  sample, draft, disabled, ttmGuide, ttmGuideIsExplicit, onDraftChange, onTtmGuideChange, onSave, onCancel,
-}: {
-  sample: SampleDefinition
-  draft: SampleDefinition
-  disabled: boolean
-  ttmGuide: TtmSampleGuideSelection
-  ttmGuideIsExplicit: boolean
-  onDraftChange: (next: SampleDefinition) => void
-  onTtmGuideChange: (selection: string) => void
-  onSave: () => void
-  onCancel: () => void
-}) {
-  const durationRef = useRef<HTMLInputElement>(null)
-  useEffect(() => { durationRef.current?.focus() }, [sample.id])
-  const numericValue = (value: number) => Number.isFinite(value) ? value : ''
-  const setNumeric = (field: 'durationUnits' | 'weight' | 'maxRepeat', raw: string) => {
-    onDraftChange({ ...draft, [field]: raw === '' ? Number.NaN : Number(raw) })
-  }
-  const suggestedGuide = suggestedGuideForSampleName(sample.name)
-  const selectedGuideId = typeof ttmGuide === 'string'
-    ? ttmGuide
-    : !ttmGuideIsExplicit && suggestedGuide ? suggestedGuide : UNTRANSCRIBED.kind
-  const guideHelperText = !ttmGuideIsExplicit && suggestedGuide
-    ? 'Suggested from the exact sample label only: ' + TTM_GUIDES[suggestedGuide].label + '. Choose a guide or Untranscribed; no audio is analyzed.'
-    : !ttmGuideIsExplicit
-      ? 'No guide is assigned. Choose an illustrative guide or leave this sample Untranscribed.'
-      : typeof ttmGuide !== 'string'
-        ? 'Explicitly Untranscribed for this session. Choose a guide to add an illustrative pattern.'
-        : 'Session-only illustrative guide; this does not change audio or INI data.'
-  return (
-    <form className="sample-editor" aria-label={'Edit ' + sample.name} noValidate onSubmit={(event) => { event.preventDefault(); onSave() }}>
-      <div className="sample-editor__heading">
-        <div>
-          <h3>Edit {sample.name}</h3>
-          <p>These values apply to the next generated combo. File and sample metadata stay read-only.</p>
-        </div>
-        <span className="sample-editor__id">{sample.id}</span>
-      </div>
-      <div className="sample-editor__fields">
-        <label className="sample-editor__field" htmlFor="sample-duration">
-          <span>Duration ticks</span>
-          <input ref={durationRef} id="sample-duration" aria-label="Duration ticks" type="number" min="0" max="512" step="1" value={numericValue(draft.durationUnits)} disabled={disabled} onChange={(event) => setNumeric('durationUnits', event.currentTarget.value)} />
-        </label>
-        <label className="sample-editor__field" htmlFor="sample-weight">
-          <span>Play weight</span>
-          <input id="sample-weight" aria-label="Play weight" type="number" min="0" max="10000" step="1" value={numericValue(draft.weight)} disabled={disabled} onChange={(event) => setNumeric('weight', event.currentTarget.value)} />
-        </label>
-        <label className="sample-editor__field" htmlFor="sample-start-direction">
-          <span>Start direction</span>
-          <select id="sample-start-direction" value={draft.startForward ? 'forward' : 'reverse'} disabled={disabled} onChange={(event) => onDraftChange({ ...draft, startForward: event.currentTarget.value === 'forward' })}>
-            <option value="forward">Forward</option><option value="reverse">Reverse</option>
-          </select>
-        </label>
-        <label className="sample-editor__field" htmlFor="sample-end-direction">
-          <span>End direction</span>
-          <select id="sample-end-direction" value={draft.endForward ? 'forward' : 'reverse'} disabled={disabled} onChange={(event) => onDraftChange({ ...draft, endForward: event.currentTarget.value === 'forward' })}>
-            <option value="forward">Forward</option><option value="reverse">Reverse</option>
-          </select>
-        </label>
-        <label className="sample-editor__field" htmlFor="sample-repeat-max">
-          <span>Repeat maximum</span>
-          <input id="sample-repeat-max" aria-label="Repeat maximum" type="number" min="0" max="8192" step="1" value={numericValue(draft.maxRepeat)} disabled={disabled} onChange={(event) => setNumeric('maxRepeat', event.currentTarget.value)} />
-        </label>
-        <label className="sample-editor__check" htmlFor="sample-can-repeat">
-          <input id="sample-can-repeat" type="checkbox" checked={draft.canRepeat} disabled={disabled} onChange={(event) => onDraftChange({ ...draft, canRepeat: event.currentTarget.checked })} />
-          <span>Repeat allowed</span>
-        </label>
-        <label className="sample-editor__check" htmlFor="sample-use">
-          <input id="sample-use" type="checkbox" checked={draft.enabled || draft.silent} disabled={disabled || draft.silent} onChange={(event) => onDraftChange({ ...draft, enabled: event.currentTarget.checked })} />
-          <span>{draft.silent ? 'Use sample · always included (silent)' : 'Use sample'}</span>
-        </label>
-        {import.meta.env.DEV && <label className="sample-editor__field sample-editor__field--guide" htmlFor="sample-ttm-guide">
-          <span>TTM guide</span>
-          <select id="sample-ttm-guide" aria-label={'TTM guide for ' + sample.name} value={selectedGuideId} disabled={disabled} onChange={(event) => onTtmGuideChange(event.currentTarget.value)}>
-            <option value={UNTRANSCRIBED.kind}>{!ttmGuideIsExplicit && !suggestedGuide ? 'Unassigned · Untranscribed' : 'Untranscribed'}</option>
-            {Object.values(TTM_GUIDES).map((guide) => <option key={guide.id} value={guide.id}>{!ttmGuideIsExplicit && suggestedGuide === guide.id ? 'Suggested: ' : ''}{guide.label}</option>)}
-          </select>
-          <small>{guideHelperText}</small>
-        </label>}
-      </div>
-      <div className="sample-editor__actions">
-        <button className="button button--small" type="button" disabled={disabled} onClick={onCancel}>Cancel</button>
-        <button className="button button--small button--primary" type="submit" disabled={disabled}>Save sample changes</button>
-      </div>
-    </form>
-  )
-}
-
-function SampleTable({
-  preset, resolution, actionsDisabled, legacyMode, sourceAvailable, editingSample, saveError, isSavingData,
-  ttmAnnotations, onTtmGuideChange, onToggle, onPreview, onEdit, onDraftChange, onSaveEdit, onCancelEdit, onSaveData,
-}: {
-  preset: Preset
-  resolution: PresetAssetResolution | undefined
-  actionsDisabled: boolean
-  legacyMode: boolean
-  sourceAvailable: boolean
-  editingSample: SampleDefinition | null
-  saveError: string | null
-  isSavingData: boolean
-  ttmAnnotations: Readonly<Record<string, TtmSampleGuideSelection>>
-  onTtmGuideChange: (sampleId: string, selection: string) => void
-  onToggle: (sample: SampleDefinition, enabled: boolean) => void
-  onPreview: (sample: SampleDefinition) => void
-  onEdit: (sample: SampleDefinition) => void
-  onDraftChange: (sample: SampleDefinition) => void
-  onSaveEdit: () => void
-  onCancelEdit: () => void
-  onSaveData: () => void
-}) {
-  return (
-    <section id="sample-section" className="workspace-section sample-section" aria-labelledby="samples-heading">
-      <div className="section-heading">
-        <div>
-          <h2 id="samples-heading">Sample settings</h2>
-          <p>{legacyMode ? 'Choose and edit eligible samples for the next generated combo. Silent rows stay included. Changes are held in this session until you save a working INI copy.' : 'Enable or disable samples for the next preview. Source files are never changed.'}</p>
-        </div>
-        <div className="sample-section__actions">
-          {sourceAvailable && <button className="button button--small" type="button" disabled={actionsDisabled || Boolean(editingSample) || isSavingData} onClick={onSaveData}>{isSavingData ? 'Saving…' : 'Save Sample Data'}</button>}
-          <span className="sample-count">{preset.samples.length} {preset.samples.length === 1 ? 'sample' : 'samples'}</span>
-        </div>
-      </div>
-      {editingSample && <SampleEditor
-        sample={preset.samples.find((sample) => sample.id === editingSample.id) ?? editingSample}
-        draft={editingSample}
-        disabled={actionsDisabled}
-        ttmGuide={ttmAnnotations[editingSample.id] ?? UNTRANSCRIBED}
-        ttmGuideIsExplicit={Object.hasOwn(ttmAnnotations, editingSample.id)}
-        onDraftChange={onDraftChange}
-        onTtmGuideChange={(selection) => onTtmGuideChange(editingSample.id, selection)}
-        onSave={onSaveEdit}
-        onCancel={onCancelEdit}
-      />}
-      {saveError && <p className="inline-error" role="alert">{saveError}</p>}
-      <div
-        className="sample-table-scroll"
-        role="region"
-        aria-labelledby="samples-heading"
-        aria-describedby="sample-table-scroll-help"
-        tabIndex={0}
-      >
-        <span className="visually-hidden" id="sample-table-scroll-help">Use the arrow keys to scroll through the sample rows and columns.</span>
-        <table className="sample-table">
-          <thead><tr>
-            <th scope="col">Sample</th><th scope="col">File reference</th><th scope="col">Length</th>
-            <th scope="col">Weight</th><th scope="col">Direction</th><th scope="col">Repeat</th>
-            <th scope="col">Use</th>{sourceAvailable && <th scope="col">Edit</th>}<th scope="col">Preview</th>
-          </tr></thead>
-          <tbody>
-            {preset.samples.map((sample) => {
-              const fileState = sampleFileState(sample, resolution)
-              const asset = resolutionForSample(sample, resolution)
-              return (
-                <tr key={sample.id}>
-                  <th scope="row"><span className="sample-name">{sample.name}</span><span className="sample-id">{sample.id}</span></th>
-                  <td>
-                    <span className={'file-state file-state--' + fileState.tone}>{fileState.label}</span>
-                    {sample.fileName && <code className="file-reference" title={sample.fileName}>{sample.fileName}</code>}
-                    {asset?.status === 'ambiguous' && <span className="file-detail">{asset.candidates.length} matching files</span>}
-                  </td>
-                  <td className="numeric-cell">{sample.durationUnits} {legacyMode ? 'legacy ticks' : 'units'}</td>
-                  <td className="numeric-cell">{formatWeight(sample.weight)}</td>
-                  <td><span className="direction-value">{sample.startForward ? 'Forward' : 'Reverse'} / {sample.endForward ? 'Forward' : 'Reverse'}</span><span className="file-detail">start / end</span></td>
-                  <td><span>{sample.canRepeat ? 'Repeat flag on' : 'Repeat flag off'}</span><span className="file-detail">Configured value: {sample.maxRepeat}</span></td>
-                  <td>
-                    <label className="toggle-control">
-                      <input type="checkbox" checked={sample.enabled || sample.silent} aria-label={'Enable ' + sample.name + ' for ' + (legacyMode ? 'next combo' : 'preview')} disabled={actionsDisabled || sample.silent} onChange={(event) => onToggle(sample, event.currentTarget.checked)} />
-                      <span className="toggle-control__track" aria-hidden="true"><span /></span>
-                      <span className="toggle-control__text">{sample.silent ? 'Always included' : sample.enabled ? 'On' : 'Off'}</span>
-                    </label>
-                  </td>
-                  {sourceAvailable && <td><button className="button button--small" type="button" aria-label={'Edit ' + sample.name} disabled={actionsDisabled} onClick={() => onEdit(sample)}>Edit</button></td>}
-                  <td>
-                    {sample.silent
-                      ? <span className="file-state file-state--muted" title="Silent samples remain included in generated combos, but have no audio preview.">Silent</span>
-                      : <button className="button button--small" type="button" aria-label={'Preview ' + sample.name} title={actionsDisabled ? 'Wait for the preset import or combo generation to finish.' : undefined} disabled={actionsDisabled} onClick={() => onPreview(sample)}>Preview</button>}
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  )
 }
 
 export default function App() {
@@ -2823,7 +2322,7 @@ export default function App() {
       setActionError(sample.name + ' is marked silent and has no audio preview.')
       return
     }
-    const resolution = resolutionForSample(sample, assetResolution)
+    const resolution = assetResolution?.samplesById.get(sample.id)
     if (!SYNTHETIC_SAMPLE_IDS.has(sample.id) && (resolution?.status !== 'resolved' || !resolution.file)) {
       setActionError('Cannot preview ' + sample.name + ' yet. Choose its WAV file or resolve the file warning above.')
       setTransportNote('Sample preview needs a local WAV file.')
