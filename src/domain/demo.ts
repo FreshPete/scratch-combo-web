@@ -50,3 +50,5 @@ export const DEMO_PRESET: Preset = {
   sampleVolume: 80,
   samples: demoSamples,
 };
+
+export const SYNTHETIC_SAMPLE_IDS = new Set(demoSamples.map(({ id }) => id));

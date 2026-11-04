@@ -326,12 +326,12 @@ async function expectNoPageOverflow(page: Page, width: number): Promise<void> {
 
 function proofImagePath(): string {
   const browser = (process.env.PLAYWRIGHT_CHANNEL ?? 'msedge').toLowerCase().replace(/[^a-z0-9-]+/g, '-')
-  return path.resolve(process.cwd(), 'docs/images', `custom-beat-live-playback-${browser}.png`)
+  return path.resolve(process.cwd(), 'test-results/screenshots', `custom-beat-live-playback-${browser}.png`)
 }
 
 function customFirstProofImagePath(): string {
   const browser = (process.env.PLAYWRIGHT_CHANNEL ?? 'msedge').toLowerCase().replace(/[^a-z0-9-]+/g, '-')
-  return path.resolve(process.cwd(), 'docs/images', `beat-source-custom-first-${browser}.png`)
+  return path.resolve(process.cwd(), 'test-results/screenshots', `beat-source-custom-first-${browser}.png`)
 }
 
 test('WAV custom beat keeps the scratch library, follows tempo at neutral pitch, and leaves live controls available', async ({ page }) => {
