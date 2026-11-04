@@ -1,4 +1,5 @@
-import { DiagnosticList, ImportWizard, type ImportReferenceCheck, type ImportWizardStep, type PreparedLocalImport } from './ImportWizard'
+import { DiagnosticList, ImportWizard } from './ImportWizard'
+import { mappedReferenceChecks, preparePresetImport, requiredImportSample, type ImportWizardStep, type PreparedLocalImport } from './preparePresetImport'
 import { SampleTable } from './SampleTable'
 import { SequenceTimeline, type TimelineLayout, type TimelineView } from './SequenceTimeline'
 import { SYNTHETIC_SAMPLE_IDS } from './domain/demo'
@@ -7,8 +8,8 @@ import {
   type ChangeEvent, type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
 import {
-  analyzeLocalAudioFile, AudioTransport, LocalWavSnapshotError, snapshotReferencedWavFiles,
-  type CyclePlanOptions, type CycleSlot, type PlayOptions, type SnapshotFileValidation,
+  analyzeLocalAudioFile, AudioTransport, snapshotReferencedWavFiles,
+  type CyclePlanOptions, type CycleSlot, type PlayOptions,
 } from './audio'
 import { PracticePrepControls, type CountInBars } from './PracticePrepControls'
 import { getTempoRange, SessionControls, type CustomBeatAnalysisStatus } from './SessionControls'
@@ -22,7 +23,7 @@ import { PracticeLibrary } from './PracticeLibrary'
 import {
   buildAssetIndex, buildPreviewFixture, DEMO_PRESET, generateLegacyCombo, parseLegacyIni,
   patchLegacyIniText, resolvePresetAssets, REST_SAMPLE_ID, web24bitRnd, type AssetIndex,
-  type AssetResolution, type Fixture, type Preset, type PresetAssetResolution,
+  type Fixture, type Preset, type PresetAssetResolution,
   type SampleDefinition,
 } from './domain'
 import {
@@ -305,109 +306,6 @@ function handleWorkspaceTabKeyDown(event: ReactKeyboardEvent<HTMLAnchorElement>,
   const nextTab = document.getElementById(WORKSPACE_TABS[nextIndex]!.id)
   nextTab?.focus()
   nextTab?.click()
-}
-
-function requiredImportSample(sample: SampleDefinition): boolean {
-  return sample.enabled && !sample.silent && sample.weight > 0 && sample.durationUnits > 0
-}
-
-function resolvedReferencedFiles(resolution: PresetAssetResolution): File[] {
-  const files = new Set<File>()
-  for (const asset of resolution.samplesById.values()) {
-    if (asset.status === 'resolved' && asset.file) files.add(asset.file)
-  }
-  for (const asset of resolution.beats) {
-    if (asset.status === 'resolved' && asset.file) files.add(asset.file)
-  }
-  return [...files]
-}
-
-function referenceChecksForImport(
-  preset: Preset,
-  resolution: PresetAssetResolution,
-  validationBySource: ReadonlyMap<File, SnapshotFileValidation> = new Map(),
-): ImportReferenceCheck[] {
-  const samples = preset.samples.map((sample): ImportReferenceCheck => {
-    const asset = resolution.samplesById.get(sample.id)
-      ?? { status: 'missing', requested: sample.fileName, candidates: [] }
-    return {
-      subject: 'sample',
-      id: sample.id,
-      requested: sample.fileName,
-      required: requiredImportSample(sample),
-      resolution: asset,
-      validation: asset.status === 'resolved' && asset.file ? validationBySource.get(asset.file) ?? null : null,
-    }
-  })
-  const beats = preset.beatFiles.map((fileName, index): ImportReferenceCheck => {
-    const asset = resolution.beats[index]
-      ?? { status: 'missing', requested: fileName, candidates: [] }
-    return {
-      subject: 'beat',
-      id: 'Beat' + String(index + 1).padStart(2, '0'),
-      requested: fileName,
-      required: false,
-      resolution: asset,
-      validation: asset.status === 'resolved' && asset.file ? validationBySource.get(asset.file) ?? null : null,
-    }
-  })
-  return [...samples, ...beats]
-}
-
-function mapPresetResolutionToSnapshots(
-  resolution: PresetAssetResolution,
-  filesBySource: ReadonlyMap<File, File>,
-  validationBySource: ReadonlyMap<File, SnapshotFileValidation>,
-): PresetAssetResolution {
-  const mapOne = (asset: AssetResolution): AssetResolution => {
-    if (asset.status !== 'resolved' || !asset.file) return asset
-    if (validationBySource.get(asset.file)?.status === 'invalid') {
-      const unavailable: AssetResolution = {
-        status: 'missing',
-        requested: asset.requested,
-        candidates: asset.candidates,
-      }
-      if (asset.selectedPath) unavailable.selectedPath = asset.selectedPath
-      return unavailable
-    }
-    const snapshot = filesBySource.get(asset.file)
-    if (!snapshot) throw new Error('A referenced WAV was not copied into session memory.')
-    return { ...asset, file: snapshot }
-  }
-  return {
-    samplesById: new Map(Array.from(resolution.samplesById, ([sampleId, asset]) => [sampleId, mapOne(asset)])),
-    beats: resolution.beats.map(mapOne),
-    diagnostics: resolution.diagnostics,
-  }
-}
-
-function mappedReferenceChecks(
-  checks: ImportReferenceCheck[],
-  resolution: PresetAssetResolution,
-): ImportReferenceCheck[] {
-  let beatIndex = 0
-  return checks.map((check) => {
-    const mapped = check.subject === 'sample'
-      ? resolution.samplesById.get(check.id) ?? check.resolution
-      : resolution.beats[beatIndex++] ?? check.resolution
-    return { ...check, resolution: mapped }
-  })
-}
-
-function snapshotErrorForImport(error: unknown, resolution: PresetAssetResolution): string {
-  if (error instanceof LocalWavSnapshotError && error.file) {
-    const paths = [
-      ...Array.from(resolution.samplesById.values())
-        .filter((asset) => asset.file === error.file)
-        .map((asset) => asset.selectedPath),
-      ...resolution.beats
-        .filter((asset) => asset.file === error.file)
-        .map((asset) => asset.selectedPath),
-    ].filter((path): path is string => Boolean(path))
-    const reference = [...new Set(paths)].join(', ') || error.file.name
-    return reference + ': ' + error.message + ' Choose another folder or smaller referenced WAVs, then review again.'
-  }
-  return describeError(error) + ' Choose another folder or smaller referenced WAVs, then review again.'
 }
 
 function legacyFixtureFor(preset: Preset, requestedRawTicks: number) {
@@ -1529,87 +1427,19 @@ export default function App() {
     const generation = ++localImportGeneration.current
     const controller = new AbortController()
     localImportController.current = controller
-    const audioIndex = buildAssetIndex(stagedAudioFiles)
-    const resolution = resolvePresetAssets(stagedPreset, audioIndex)
-    const baseChecks = referenceChecksForImport(stagedPreset, resolution)
-    const requiredMissing = baseChecks.filter((check) => check.required && check.resolution.status !== 'resolved')
-    const base: PreparedLocalImport = {
-      iniFileName: stagedIniFile.name,
-      iniText: stagedIniText,
-      preset: stagedPreset,
-      resolution,
-      snapshotResolution: resolution,
-      snapshotFiles: [],
-      selectedAudioFileCount: stagedAudioFiles.length,
-      checks: baseChecks,
-      copiedFileCount: 0,
-      copiedBytes: 0,
-      decodedFileCount: 0,
-      decodeAttemptCount: 0,
-      canLoad: false,
-      applied: false,
-      blockedMessage: null,
-    }
     setLocalImportError(null)
     setPreparedLocalImport(null)
     setIsPreparingLocalImport(true)
     setImportStep(3)
     focusLocalImportTarget(3)
 
-    const referencedFiles = resolvedReferencedFiles(resolution)
-    const decodeFiles = [
-      ...stagedPreset.samples
-        .filter(requiredImportSample)
-        .flatMap((sample) => {
-          const asset = resolution.samplesById.get(sample.id)
-          return asset?.status === 'resolved' && asset.file ? [asset.file] : []
-        }),
-      ...resolution.beats.flatMap((asset) => asset.status === 'resolved' && asset.file ? [asset.file] : []),
-    ]
-
     void (async () => {
       try {
-        const snapshot = await snapshotReferencedWavFiles(referencedFiles, {
-          decodeFiles,
-          signal: controller.signal,
-        })
-        if (generation !== localImportGeneration.current) return
-        const snapshotResolution = mapPresetResolutionToSnapshots(
-          resolution,
-          snapshot.filesBySource,
-          snapshot.validationBySource,
-        )
-        const checks = referenceChecksForImport(stagedPreset, resolution, snapshot.validationBySource)
-        const requiredDecodeFailures = checks.filter((check) => check.required && check.validation?.status === 'invalid')
-        const failed = requiredDecodeFailures[0]
-        const blockedMessage = requiredMissing.length > 0
-          ? requiredDecodeFailures.length > 0
-            ? 'Resolve missing or ambiguous sample references and replace any required WAVs that failed decoding before loading this preset.'
-            : 'Resolve the missing or ambiguous WAV files for enabled, audible samples before loading this preset.'
-          : failed
-            ? (failed.resolution.selectedPath ?? failed.requested) + ': this required sample WAV could not be decoded. ' + (failed.validation?.status === 'invalid' ? failed.validation.message : '') + ' Choose a valid WAV, then review the selection again.'
-            : null
-        const prepared: PreparedLocalImport = {
-          ...base,
-          resolution,
-          snapshotResolution,
-          snapshotFiles: resolvedReferencedFiles(snapshotResolution),
-          checks,
-          copiedFileCount: snapshot.copiedFileCount,
-          copiedBytes: snapshot.copiedBytes,
-          decodedFileCount: snapshot.decodedFileCount,
-          decodeAttemptCount: snapshot.decodeAttemptCount,
-          canLoad: requiredMissing.length === 0 && requiredDecodeFailures.length === 0,
-          blockedMessage,
-        }
-        setPreparedLocalImport(prepared)
+        const prepared = await preparePresetImport(stagedIniFile.name, stagedIniText, stagedPreset, stagedAudioFiles, controller.signal)
+        if (generation === localImportGeneration.current) setPreparedLocalImport(prepared)
       } catch (error) {
         if (controller.signal.aborted || generation !== localImportGeneration.current) return
-        setPreparedLocalImport({
-          ...base,
-          checks: referenceChecksForImport(stagedPreset, resolution),
-          blockedMessage: snapshotErrorForImport(error, resolution),
-        })
+        setLocalImportError(describeError(error))
       } finally {
         if (generation === localImportGeneration.current) {
           setIsPreparingLocalImport(false)
