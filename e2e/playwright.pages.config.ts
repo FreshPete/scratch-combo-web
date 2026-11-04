@@ -1,7 +1,8 @@
 import { defineConfig, devices } from '@playwright/test'
 
 export default defineConfig({
-  testDir: './e2e',
+  testDir: '.',
+  outputDir: '../test-results',
   testMatch: 'pages-base.spec.ts',
   fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
@@ -14,6 +15,7 @@ export default defineConfig({
     channel: process.env.PLAYWRIGHT_CHANNEL ?? 'msedge',
   },
   webServer: {
+    cwd: '..',
     command: 'npm run preview -- --host 127.0.0.1 --port 4174 --strictPort',
     url: 'http://127.0.0.1:4174/scratch-combo-web/',
     env: { VITE_BASE_PATH: '/scratch-combo-web/' },

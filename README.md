@@ -31,6 +31,8 @@ Browser tests use installed Edge by default. Set `PLAYWRIGHT_CHANNEL=chrome` for
 
 ## Project reference
 
+App code is in [src](src/), browser tests and their configuration are in [e2e](e2e/), and the TypeScript build settings are in [config](config/).
+
 - App structure, local storage, and playback contracts. [Architecture](docs/architecture.md)
 - Recovered rules and differences from the Windows generator. [Generator contract](docs/generator-contract.md)
 - Web Audio, beat analysis, and timing limits. [Audio engine](src/audio/README.md)
