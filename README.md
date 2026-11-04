@@ -39,7 +39,9 @@ Use **Practice**, **Session**, **Samples**, **Editor**, and **Files** to focus o
 
 Open **Keyboard shortcuts** for the available keys and the option to disable them: **P** toggles Play/Stop, **G** generates or builds a combo, and **R** resets the session controls. Shortcuts obey the same readiness and playback locks as the buttons and are ignored while typing or interacting with native controls.
 
-In **Editor**, draw the record position over time and paint the sections where the fader opens or closes. The 1.5-second preview moves through up to the first 0.4 seconds of the starter sound or a loaded sample. Starting a scratch preview stops any running practice playback. The drawing stays in memory while the page is open.
+In **Editor**, draw the record position over time and paint the sections where the fader opens or closes. The 1.5-second preview moves through up to the first 0.4 seconds of the starter sound, the bundled Ahh vocal, or a loaded sample. Starting a scratch preview stops any running practice playback. The drawing stays in memory while the page is open.
+
+The bundled Ahh vocal uses the MP3 preview of [ahh.wav by hy96](https://freesound.org/s/48171/), released under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
 
 ## Import your sample preset
 

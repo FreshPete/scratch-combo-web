@@ -71,6 +71,13 @@ test('draws a scratch on a phone-sized viewport and plays the edited PCM', async
   await expect(record).toHaveAttribute('aria-valuenow', '20')
   await editor.getByRole('button', { name: 'Reset pattern' }).click()
   await expect(record).toHaveAttribute('aria-valuenow', '0')
+
+  await editor.getByLabel('Scratch sound').selectOption({ label: 'Ahh vocal' })
+  await play.click()
+  await expect(editor.getByRole('status')).toHaveText('Playing Ahh vocal.')
+  const ahhPcm = await page.locator('body').getAttribute('data-scratch-pcm')
+  expect(ahhPcm).not.toBe(originalPcm)
+  expect(Number(ahhPcm?.split(',')[0])).toBeGreaterThan(0.05)
 })
 
 test('previews a loaded WAV and stops the practice transport first', async ({ page }) => {

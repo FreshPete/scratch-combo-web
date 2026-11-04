@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { makeScratchPreviewSource, renderScratchPreview, SCRATCH_SOURCE_WINDOW_SECONDS } from './audio/scratch-preview'
 import { decodeLocalAudioFile } from './audio/beatAnalysis'
+import ahhSampleUrl from './assets/ahh-hy96.mp3?url'
 import './ScratchEditor.css'
 
 const POINT_COUNT = 48
@@ -64,7 +65,7 @@ export function ScratchEditor({ active, samples, onBeforePreview }: ScratchEdito
   const pointerRef = useRef<{ lane: 'record' | 'fader'; lastIndex: number; lastValue: number; pointerId: number } | null>(null)
   const [preparing, setPreparing] = useState(false)
   const selectedSample = samples.find((sample) => sample.id === sourceId)
-  const resolvedSourceId = sourceId !== 'starter' && selectedSample ? sourceId : 'starter'
+  const resolvedSourceId = sourceId === 'ahh' || selectedSample ? sourceId : 'starter'
 
   const stopPreview = (status = 'Preview stopped.') => {
     const wasActive = Boolean(pendingContextRef.current || audioRef.current)
@@ -94,8 +95,8 @@ export function ScratchEditor({ active, samples, onBeforePreview }: ScratchEdito
   useEffect(() => () => stopPreview(''), [])
 
   useEffect(() => {
-    if (sourceId !== 'starter' && !selectedSample) setSourceId('starter')
-  }, [selectedSample, sourceId])
+    if (sourceId !== resolvedSourceId) setSourceId(resolvedSourceId)
+  }, [resolvedSourceId, sourceId])
 
   const animatePlayhead = () => {
     const playback = audioRef.current
@@ -127,10 +128,20 @@ export function ScratchEditor({ active, samples, onBeforePreview }: ScratchEdito
       if (requestId !== requestIdRef.current) return
       let channels: readonly Float32Array[]
       let sourceSampleRate = context.sampleRate
-      if (resolvedSourceId === 'starter' || !selectedSample) {
+      if (resolvedSourceId === 'starter') {
         channels = [makeScratchPreviewSource(context.sampleRate)]
       } else {
-        const decoded = await decodeLocalAudioFile(context, selectedSample.file)
+        let decoded: AudioBuffer
+        if (resolvedSourceId === 'ahh') {
+          const response = await fetch(ahhSampleUrl)
+          if (!response.ok) throw new Error('The built-in Ahh sample could not load. Try again.')
+          const bytes = await response.arrayBuffer()
+          if (requestId !== requestIdRef.current) return
+          decoded = await context.decodeAudioData(bytes)
+        } else {
+          if (!selectedSample) throw new Error('Choose an available scratch sound.')
+          decoded = await decodeLocalAudioFile(context, selectedSample.file)
+        }
         channels = Array.from({ length: decoded.numberOfChannels }, (_, index) => decoded.getChannelData(index))
         sourceSampleRate = decoded.sampleRate
       }
@@ -156,7 +167,8 @@ export function ScratchEditor({ active, samples, onBeforePreview }: ScratchEdito
       source.start(startedAt)
       setPreparing(false)
       setPreviewing(true)
-      setMessage(`Playing ${resolvedSourceId === 'starter' ? 'starter sound' : selectedSample?.name ?? 'sample'}.`)
+      const sourceName = resolvedSourceId === 'ahh' ? 'Ahh vocal' : selectedSample?.name ?? 'starter sound'
+      setMessage(`Playing ${sourceName}.`)
       playback.frame = window.requestAnimationFrame(animatePlayhead)
     } catch (error) {
       if (requestId !== requestIdRef.current || !activeRef.current) return
@@ -255,6 +267,7 @@ export function ScratchEditor({ active, samples, onBeforePreview }: ScratchEdito
         <span>Scratch sound</span>
         <select id="scratch-editor-source" value={resolvedSourceId} onChange={(event) => setSourceId(event.currentTarget.value)} disabled={previewing || preparing}>
           <option value="starter">Starter sound</option>
+          <option value="ahh">Ahh vocal</option>
           {samples.map((sample) => <option key={sample.id} value={sample.id}>{sample.name}</option>)}
         </select>
       </label>
