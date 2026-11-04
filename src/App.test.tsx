@@ -373,7 +373,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(within(transportRow!).getByRole('button', { name: 'Stop' })).toBeDisabled()
   })
 
-  it('uses four keyboard-operable tabs and activates direct hash targets', async () => {
+  it('uses keyboard-operable tabs and activates direct hash targets', async () => {
     render(<App />)
     await screen.findByRole('heading', { name: 'Generated combo' })
 
@@ -386,6 +386,7 @@ describe('workspace import and transport lifecycle', () => {
     expect(document.getElementById('panel-session')).toHaveAttribute('hidden')
     expect(document.getElementById('panel-samples')).toHaveAttribute('hidden')
     expect(document.getElementById('panel-files')).toHaveAttribute('hidden')
+    expect(document.getElementById('panel-scratch')).toHaveAttribute('hidden')
 
     fireEvent.keyDown(practiceTab, { key: 'ArrowDown' })
     await waitFor(() => expect(sessionTab).toHaveAttribute('aria-selected', 'true'))
@@ -396,6 +397,11 @@ describe('workspace import and transport lifecycle', () => {
     const filesPanel = screen.getByRole('tabpanel', { name: 'Files' })
     expect(filesPanel).not.toHaveAttribute('hidden')
     await waitFor(() => expect(filesPanel).toHaveFocus())
+
+    window.location.hash = '#scratch-editor'
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Editor' })).toHaveAttribute('aria-selected', 'true'))
+    expect(screen.getByRole('heading', { name: /scratch editor/i })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Play sequence' })).not.toBeInTheDocument()
 
     window.location.hash = '#workspace'
     await waitFor(() => expect(practiceTab).toHaveAttribute('aria-selected', 'true'))

@@ -15,6 +15,7 @@ import {
   type TempoTrainingSettings,
 } from './tempo-training'
 import { PracticeLibrary } from './PracticeLibrary'
+import { ScratchEditor } from './ScratchEditor'
 import {
   buildAssetIndex, buildPreviewFixture, DEMO_PRESET, generateLegacyCombo, parseLegacyIni,
   patchLegacyIniText, resolvePresetAssets, REST_SAMPLE_ID, web24bitRnd, type AssetDiagnostic, type AssetIndex,
@@ -81,7 +82,7 @@ type PlaybackTarget =
 type PracticeMode = 'qa' | 'loop'
 type TimelineView = 'waveform' | 'ttm'
 type TimelineLayout = 'grid' | 'inline'
-type WorkspaceSection = 'sequence' | 'files' | 'session' | 'samples'
+type WorkspaceSection = 'sequence' | 'files' | 'session' | 'samples' | 'scratch'
 type PresetSource = 'loading' | 'builtin' | 'custom' | 'demo'
 type CustomBeatCandidate = { file: File; buffer: AudioBuffer | null }
 type ImportWizardStep = 1 | 2 | 3
@@ -115,6 +116,7 @@ const WORKSPACE_TABS: ReadonlyArray<{ section: WorkspaceSection; label: string; 
   { section: 'sequence', label: 'Practice', href: '#sequence-section', id: 'tab-practice' },
   { section: 'session', label: 'Session', href: '#session-section', id: 'tab-session' },
   { section: 'samples', label: 'Samples', href: '#sample-section', id: 'tab-samples' },
+  { section: 'scratch', label: 'Editor', href: '#scratch-editor', id: 'tab-scratch' },
   { section: 'files', label: 'Files', href: '#files-section', id: 'tab-files' },
 ]
 
@@ -132,6 +134,7 @@ function WorkspaceSectionIcon({ section }: { section: WorkspaceSection }) {
         <circle cx="15" cy="6" r="1.8" />
       </>}
       {section === 'samples' && <path d="M2.5 10h2l1.6-4.5 2.2 9 2.3-10 2.1 9 1.8-4.5 1.5 1h1.5" />}
+      {section === 'scratch' && <path d="m3 13 4-7 5 7 5-7M3 17h4m3 0h7" />}
       {section === 'files' && <path d="M2.5 6V4.3h5l1.7 1.8h8.3v9.6H2.5z" />}
     </svg>
   )
@@ -142,6 +145,7 @@ function workspaceSectionForHash(hash: string): WorkspaceSection | null {
   if (!target || target === 'workspace' || target === 'sequence-section' || target === 'sequence-heading' || target === 'timeline-caption') return 'sequence'
   if (target === 'session-section' || target === 'settings-heading') return 'session'
   if (target === 'sample-section' || target === 'samples-heading') return 'samples'
+  if (target === 'scratch-editor') return 'scratch'
   if (target === 'files-section' || target === 'import-heading' || target === 'preset-file') return 'files'
   return null
 }
@@ -1486,6 +1490,10 @@ export default function App() {
     beatVolume: DEMO_PRESET.beatVolume,
   })
   const sampleAssets = useMemo(() => assetMapFor(assetResolution), [assetResolution])
+  const scratchEditorSamples = useMemo(() => preset.samples.flatMap(({ id, name, silent }) => {
+    const file = sampleAssets.get(id)
+    return file && !silent && id !== REST_SAMPLE_ID ? [{ id, name, file }] : []
+  }), [preset.samples, sampleAssets])
   const selectedBeatResolution = selectedBeatIndex === 'none' ? undefined : assetResolution?.beats[Number(selectedBeatIndex)]
   const selectedBeatFile = customBeatSelected
     ? undefined
@@ -3304,7 +3312,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (!shortcutsEnabled || shortcutsHelpOpen) return
+    if (!shortcutsEnabled || shortcutsHelpOpen || activeSection === 'scratch') return
     const handleShortcut = (event: KeyboardEvent) => {
       if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.repeat || isSingleKeyShortcutTarget(event.target)) return
       const actions = shortcutActionsRef.current
@@ -3328,7 +3336,7 @@ export default function App() {
     }
     window.addEventListener('keydown', handleShortcut)
     return () => window.removeEventListener('keydown', handleShortcut)
-  }, [shortcutsEnabled, shortcutsHelpOpen, isPlaybackLocked, isPresetReady, isReadingPreset, isGenerating])
+  }, [shortcutsEnabled, shortcutsHelpOpen, activeSection, isPlaybackLocked, isPresetReady, isReadingPreset, isGenerating])
 
   return (
     <div className="app-shell">
@@ -3370,7 +3378,7 @@ export default function App() {
           <div className="session-state"><span className="session-state__dot" aria-hidden="true" /><span>Local browser workspace</span></div>
         </header>
 
-        <section className="transport-dock" aria-label="Playback controls">
+        <section className="transport-dock" aria-label="Playback controls" hidden={activeSection === 'scratch' && stopDisabled}>
           <div className="transport-dock__actions">
             <button className="button button--play" type="button" onClick={handleTogglePlayback} disabled={pauseResumeDisabled}>
               {transportSnapshot.status === 'playing' || isCountInActive
@@ -3626,6 +3634,12 @@ export default function App() {
               onSaveData={() => { void handleSaveSampleData() }}
             />
           : <section id="sample-section" className="workspace-section sample-section" aria-labelledby="samples-heading"><div className="section-heading"><div><h2 id="samples-heading">Sample settings</h2><p>Sample rows appear after the selected preset and its files are ready.</p></div></div></section>}
+        </div>
+
+        <div id="panel-scratch" role="tabpanel" aria-labelledby="tab-scratch" tabIndex={0} hidden={activeSection !== 'scratch'}>
+          <ScratchEditor active={activeSection === 'scratch'} samples={scratchEditorSamples} onBeforePreview={() => {
+            if (isPlaybackLockedNow()) handleStop()
+          }} />
         </div>
 
         <footer className="workspace-footer">
