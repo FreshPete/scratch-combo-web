@@ -1,3 +1,5 @@
+export const LEGACY_TICKS_PER_BEAT = 16;
+
 export { buildAssetIndex, resolvePresetAssets } from './assets';
 export { DEMO_PRESET } from './demo';
 export {
