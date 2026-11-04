@@ -169,7 +169,7 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
 .combo-length-control select { min-width: 112px; min-height: 36px; padding: 0 28px 0 10px; border: 1px solid var(--line-strong); border-radius: 0; background: var(--surface-inset); color: var(--text); font-size: 12px; }
 .practice-settings { display: block; min-width: 0; margin: 0 0 12px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--surface-inset); }
 .playback-prep { display: flex; width: 100%; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px 20px; margin: 0; padding: 8px 11px; border: 0; }
-.playback-prep legend { float: left; margin-right: 2px; padding: 0; color: var(--text); font-size: 12px; font-weight: 620; }
+.playback-prep__title { color: var(--text); font-size: 12px; font-weight: 620; }
 .playback-prep__controls { display: flex; flex: 1 1 0; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px 18px; }
 .playback-prep__field { display: grid; min-width: 170px; gap: 4px; color: var(--text-secondary); font-size: 12px; }
 .playback-prep__field select { min-height: 36px; padding: 0 28px 0 9px; border: 1px solid var(--line-strong); border-radius: 0; background: var(--surface); color: var(--text); font-size: 12px; }
@@ -418,7 +418,9 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
   .timeline-caption { grid-template-columns: minmax(0, 1fr) auto; }
   .timing-readout { grid-column: 2; grid-row: 1; justify-self: end; margin-left: 0; }
   .timeline-layout-control { grid-column: 1 / -1; grid-row: 2; flex-wrap: wrap; }
-  .timeline-view-control { grid-column: 1 / -1; grid-row: 3; flex-wrap: wrap; }
+  .timeline-view-control { grid-column: 1 / -1; grid-row: 3; justify-self: stretch; flex-wrap: wrap; }
+  .timeline-layout-control, .timeline-view-control { padding-left: 49px; }
+  .timeline-layout-control legend, .timeline-view-control legend { width: 44px; margin-left: -49px; }
   .ttm-guide-legend { margin-left: 12px; }
   .timeline-guide-note { margin-left: 12px; }
 }
@@ -441,7 +443,8 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
   .sequence-actions { width: 100%; align-items: stretch; }
   .sequence-actions .button { flex: 1 1 auto; }
   .combo-length-control { flex: 0 0 auto; }
-  .playback-prep { align-items: flex-start; gap: 8px; }
+  .playback-prep { align-items: flex-start; gap: 8px; padding: 12px 14px; }
+  .playback-prep__title { flex-basis: 100%; }
   .playback-prep__controls { flex: 1 1 100%; width: 100%; flex-direction: column; align-items: stretch; gap: 8px; }
   .playback-prep__field, .playback-prep__level { width: 100%; min-width: 0; }
   .playback-prep__field select { width: 100%; min-width: 0; }
